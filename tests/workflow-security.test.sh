@@ -71,31 +71,31 @@ post_has_retry "$tmp_dir/review-publish.sh" && die "review POST must not retry a
 post_has_retry "$tmp_dir/build-publish.sh" && die "build POST must not retry after an ambiguous failure"
 pass "mutating GitHub POST calls are explicitly one-shot"
 
-if rg -n --ignore-case \
+if grep -nEi -- \
   'pull_request_target|runs-on:[[:space:]]*self-hosted|id-token:[[:space:]]*write|secrets:[[:space:]]*inherit|opencode[[:space:]]+github[[:space:]]+run|persist-credentials:[[:space:]]*true' \
   "$review_workflow" "$build_workflow"; then
   die "workflow contains a forbidden trust-boundary primitive"
 fi
-[[ "$(rg -c -- '--pure run' "$review_workflow" "$build_workflow" | awk -F: '{ total += $2 } END { print total + 0 }')" == 2 ]] ||
+[[ "$(grep -HcF -- '--pure run' "$review_workflow" "$build_workflow" | awk -F: '{ total += $2 } END { print total + 0 }')" == 2 ]] ||
   die "both model jobs must use opencode --pure run"
-rg -q 'environment: opencode-review' "$review_workflow" || die "review environment is missing"
-rg -q 'environment: opencode-build' "$build_workflow" || die "build environment is missing"
-rg -q 'draft: true' "$build_workflow" || die "build publisher is not draft-only"
-rg -q 'branch="opencode/\$\{RUN_ID\}"' "$build_workflow" || die "branch name is not stable across retries"
-rg -q 'opencode-review:\$\{RUN_ID\}:\$\{TARGET_SHA\}:\$\{COMMAND\}' "$review_workflow" ||
+grep -Fq -- 'environment: opencode-review' "$review_workflow" || die "review environment is missing"
+grep -Fq -- 'environment: opencode-build' "$build_workflow" || die "build environment is missing"
+grep -Fq -- 'draft: true' "$build_workflow" || die "build publisher is not draft-only"
+grep -Fq -- 'branch="opencode/${RUN_ID}"' "$build_workflow" || die "branch name is not stable across retries"
+grep -Fq -- 'opencode-review:${RUN_ID}:${TARGET_SHA}:${COMMAND}' "$review_workflow" ||
   die "review publication marker is missing"
-rg -q 'opencode-build:\$\{RUN_ID\}:\$\{PATCH_SHA256\}' "$build_workflow" ||
+grep -Fq -- 'opencode-build:${RUN_ID}:${PATCH_SHA256}' "$build_workflow" ||
   die "build publication marker is missing"
 pass "static trust boundaries and deterministic draft-only publishing are present"
 
 awk '/^  model:/{active=1} /^  publish:/{active=0} active{print}' "$review_workflow" >"$tmp_dir/review-model-job.yml"
 awk '/^  model:/{active=1} /^  publish:/{active=0} active{print}' "$build_workflow" >"$tmp_dir/build-model-job.yml"
 awk '/^  publish:/{active=1} active{print}' "$build_workflow" >"$tmp_dir/build-publish-job.yml"
-! rg -q 'GH_TOKEN|contents:[[:space:]]*write|pull-requests:[[:space:]]*write' "$tmp_dir/review-model-job.yml" ||
+! grep -Eq -- 'GH_TOKEN|contents:[[:space:]]*write|pull-requests:[[:space:]]*write' "$tmp_dir/review-model-job.yml" ||
   die "review model job has GitHub write credentials"
-! rg -q 'GH_TOKEN|contents:[[:space:]]*write|pull-requests:[[:space:]]*write' "$tmp_dir/build-model-job.yml" ||
+! grep -Eq -- 'GH_TOKEN|contents:[[:space:]]*write|pull-requests:[[:space:]]*write' "$tmp_dir/build-model-job.yml" ||
   die "build model job has GitHub write credentials"
-! rg -q 'OPENCODE_API_KEY|environment:[[:space:]]*opencode-' "$tmp_dir/build-publish-job.yml" ||
+! grep -Eq -- 'OPENCODE_API_KEY|environment:[[:space:]]*opencode-' "$tmp_dir/build-publish-job.yml" ||
   die "build publish job has provider credentials"
 pass "provider and GitHub write credentials are separated by job"
 
@@ -117,7 +117,7 @@ credential_denies=(
 )
 for workflow in "$review_workflow" "$build_workflow"; do
   for denied_path in "${credential_denies[@]}"; do
-    [[ "$(rg -o -F "\"$denied_path\":\"deny\"" "$workflow" | wc -l)" -eq 2 ]] ||
+    [[ "$(grep -oF -- "\"$denied_path\":\"deny\"" "$workflow" | wc -l)" -eq 2 ]] ||
       die "model config does not deny $denied_path at both global and agent scope"
   done
 done
@@ -157,7 +157,7 @@ jq -e '
   die "build model config exposes an alternate content-returning tool"
 pass "workflow model configs close alternate content-tool paths around read denies"
 
-mapfile -t uses_lines < <(rg --no-filename '^[[:space:]]*uses:' "$review_workflow" "$build_workflow")
+mapfile -t uses_lines < <(grep -hE -- '^[[:space:]]*uses:' "$review_workflow" "$build_workflow")
 ((${#uses_lines[@]} == 3)) || die "unexpected action count"
 for uses_line in "${uses_lines[@]}"; do
   [[ "$uses_line" =~ @([0-9a-f]{40})([[:space:]]|$) ]] || die "action is not pinned to an immutable SHA: $uses_line"
@@ -200,8 +200,8 @@ run_review_gate() {
 }
 
 run_review_gate "$tmp_dir/review-event.json" "$tmp_dir/review.out"
-rg -q '^command=review$' "$tmp_dir/review.out" || die "review command output is wrong"
-rg -q "^target_sha=${sha}$" "$tmp_dir/review.out" || die "review target SHA output is wrong"
+grep -Fxq -- 'command=review' "$tmp_dir/review.out" || die "review command output is wrong"
+grep -Fxq -- "target_sha=${sha}" "$tmp_dir/review.out" || die "review target SHA output is wrong"
 pass "review gate accepts one exact owner command on a same-repository PR SHA"
 
 jq '.comment.user.id = 9' "$tmp_dir/review-event.json" >"$tmp_dir/review-hostile-user.json"
@@ -257,8 +257,8 @@ run_build_gate() {
 }
 
 run_build_gate "$tmp_dir/policy.json" "$tmp_dir/build.out"
-rg -q '^default_branch=main$' "$tmp_dir/build.out" || die "build default branch output is wrong"
-rg -q "^target_sha=${sha}$" "$tmp_dir/build.out" || die "build target SHA output is wrong"
+grep -Fxq -- 'default_branch=main' "$tmp_dir/build.out" || die "build default branch output is wrong"
+grep -Fxq -- "target_sha=${sha}" "$tmp_dir/build.out" || die "build target SHA output is wrong"
 pass "build gate accepts owner dispatch on the live default-branch SHA with strict policy"
 
 jq '.unexpected = true' "$tmp_dir/policy.json" >"$tmp_dir/policy-extra-key.json"
@@ -381,7 +381,7 @@ review_model_head="$(git -C "$review_model_repo" rev-parse HEAD)"
 [[ "$(git -C "$review_model_repo" rev-parse HEAD)" == "$review_model_head" &&
    -z "$(git -C "$review_model_repo" status --porcelain)" ]] ||
   die "offline review fixture mutated the repository"
-rg -q '^response_base64=' "$review_model_output" ||
+grep -Eq -- '^response_base64=' "$review_model_output" ||
   die "offline review fixture did not emit bounded output"
 pass "offline fixture enforces the exact pure-mode invocation and isolated runtime contract"
 
@@ -681,7 +681,7 @@ run_review_publish() {
 : >"$review_curl_log"
 expect_fail "review publisher reports an ambiguous one-shot POST without retrying" \
   run_review_publish "" review-fail
-[[ "$(rg -c '^POST ' "$review_curl_log" || true)" == "1" ]] ||
+[[ "$(grep -cE -- '^POST ' "$review_curl_log" || true)" == "1" ]] ||
   die "review publisher attempted its POST more than once"
 review_marker="<!-- opencode-review:7001:${sha}:review -->"
 jq -n --arg body "$review_marker" '[{user: {id: 41898282}, body: $body}]' >"$tmp_dir/existing-comments.json"
@@ -763,9 +763,9 @@ run_build_publish() {
 : >"$build_git_log"
 expect_fail "build publisher reports an ambiguous one-shot PR POST without retrying" \
   run_build_publish "$build_publish_repo" build-fail
-[[ "$(rg -c '^POST ' "$build_curl_log" || true)" == "1" ]] ||
+[[ "$(grep -cE -- '^POST ' "$build_curl_log" || true)" == "1" ]] ||
   die "build publisher attempted its PR POST more than once"
-[[ "$(rg -c '^PUSH ' "$build_git_log" || true)" == "1" ]] ||
+[[ "$(grep -cE -- '^PUSH ' "$build_git_log" || true)" == "1" ]] ||
   die "build publisher did not make exactly one deterministic branch push"
 
 : >"$build_curl_log"
@@ -779,7 +779,7 @@ pass "build rerun preflight suppresses duplicate branches and pull requests afte
 : >"$build_git_log"
 expect_fail "closed deterministic build pull request is terminal" \
   run_build_publish "$build_closed_repo" build-closed
-rg -q 'closed or merged; that run is terminal' "$tmp_dir/expected-failure.err" ||
+grep -Fq -- 'closed or merged; that run is terminal' "$tmp_dir/expected-failure.err" ||
   die "closed build pull request did not report terminal state"
 [[ ! -s "$build_curl_log" && ! -s "$build_git_log" ]] ||
   die "terminal build pull request caused a write"
@@ -794,8 +794,8 @@ pass "closed build results are terminal and human-promoted results remain read-o
 : >"$build_curl_log"
 : >"$build_git_log"
 run_build_publish "$build_success_repo" build-success
-[[ "$(rg -c '^POST ' "$build_curl_log" || true)" == "1" &&
-   "$(rg -c '^PUSH ' "$build_git_log" || true)" == "1" ]] ||
+[[ "$(grep -cE -- '^POST ' "$build_curl_log" || true)" == "1" &&
+   "$(grep -cE -- '^PUSH ' "$build_git_log" || true)" == "1" ]] ||
   die "successful build publication did not perform one push and one PR POST"
 pass "build publisher verifies a freshly persisted branch, commit, and pull request"
 
@@ -803,14 +803,14 @@ pass "build publisher verifies a freshly persisted branch, commit, and pull requ
 : >"$build_git_log"
 expect_fail "build publisher rejects mismatched PR head response" \
   run_build_publish "$build_head_mismatch_repo" build-pr-head-mismatch
-[[ "$(rg -c '^POST ' "$build_curl_log" || true)" == "1" ]] ||
+[[ "$(grep -cE -- '^POST ' "$build_curl_log" || true)" == "1" ]] ||
   die "mismatched build PR response was retried"
 
 : >"$build_curl_log"
 : >"$build_git_log"
 expect_fail "build publisher rejects mismatched persisted PR" \
   run_build_publish "$build_persisted_mismatch_repo" build-persisted-mismatch
-[[ "$(rg -c '^POST ' "$build_curl_log" || true)" == "1" ]] ||
+[[ "$(grep -cE -- '^POST ' "$build_curl_log" || true)" == "1" ]] ||
   die "mismatched persisted build PR was retried"
 pass "build publisher fails closed on response and persisted-state mismatches"
 

@@ -890,7 +890,7 @@ grep -Fq 'ambiguous response' <<<"$invalid_pr_output"
 grep -Fq 'rerun the exact preflight' <<<"$invalid_pr_output"
 [[ "$(grep -Fc $'POST\trepos/Ayyitskevin/ExampleStandard/pulls' "$invalid_pr_log")" == 1 ]]
 
-if rg -n 'sk-[A-Za-z0-9]|BEGIN [A-Z ]*PRIVATE KEY|OPENCODE_API_KEY' "$capture_dir"; then
+if grep -rIEn -- 'sk-[A-Za-z0-9]|BEGIN [A-Z ]*PRIVATE KEY|OPENCODE_API_KEY' "$capture_dir"; then
   printf 'captured rollout payload contained secret material or a secret binding\n' >&2
   exit 1
 fi
