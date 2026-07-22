@@ -35,6 +35,7 @@ The manifest's risk and GitHub-mode pair is authoritative:
 | --- | --- | --- |
 | `standard` | `manual-build` | owner comment review plus protected manual draft-PR build |
 | `restricted` | `review` | owner comment review only; no patch authority |
+| `restricted` | `manual` | local/manual work only; no remote caller |
 | `upstream` | `manual` | no remote caller; local/manual review only |
 | `placeholder` | `disabled` | no files or first commit |
 
@@ -62,7 +63,7 @@ scripts/render-callers \
 ```
 
 The output directory must be absent or empty. Rendering a placeholder,
-disabled repository, or upstream/manual repository fails closed.
+disabled repository, or manual-only repository fails closed.
 
 That standalone command is an offline rendering aid. The rollout command does
 not trust the working tree, an environment manifest override, or local template
@@ -201,9 +202,9 @@ draft pull request or changes repository settings.
   rollout remains blocked until `opencode-review` and its environment secret
   exist.
 - **Apollo, Themis, Harmonia, and Prometheus:** empty placeholders remain empty.
-- **Minerva:** `main` contains only its empty initialization commit while
-  product content remains on an unmerged draft pull request. The rollout
-  refuses to create first product content or race that review.
+- **Minerva:** product content is merged on `main`; the active repository stays
+  `restricted` and local/manual-only, so no remote caller is rendered or
+  installed.
 - **opencode-fleet:** publish and verify the central repository first; a consumer
   caller must pin the resulting exact central commit like every other caller.
 

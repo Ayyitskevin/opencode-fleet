@@ -359,11 +359,17 @@ minerva_plan="$(
   env "${common_env[@]}" FAKE_GH_LOG="$minerva_log" \
     "$fleet_root/scripts/github-rollout" Minerva --central-sha "$central_sha"
 )"
-jq -e '.ready == false and (.blockers[0] | contains("unmerged draft PR"))' \
+jq -e '
+  .ready == false and
+  .state == "active" and
+  .risk == "restricted" and
+  .githubMode == "manual" and
+  (.blockers[0] | contains("local-manual-only"))
+' \
   <<<"$minerva_plan" >/dev/null
 if grep -Eq $'^GET\trepos/Ayyitskevin/Minerva|^(POST|PUT|PATCH|DELETE)' \
    "$minerva_log"; then
-  printf 'placeholder repository reached consumer state or mutation\n' >&2
+  printf 'local-manual-only repository reached consumer state or mutation\n' >&2
   exit 1
 fi
 assert_fails env "${common_env[@]}" FAKE_GH_LOG="$minerva_log" \

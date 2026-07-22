@@ -206,10 +206,10 @@
     {
       "name": "Minerva",
       "fullName": "Ayyitskevin/Minerva",
-      "state": "placeholder",
+      "state": "active",
       "defaultBranch": "main",
-      "risk": "placeholder",
-      "githubMode": "disabled"
+      "risk": "restricted",
+      "githubMode": "manual"
     }
   ]
 }

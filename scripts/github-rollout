@@ -237,8 +237,6 @@ emit_non_rollout_plan() {
 
 if [[ "$repository_state" != active || "$github_mode" == disabled ]]; then
   reason="$repository_name is an empty placeholder; rollout must wait for its first intentional commit"
-  [[ "$repository_name" != Minerva ]] || \
-    reason="Minerva main is an empty initialization commit while product content remains on an unmerged draft PR; rollout must not create the first main content commit or race that review"
   emit_non_rollout_plan "$reason"
   [[ "$apply" == false ]] || exit 1
   exit 0
@@ -246,7 +244,7 @@ fi
 
 if [[ "$github_mode" == manual ]]; then
   emit_non_rollout_plan \
-    "$repository_name is upstream/local-manual-only; the comment workflow is intentionally not installed"
+    "$repository_name is local-manual-only; the comment workflow is intentionally not installed"
   [[ "$apply" == false ]] || exit 1
   exit 0
 fi

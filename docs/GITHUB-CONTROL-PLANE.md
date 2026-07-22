@@ -128,7 +128,9 @@ rejects:
 - paths not explicitly allowed by the repository policy;
 - deletions, renames, unmerged entries, mode changes, symlinks, submodules, binary patches, whitespace errors, excess files, and excess bytes.
 
-Restricted or review-only repositories do not receive the manual build caller. `curriculum` remains local/manual and should not be enrolled in this remote mutation path.
+Restricted or review-only repositories do not receive the manual build caller.
+`curriculum` and `Minerva` remain local/manual and must not be enrolled in this
+remote mutation path.
 
 ## Installation and provenance
 

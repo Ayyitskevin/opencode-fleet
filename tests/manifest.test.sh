@@ -14,16 +14,16 @@ jq -e '
   .schemaVersion == 1 and
   .owner == "Ayyitskevin" and
   (.workspaceRoot | startswith("/")) and
-  ([.repositories[] | select(.state == "active")] | length == 21) and
-  ([.repositories[] | select(.state == "placeholder")] | length == 5) and
+  ([.repositories[] | select(.state == "active")] | length == 22) and
+  ([.repositories[] | select(.state == "placeholder")] | length == 4) and
   ([.repositories[] | select(.state == "active") | .name] | sort) == [
     "Chronos", "Focal", "Hermes", "Hippocrates", "Icarus", "Iris",
-    "Midas", "Tyche", "Vulcan", "aphrodite", "argus", "athena",
+    "Midas", "Minerva", "Tyche", "Vulcan", "aphrodite", "argus", "athena",
     "atlas", "curriculum", "dionysus", "eos", "hestia",
     "kleephotography", "mnemosyne", "opencode-fleet", "plutus"
   ] and
   ([.repositories[] | select(.state == "placeholder") | .name] | sort) == [
-    "Apollo", "Harmonia", "Minerva", "Prometheus", "Themis"
+    "Apollo", "Harmonia", "Prometheus", "Themis"
   ] and
   ([.repositories[].name | ascii_downcase] | length == (unique | length)) and
   ([.repositories[].fullName | ascii_downcase] |
@@ -46,7 +46,10 @@ jq -e '
   (.repositories[] | select(.name == "Chronos") |
     .defaultBranch == "feat/wheel-dashboard-mvp") and
   (.repositories[] | select(.name == "Hippocrates") |
-    .githubMode == "review")
+    .githubMode == "review") and
+  (.repositories[] | select(.name == "Minerva") |
+    .state == "active" and .risk == "restricted" and
+    .githubMode == "manual")
 ' "$manifest" >/dev/null
 
 jq -e '

@@ -143,7 +143,7 @@ an offline fixture to prove that the host invokes the exact
 does not execute a provider or claim to prove the upstream CLI's isolation
 semantics; a live pilot remains a separate human-approved acceptance step.
 
-The GitHub rollout inventory contains 21 active repositories and five explicit
+The GitHub rollout inventory contains 22 active repositories and four explicit
 placeholders. Every active repository is addressable by the local launcher;
 placeholder entries remain disabled until their first intentional product
 commit. Remote caller rollout is separate, one repository at a time, and
