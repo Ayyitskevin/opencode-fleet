@@ -185,7 +185,9 @@ case "$endpoint" in
     exit 0
     ;;
   repos/Ayyitskevin/opencode-fleet/git/ref/heads/main)
-    printf '{"ref":"refs/heads/main","object":{"type":"commit","sha":"7777777777777777777777777777777777777777"}}\n'
+    central_head="${FAKE_GH_CENTRAL_HEAD:-7777777777777777777777777777777777777777}"
+    printf '{"ref":"refs/heads/main","object":{"type":"commit","sha":"%s"}}\n' \
+      "$central_head"
     exit 0
     ;;
   repos/Ayyitskevin/opencode-fleet/git/commits/*)
@@ -200,14 +202,24 @@ case "$endpoint" in
     merge_base="$base"
     [[ "${FAKE_GH_UNAUTHORIZED_CENTRAL_SHA:-0}" != 1 ]] ||
       merge_base=8888888888888888888888888888888888888888
-    jq -cn --arg base "$base" --arg head "$head" --arg merge "$merge_base" '
-      {
-        status: (if $base == $head then "identical" else "ahead" end),
-        base_commit: {sha: $base},
-        merge_base_commit: {sha: $merge},
-        head_commit: {sha: $head}
-      }
-    '
+    if [[ "$base" == "$head" || "${FAKE_GH_FALSE_IDENTICAL:-0}" == 1 ]]; then
+      jq -cn --arg base "$base" --arg merge "$merge_base" '
+        {
+          status: "identical",
+          base_commit: {sha: $base},
+          merge_base_commit: {sha: $merge}
+        }
+      '
+    else
+      jq -cn --arg base "$base" --arg head "$head" --arg merge "$merge_base" '
+        {
+          status: "ahead",
+          base_commit: {sha: $base},
+          merge_base_commit: {sha: $merge},
+          head_commit: {sha: $head}
+        }
+      '
+    fi
     exit 0
     ;;
   repos/Ayyitskevin/opencode-fleet/contents/*?ref=*)

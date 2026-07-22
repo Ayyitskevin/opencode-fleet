@@ -78,6 +78,22 @@ fetch_api() {
   gh api "$endpoint" >"$destination" 2>/dev/null
 }
 
+central_lineage_is_authorized() {
+  local comparison_file="$1"
+  local base="$2"
+  local head="$3"
+
+  jq -e --arg base "$base" --arg head "$head" '
+    .base_commit.sha == $base and .merge_base_commit.sha == $base and
+    (
+      (.status == "ahead" and $base != $head and
+        .head_commit.sha == $head) or
+      (.status == "identical" and $base == $head and
+        .head_commit == null)
+    )
+  ' "$comparison_file" >/dev/null
+}
+
 urlencode() {
   jq -rn --arg value "$1" '$value | @uri'
 }
@@ -150,11 +166,8 @@ jq -e --arg sha "$central_sha" '
 central_compare_json="$temp_root/central-compare.json"
 fetch_api "repos/$owner_login/opencode-fleet/compare/$central_sha...$central_head" "$central_compare_json" ||
   die "central default-branch lineage is unavailable"
-jq -e --arg base "$central_sha" --arg head "$central_head" '
-  (.status == "ahead" or .status == "identical") and
-  .base_commit.sha == $base and .merge_base_commit.sha == $base and
-  .head_commit.sha == $head
-' "$central_compare_json" >/dev/null ||
+central_lineage_is_authorized \
+  "$central_compare_json" "$central_sha" "$central_head" ||
   die "supplied central commit is not in the authorized default-branch lineage"
 
 fetch_central_file "config/repos.json" 1048576
@@ -817,11 +830,8 @@ rechecked_central_head="$(jq -r '.object.sha' "$central_ref_recheck_json")"
 central_compare_recheck_json="$temp_root/central-compare-recheck.json"
 fetch_api "repos/$owner_login/opencode-fleet/compare/$central_sha...$rechecked_central_head" "$central_compare_recheck_json" ||
   die "central default-branch lineage became unavailable after planning"
-jq -e --arg base "$central_sha" --arg head "$rechecked_central_head" '
-  (.status == "ahead" or .status == "identical") and
-  .base_commit.sha == $base and .merge_base_commit.sha == $base and
-  .head_commit.sha == $head
-' "$central_compare_recheck_json" >/dev/null ||
+central_lineage_is_authorized \
+  "$central_compare_recheck_json" "$central_sha" "$rechecked_central_head" ||
   die "supplied central commit left the authorized default-branch lineage"
 
 # All external writes begin below this line, after every readiness gate and the

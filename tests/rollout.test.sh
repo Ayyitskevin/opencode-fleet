@@ -6,6 +6,7 @@ test_path="$(readlink -f "${BASH_SOURCE[0]}")"
 fleet_root="$(cd "$(dirname "$test_path")/.." && pwd)"
 manifest="$fleet_root/tests/fixtures/fleet-rollout-repos.json"
 central_sha=0123456789abcdef0123456789abcdef01234567
+central_head_sha=7777777777777777777777777777777777777777
 temp_root="$(mktemp -d)"
 trap 'rm -rf "$temp_root"' EXIT
 
@@ -212,12 +213,30 @@ jq -e '.ready == true and .fullName == "Ayyitskevin/ExampleRestricted"' \
   <<<"$public_central_plan" >/dev/null
 grep -Fq $'GET\trepos/Ayyitskevin/opencode-fleet' "$public_central_log"
 
+# GitHub omits head_commit when the pinned commit is the exact branch head.
+# Exact equality is still an authorized lineage and must remain read-only.
+exact_head_log="$temp_root/exact-head.log"
+exact_head_plan="$(
+  env "${common_env[@]}" \
+    FAKE_GH_LOG="$exact_head_log" \
+    FAKE_GH_CENTRAL_HEAD="$central_head_sha" \
+    "$fleet_root/scripts/github-rollout" \
+    ExampleRestricted --central-sha "$central_head_sha"
+)"
+jq -e '.ready == true and .fullName == "Ayyitskevin/ExampleRestricted"' \
+  <<<"$exact_head_plan" >/dev/null
+if grep -Eq '^(POST|PUT|PATCH|DELETE)' "$exact_head_log"; then
+  printf 'exact-head lineage plan attempted a GitHub write\n' >&2
+  exit 1
+fi
+
 central_trust_cases=(
   'FAKE_GH_PRIVATE_CENTRAL|explicitly public'
   'FAKE_GH_MISSING_CENTRAL_VISIBILITY|explicitly public'
   'FAKE_GH_MISSING_CENTRAL_PRIVATE|explicitly public'
   'FAKE_GH_CONTRADICTORY_CENTRAL_VISIBILITY|explicitly public'
   'FAKE_GH_UNAUTHORIZED_CENTRAL_SHA|authorized default-branch lineage'
+  'FAKE_GH_FALSE_IDENTICAL|authorized default-branch lineage'
   'FAKE_GH_BAD_CENTRAL_BLOB|does not match its Git blob ID'
 )
 for central_trust_case in "${central_trust_cases[@]}"; do
@@ -825,6 +844,7 @@ capture_dir="$temp_root/captured"
 apply_result="$(
   env "${common_env[@]}" \
     "${generated_tree_env[@]}" \
+    FAKE_GH_CENTRAL_HEAD="$central_sha" \
     FAKE_GH_LOG="$apply_log" \
     FAKE_GH_CAPTURE_DIR="$capture_dir" \
     "$fleet_root/scripts/github-rollout" \
@@ -841,6 +861,8 @@ grep -Fq $'POST\trepos/Ayyitskevin/ExampleStandard/git/trees' "$apply_log"
 grep -Fq $'POST\trepos/Ayyitskevin/ExampleStandard/git/commits' "$apply_log"
 grep -Fq $'POST\trepos/Ayyitskevin/ExampleStandard/git/refs' "$apply_log"
 grep -Fq $'POST\trepos/Ayyitskevin/ExampleStandard/pulls' "$apply_log"
+exact_compare_request=$'GET\t'"repos/Ayyitskevin/opencode-fleet/compare/$central_sha...$central_sha"
+[[ "$(grep -Fc "$exact_compare_request" "$apply_log")" == 2 ]]
 if awk -F '\t' '
   $1 != "GET" && $2 !~ /^repos\/Ayyitskevin\/ExampleStandard\// { bad = 1 }
   END { exit bad ? 0 : 1 }
