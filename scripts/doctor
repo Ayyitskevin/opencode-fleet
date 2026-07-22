@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+manifest="${OPENCODE_FLEET_MANIFEST:-$fleet_root/config/repos.json}"
+config="${OPENCODE_FLEET_CONFIG:-$fleet_root/config/opencode.jsonc}"
+guard="${OPENCODE_FLEET_GUARD:-$fleet_root/config/runtime-guard.json}"
+routes="${OPENCODE_FLEET_ROUTES:-$fleet_root/config/model-routes.json}"
+versions="${OPENCODE_FLEET_VERSIONS:-$fleet_root/config/versions.json}"
+opencode_bin="${OPENCODE_FLEET_BIN:-$HOME/.opencode/bin/opencode}"
+installed_config="${OPENCODE_FLEET_INSTALLED_CONFIG:-$HOME/.config/opencode/opencode.jsonc}"
+installed_launcher="${OPENCODE_FLEET_INSTALLED_LAUNCHER:-$HOME/.local/bin/oc}"
+state_root="${OPENCODE_FLEET_STATE_ROOT:-$HOME/.local/state/opencode-fleet}"
+cli_record="${OPENCODE_FLEET_CLI_RECORD:-$state_root/cli-install.json}"
+strict=false
+
+usage() {
+  printf 'Usage: doctor [--strict]\n'
+}
+
+case "${1:-}" in
+  "")
+    ;;
+  --strict)
+    strict=true
+    shift
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    printf 'doctor: unknown argument: %s\n' "$1" >&2
+    exit 2
+    ;;
+esac
+if (($#)); then
+  printf 'doctor: unexpected argument: %s\n' "$1" >&2
+  exit 2
+fi
+
+failures=0
+warnings=0
+
+pass() {
+  printf 'ok   %s\n' "$*"
+}
+
+warn() {
+  printf 'warn %s\n' "$*"
+  warnings=$((warnings + 1))
+}
+
+fail() {
+  printf 'FAIL %s\n' "$*" >&2
+  failures=$((failures + 1))
+}
+
+normalize_github_remote() {
+  local remote="$1"
+  local slug
+
+  case "$remote" in
+    git@github.com:*) slug="${remote#git@github.com:}" ;;
+    ssh://git@github.com/*) slug="${remote#ssh://git@github.com/}" ;;
+    https://github.com/*) slug="${remote#https://github.com/}" ;;
+    *) return 1 ;;
+  esac
+  [[ "$slug" != *'?'* && "$slug" != *'#'* && "$slug" != *'@'* ]] || return 1
+  slug="${slug%.git}"
+  [[ "$slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    return 1
+  printf '%s\n' "$slug"
+}
+
+check_private_mode() {
+  local path="$1"
+  local label="$2"
+  local mode
+
+  if [[ ! -e "$path" ]]; then
+    warn "$label is not installed"
+    return
+  fi
+  mode="$(stat -c %a "$path" 2>/dev/null || true)"
+  if [[ "$mode" == "600" || "$mode" == "700" ]]; then
+    pass "$label has private mode"
+  else
+    fail "$label must have mode 600 or 700"
+  fi
+}
+
+validate_clone() {
+  local path="$1"
+  local expected="$2"
+  local top common remote normalized
+  local -a origins push_urls
+
+  if [[ ! -d "$path" || -L "$path" || ! -d "$path/.git" || -L "$path/.git" ]]; then
+    return 1
+  fi
+  top="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  top="$(realpath -e "$top" 2>/dev/null)" || return 1
+  [[ "$top" == "$path" ]] || return 1
+  common="$(git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+    return 1
+  common="$(realpath -e "$common" 2>/dev/null)" || return 1
+  [[ "$common" == "$path/.git" ]] || return 1
+
+  mapfile -t origins < <(git -C "$path" config --get-all remote.origin.url || true)
+  [[ "${#origins[@]}" -eq 1 ]] || return 1
+  normalized="$(normalize_github_remote "${origins[0]}")" || return 1
+  [[ "${normalized,,}" == "${expected,,}" ]] || return 1
+
+  mapfile -t push_urls < <(git -C "$path" config --get-all remote.origin.pushurl || true)
+  for remote in "${push_urls[@]}"; do
+    normalized="$(normalize_github_remote "$remote")" || return 1
+    [[ "${normalized,,}" == "${expected,,}" ]] || return 1
+  done
+}
+
+for command_name in jq git flock realpath stat sha256sum sed cut readlink grep; do
+  if command -v "$command_name" >/dev/null 2>&1; then
+    pass "dependency $command_name"
+  else
+    fail "missing dependency $command_name"
+  fi
+done
+
+for file in "$manifest" "$config" "$guard" "$routes" "$versions"; do
+  if [[ -r "$file" ]]; then
+    pass "readable ${file#$fleet_root/}"
+  else
+    fail "required policy file is unreadable"
+  fi
+done
+
+manifest_valid=false
+if jq -e '
+  .schemaVersion == 1 and
+  (.owner | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9.-]*$")) and
+  (.workspaceRoot | type == "string" and startswith("/") and
+    (test("[\\r\\n]") | not) and (contains("\u0000") | not)) and
+  (.repositories | type == "array" and length > 0) and
+  (.owner as $owner |
+    all(.repositories[];
+      (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+      .fullName == ($owner + "/" + .name) and
+      (.state == "active" or .state == "placeholder") and
+      (.defaultBranch | type == "string" and length > 0 and
+        (test("[\\r\\n]") | not)) and
+      (.risk == "upstream" or .risk == "restricted" or
+       .risk == "standard" or .risk == "placeholder") and
+      (.githubMode == "manual" or .githubMode == "review" or
+       .githubMode == "manual-build" or .githubMode == "disabled") and
+      (if .state == "placeholder"
+       then .risk == "placeholder" and .githubMode == "disabled"
+       else .risk != "placeholder" and .githubMode != "disabled"
+       end)
+    )
+  ) and
+  ([.repositories[].name | ascii_downcase] | length == (unique | length)) and
+  ([.repositories[].fullName | ascii_downcase] |
+    length == (unique | length))
+' "$manifest" >/dev/null 2>&1; then
+  pass "strict manifest schema and identities"
+  manifest_valid=true
+else
+  fail "strict manifest schema or identity"
+fi
+
+routes_valid=false
+if jq -e '
+  .schemaVersion == 1 and
+  .routes == {
+    plan: {agent: "fleet-plan", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
+    build: {agent: "fleet-build", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
+    review: {agent: "fleet-review", model: "ollama/qwen3-coder:30b", costClass: "local-mid"}
+  } and
+  .ceiling == {
+    model: "ollama/qwen3-coder-next:q8_0",
+    costClass: "local-ceiling"
+  } and
+  (.cloud.enabled | type == "boolean") and
+  (.cloud.allowlist | type == "array") and
+  all(.cloud.allowlist[];
+    type == "string" and
+    test("^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$") and
+    (startswith("ollama/") | not)
+  ) and
+  (.cloud.allowlist | length == (unique | length))
+' "$routes" >/dev/null 2>&1; then
+  pass "deterministic local routes and explicit cloud policy"
+  routes_valid=true
+  if [[ "$(jq -r '.cloud.enabled' "$routes")" == true ]]; then
+    warn "paid cloud routing is enabled"
+  else
+    pass "cloud routing disabled"
+  fi
+else
+  fail "model route policy"
+fi
+
+config_json="$(sed '/^[[:space:]]*\/\//d' "$config" 2>/dev/null || true)"
+config_valid=false
+if jq -e . <<<"$config_json" >/dev/null 2>&1; then
+  config_valid=true
+  pass "staged JSONC parses after comment removal"
+  if jq -e '
+    .model == "ollama/qwen3-coder:30b" and
+    .small_model == "ollama/gpt-oss:20b" and
+    .enabled_providers == ["ollama"] and
+    (.provider | keys) == ["ollama"] and
+    (.provider.ollama | keys | sort) == ["models", "name", "npm", "options"] and
+    .provider.ollama.npm == "@ai-sdk/openai-compatible" and
+    .provider.ollama.name == "Ollama (mickey loopback)" and
+    .provider.ollama.options == {baseURL: "http://127.0.0.1:11434/v1"} and
+    (.provider.ollama.models | type) == "object" and
+    (.provider.ollama.models | has("gpt-oss:20b")) and
+    (.provider.ollama.models | has("qwen3-coder:30b")) and
+    (.provider.ollama.models | has("qwen3-coder-next:q8_0")) and
+    .share == "disabled" and
+    .autoupdate == false and
+    .default_agent == "fleet-plan" and
+    .permission.external_directory == "deny" and
+    .permission.webfetch == "deny" and
+    .permission.websearch == "deny" and
+    .permission.task == "deny" and
+    .permission.grep == "deny" and .permission.lsp == "deny" and
+    ([.. | objects | .bash? | select(type == "object") | .[]] |
+      all(. != "allow")) and
+    .agent["fleet-plan"].permission.edit == "deny" and
+    .agent["fleet-plan"].permission.bash == "deny" and
+    .agent["fleet-review"].permission.edit == "deny" and
+    .agent["fleet-build"].permission.edit == "allow"
+  ' <<<"$config_json" >/dev/null; then
+    pass "staged loopback provider, fail-closed permissions, and no shell allow rules"
+  else
+    fail "staged provider or fail-closed permissions"
+  fi
+else
+  fail "staged JSONC syntax"
+fi
+
+if jq -e '
+  .share == "disabled" and
+  .autoupdate == false and
+  .enabled_providers == ["ollama"] and
+  (.permission | keys | sort) ==
+    ["*", "bash", "external_directory", "grep", "lsp", "read", "skill",
+     "task", "webfetch", "websearch"] and
+  .permission.external_directory == "deny" and
+  .permission.webfetch == "deny" and
+  .permission.websearch == "deny" and
+  .permission.task == "deny" and
+  .permission.grep == "deny" and .permission.lsp == "deny" and
+  .permission.bash["*"] == "ask" and
+  ([.. | objects | .bash? | select(type == "object") | .[]] |
+    all(. != "allow")) and
+  .agent["fleet-plan"].permission.edit == "deny" and
+  .agent["fleet-plan"].permission.bash == "deny" and
+  .agent["fleet-review"].permission.edit == "deny" and
+  .agent["fleet-build"].permission.edit == "allow"
+' "$guard" >/dev/null 2>&1; then
+  pass "runtime guard authority and no shell allow rules"
+else
+  fail "runtime guard authority"
+fi
+
+if [[ "$config_valid" == true && "$routes_valid" == true ]]; then
+  missing_route_model=false
+  while IFS= read -r model; do
+    model_id="${model#ollama/}"
+    if ! jq -e --arg model "$model_id" \
+      '.provider.ollama.models[$model] != null' <<<"$config_json" >/dev/null; then
+      fail "route references a model absent from staged config"
+      missing_route_model=true
+    fi
+  done < <(jq -r '.routes[].model' "$routes")
+  [[ "$missing_route_model" == true ]] || pass "all local routes exist in staged config"
+fi
+
+retired_pattern='devstral|deepseek-r1|llama3\.3|llama4|phi4|olmo-3|magistral|nemotron-3-super|translategemma'
+if grep -Eq "$retired_pattern" "$config"; then
+  fail "retired fleet model remains in staged config"
+else
+  pass "retired fleet models absent"
+fi
+
+versions_valid=false
+if jq -e '
+  (keys == ["opencode"] or (keys | sort) == ["actionsCheckout", "opencode"]) and
+  (.opencode | keys | sort) ==
+    ["linuxX64Archive", "linuxX64Sha256", "version"] and
+  (.opencode.version | type == "string" and
+    test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+  (.opencode.linuxX64Archive | type == "string" and length > 0) and
+  (.opencode.linuxX64Sha256 | type == "string" and
+    test("^[0-9a-f]{64}$"))
+' "$versions" >/dev/null 2>&1; then
+  pass "strict OpenCode version and archive pins"
+  versions_valid=true
+else
+  fail "OpenCode version pin schema"
+fi
+
+expected_version="$(jq -r '.opencode.version // empty' "$versions" 2>/dev/null || true)"
+expected_archive_sha="$(jq -r '.opencode.linuxX64Sha256 // empty' "$versions" 2>/dev/null || true)"
+state_root_safe=false
+if [[ -d "$state_root" && ! -L "$state_root" &&
+      "$(realpath -e "$state_root" 2>/dev/null || true)" == "$state_root" ]]; then
+  state_root_safe=true
+  check_private_mode "$state_root" "fleet state root"
+else
+  fail "fleet state root is missing, non-canonical, or contains a symlink"
+fi
+binary_safe=false
+if [[ -f "$opencode_bin" && -x "$opencode_bin" && ! -L "$opencode_bin" ]]; then
+  binary_safe=true
+  if [[ "$(stat -c %u "$opencode_bin")" == "$(id -u)" ]]; then
+    pass "OpenCode binary is regular and user-owned"
+  else
+    fail "OpenCode binary is not owned by the current user"
+  fi
+  binary_mode="$(stat -c %a "$opencode_bin")"
+  if [[ "$binary_mode" == "700" ]]; then
+    pass "OpenCode binary has private executable mode"
+  else
+    fail "OpenCode binary must have mode 700"
+  fi
+  actual_version="$("$opencode_bin" --version 2>/dev/null || true)"
+  if [[ "$actual_version" == "$expected_version" ]]; then
+    pass "OpenCode version $actual_version"
+  else
+    fail "OpenCode version does not match the pin"
+  fi
+else
+  fail "OpenCode binary must be an executable regular file"
+fi
+
+if [[ "$binary_safe" == true && "$versions_valid" == true &&
+      "$state_root_safe" == true ]]; then
+  if [[ -f "$cli_record" && ! -L "$cli_record" ]] &&
+     jq -e \
+       --arg version "$expected_version" \
+       --arg archiveSha256 "$expected_archive_sha" \
+       --arg target "$opencode_bin" '
+         .schemaVersion == 1 and
+         (.status // "installed") == "installed" and
+         .version == $version and
+         .archiveSha256 == $archiveSha256 and
+         .target == $target and
+         (.binarySha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+         .installedType == "regular" and .mode == "700"
+       ' "$cli_record" >/dev/null 2>&1; then
+    pass "pinned CLI install record shape, version, and target"
+    actual_binary_sha="$(sha256sum "$opencode_bin" | cut -d' ' -f1)"
+    if [[ "$actual_binary_sha" == "$(jq -r '.binarySha256' "$cli_record")" ]]; then
+      pass "OpenCode binary digest matches its install record"
+    else
+      fail "OpenCode binary digest differs from its install record"
+    fi
+  else
+    fail "pinned OpenCode CLI install record"
+  fi
+else
+  fail "pinned OpenCode CLI install record cannot be verified"
+fi
+
+if [[ -f "$installed_config" && ! -L "$installed_config" ]]; then
+  check_private_mode "$installed_config" "installed OpenCode config"
+  installed_config_hash="$(sha256sum "$installed_config" | cut -d' ' -f1)"
+  staged_config_hash="$(sha256sum "$config" | cut -d' ' -f1)"
+  if [[ "$installed_config_hash" == "$staged_config_hash" ]]; then
+    pass "installed OpenCode config matches staged config"
+  else
+    warn "installed OpenCode config differs from staged config"
+  fi
+else
+  warn "installed OpenCode config is missing or not regular"
+fi
+
+if [[ -L "$installed_launcher" && -x "$installed_launcher" &&
+      "$(readlink -f "$installed_launcher")" == "$fleet_root/scripts/oc" ]]; then
+  pass "installed launcher is the exact canonical symlink"
+elif [[ -e "$installed_launcher" || -L "$installed_launcher" ]]; then
+  fail "installed launcher is not the exact canonical symlink"
+else
+  warn "installed launcher is missing"
+fi
+
+if [[ "$manifest_valid" == true ]]; then
+  workspace_root="${OPENCODE_FLEET_WORKSPACE_ROOT:-$(jq -r '.workspaceRoot' "$manifest")}"
+  if [[ ! -d "$workspace_root" || -L "$workspace_root" ||
+        "$(realpath -e "$workspace_root" 2>/dev/null || true)" != "$workspace_root" ]]; then
+    warn "dedicated workspace root is absent or non-canonical"
+  else
+    while IFS=$'\t' read -r name full_name state; do
+      repository_path="$workspace_root/$name"
+      if [[ "$state" == "placeholder" ]]; then
+        if [[ -e "$repository_path" ]]; then
+          warn "placeholder has unexpected local state: $name"
+        else
+          pass "placeholder remains unpopulated: $name"
+        fi
+        continue
+      fi
+
+      if [[ ! -e "$repository_path" ]]; then
+        warn "active dedicated clone is missing: $name"
+        continue
+      fi
+      if validate_clone "$repository_path" "$full_name"; then
+        pass "independent clone identity: $name"
+      else
+        fail "independent clone identity or origin policy: $name"
+        continue
+      fi
+      if [[ -f "$repository_path/AGENTS.md" ]]; then
+        pass "AGENTS.md: $name"
+      else
+        warn "AGENTS.md missing: $name"
+      fi
+    done < <(jq -r '.repositories[] | [.name, .fullName, .state] | @tsv' "$manifest")
+  fi
+fi
+
+printf 'doctor: failures=%d warnings=%d strict=%s\n' \
+  "$failures" "$warnings" "$strict"
+if [[ "$failures" -ne 0 ]]; then
+  exit 1
+fi
+if [[ "$strict" == true && "$warnings" -ne 0 ]]; then
+  exit 1
+fi

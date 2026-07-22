@@ -1,0 +1,231 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Local Ollama remains the installed default. scripts/oc chooses an exact
+  // model per mode from config/model-routes.json and never falls back.
+  "model": "ollama/qwen3-coder:30b",
+  "small_model": "ollama/gpt-oss:20b",
+  "enabled_providers": ["ollama"],
+  "default_agent": "fleet-plan",
+  "autoupdate": false,
+  "share": "disabled",
+  "snapshot": true,
+  "plugin": [],
+  "mcp": {},
+  "instructions": [],
+  "skills": {"paths": [], "urls": []},
+
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (mickey loopback)",
+      "options": {
+        "baseURL": "http://127.0.0.1:11434/v1"
+      },
+      "models": {
+        "gpt-oss:20b": {"name": "GPT-OSS 20B (simple)", "tools": true},
+        "qwen3-coder:30b": {"name": "Qwen3 Coder 30B (daily code)", "tools": true},
+        "qwen3-coder-next:q8_0": {"name": "Qwen3 Coder Next Q8 (code ceiling)", "tools": true},
+        "qwen3.6:27b": {"name": "Qwen3.6 27B", "tools": true},
+        "qwen3.6:35b": {"name": "Qwen3.6 35B (planning)", "tools": true},
+        "gemma4:26b": {"name": "Gemma4 26B", "tools": true},
+        "glm-4.7-flash": {"id": "glm-4.7-flash:latest", "name": "GLM 4.7 Flash", "tools": true},
+        "qwen3-next:80b": {"name": "Qwen3 Next 80B (heavy)", "tools": true},
+        "qwen3.5:122b": {"name": "Qwen3.5 122B (ceiling)", "tools": true},
+        "gpt-oss:120b": {"name": "GPT-OSS 120B (ceiling solo)", "tools": true},
+        "qwen3-vl:32b": {
+          "name": "Qwen3 VL 32B (work vision)",
+          "tools": true,
+          "modalities": {"input": ["text", "image"], "output": ["text"]}
+        }
+      }
+    }
+  },
+
+  "permission": {
+    "*": "ask",
+    "read": {
+      "*": "allow",
+      ".env": "deny",
+      ".env.*": "deny",
+      "**/.env": "deny",
+      "**/.env.*": "deny",
+      ".netrc": "deny",
+      "**/.netrc": "deny",
+      ".npmrc": "deny",
+      "**/.npmrc": "deny",
+      ".pypirc": "deny",
+      "**/.pypirc": "deny",
+      ".git-credentials": "deny",
+      "**/.git-credentials": "deny",
+      "credentials.json": "deny",
+      "**/credentials.json": "deny",
+      "secrets.json": "deny",
+      "**/secrets.json": "deny",
+      "secrets.yaml": "deny",
+      "**/secrets.yaml": "deny",
+      "secrets.yml": "deny",
+      "**/secrets.yml": "deny",
+      "*.pem": "deny",
+      "**/*.pem": "deny",
+      "*.key": "deny",
+      "**/*.key": "deny",
+      "*credentials*": "deny",
+      "**/*credentials*": "deny",
+      "id_rsa": "deny",
+      "**/id_rsa": "deny",
+      "id_ed25519": "deny",
+      "**/id_ed25519": "deny"
+    },
+    "glob": "allow",
+    "grep": "deny",
+    "lsp": "deny",
+    "edit": "ask",
+    "external_directory": "deny",
+    "webfetch": "deny",
+    "websearch": "deny",
+    "task": "deny",
+    "skill": "deny",
+    "bash": {
+      "*": "ask",
+      "bash *": "deny",
+      "*/bash *": "deny",
+      "sh *": "deny",
+      "*/sh *": "deny",
+      "zsh *": "deny",
+      "*/zsh *": "deny",
+      "env *": "deny",
+      "*/env *": "deny",
+      "command *": "deny",
+      "xargs *": "deny",
+      "*/xargs *": "deny",
+      "gh *": "deny",
+      "*/gh *": "deny",
+      "hub *": "deny",
+      "*/hub *": "deny",
+      "git remote set-url*": "deny",
+      "git config *credential*": "deny",
+      "git config *pushurl*": "deny",
+      "git push*": "deny",
+      "git * push*": "deny",
+      "/usr/bin/git push*": "deny",
+      "*/git push*": "deny",
+      "git reset --hard*": "deny",
+      "git clean*": "deny",
+      "rm -rf*": "deny",
+      "sudo *": "deny",
+      "*git*push*": "deny"
+    }
+  },
+
+  "agent": {
+    "fleet-plan": {
+      "description": "Read-only implementation planning inside one catalogued clone.",
+      "mode": "primary",
+      "permission": {
+        "edit": "deny",
+        "external_directory": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "task": "deny",
+        "skill": "deny",
+        "bash": "deny"
+      },
+      "tools": {
+        "skill": false
+      }
+    },
+    "fleet-review": {
+      "description": "Quality review without source edits or publication.",
+      "mode": "primary",
+      "permission": {
+        "edit": "deny",
+        "external_directory": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "task": "deny",
+        "skill": "deny",
+        "bash": {
+          "*": "ask",
+          "bash *": "deny",
+          "*/bash *": "deny",
+          "sh *": "deny",
+          "*/sh *": "deny",
+          "zsh *": "deny",
+          "*/zsh *": "deny",
+          "env *": "deny",
+          "*/env *": "deny",
+          "command *": "deny",
+          "xargs *": "deny",
+          "*/xargs *": "deny",
+          "gh *": "deny",
+          "*/gh *": "deny",
+          "hub *": "deny",
+          "*/hub *": "deny",
+          "git commit*": "deny",
+          "git remote set-url*": "deny",
+          "git config *credential*": "deny",
+          "git config *pushurl*": "deny",
+          "git push*": "deny",
+          "git * push*": "deny",
+          "/usr/bin/git push*": "deny",
+          "*/git push*": "deny",
+          "git reset --hard*": "deny",
+          "git clean*": "deny",
+          "rm -rf*": "deny",
+          "sudo *": "deny",
+          "*git*push*": "deny"
+        }
+      },
+      "tools": {
+        "skill": false
+      }
+    },
+    "fleet-build": {
+      "description": "Local implementation in a private run worktree; publication is held.",
+      "mode": "primary",
+      "permission": {
+        "edit": "allow",
+        "external_directory": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "task": "deny",
+        "skill": "deny",
+        "bash": {
+          "*": "ask",
+          "bash *": "deny",
+          "*/bash *": "deny",
+          "sh *": "deny",
+          "*/sh *": "deny",
+          "zsh *": "deny",
+          "*/zsh *": "deny",
+          "env *": "deny",
+          "*/env *": "deny",
+          "command *": "deny",
+          "xargs *": "deny",
+          "*/xargs *": "deny",
+          "gh *": "deny",
+          "*/gh *": "deny",
+          "hub *": "deny",
+          "*/hub *": "deny",
+          "git commit*": "ask",
+          "git remote set-url*": "deny",
+          "git config *credential*": "deny",
+          "git config *pushurl*": "deny",
+          "git push*": "deny",
+          "git * push*": "deny",
+          "/usr/bin/git push*": "deny",
+          "*/git push*": "deny",
+          "git reset --hard*": "deny",
+          "git clean*": "deny",
+          "rm -rf*": "deny",
+          "sudo *": "deny",
+          "*git*push*": "deny"
+        }
+      },
+      "tools": {
+        "skill": false
+      }
+    }
+  }
+}

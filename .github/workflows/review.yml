@@ -1,0 +1,475 @@
+name: reusable OpenCode review
+
+on:
+  workflow_call:
+
+permissions: {}
+
+concurrency:
+  group: opencode-review-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      command: ${{ steps.gate.outputs.command }}
+      issue_number: ${{ steps.gate.outputs.issue_number }}
+      prompt_base64: ${{ steps.gate.outputs.prompt_base64 }}
+      target_kind: ${{ steps.gate.outputs.target_kind }}
+      target_sha: ${{ steps.gate.outputs.target_sha }}
+    steps:
+      - name: Authorize exact owner command and target
+        id: gate
+        shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
+          API_URL: ${{ github.api_url }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PATH: ${{ github.event_path }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          # runtime:review-gate:start
+          set -euo pipefail
+
+          readonly expected_owner="Ayyitskevin"
+          readonly expected_owner_id="133295304"
+          readonly event_path="${EVENT_PATH:?EVENT_PATH is required}"
+          readonly output_path="${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
+
+          fail() {
+            printf 'OpenCode review gate: %s\n' "$1" >&2
+            exit 1
+          }
+
+          api_get() {
+            local route="$1"
+            local fixture="${2:-}"
+            if [[ -n "$fixture" ]]; then
+              [[ -f "$fixture" ]] || fail "API fixture is missing"
+              cat "$fixture"
+              return
+            fi
+            curl \
+              --fail-with-body \
+              --silent \
+              --show-error \
+              --retry 2 \
+              --retry-all-errors \
+              --connect-timeout 15 \
+              --max-time 60 \
+              --proto '=https' \
+              --tlsv1.2 \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN is required}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${API_URL:-https://api.github.com}/${route}"
+          }
+
+          [[ -s "$event_path" ]] || fail "event payload is missing"
+          [[ "$REPOSITORY_OWNER" == "$expected_owner" ]] || fail "repository owner mismatch"
+          [[ "$ACTOR" == "$expected_owner" ]] || fail "workflow actor mismatch"
+          [[ "$TRIGGERING_ACTOR" == "$expected_owner" ]] || fail "rerun actor mismatch"
+          [[ "$REPOSITORY" == "${expected_owner}/"* ]] || fail "repository namespace mismatch"
+          [[ "$EVENT_NAME" == "issue_comment" || "$EVENT_NAME" == "pull_request_review_comment" ]] ||
+            fail "unsupported event"
+
+          jq -e --arg repository "$REPOSITORY" --argjson owner_id "$expected_owner_id" '
+            .action == "created" and
+            .repository.full_name == $repository and
+            .repository.owner.id == $owner_id and
+            .sender.id == $owner_id and
+            .comment.user.id == $owner_id and
+            .comment.author_association == "OWNER" and
+            ((.comment.body | type) == "string") and
+            ((.comment.body | utf8bytelength) <= 8192) and
+            (.comment.body | explode | all(
+              . == 9 or . == 10 or (. >= 32 and . != 127)
+            ))
+          ' "$event_path" >/dev/null || fail "owner, association, action, or comment validation failed"
+
+          body="$(jq -r '.comment.body' "$event_path")"
+          command=""
+          request=""
+          case "$body" in
+            "/oc review") command="review" ;;
+            "/oc review: "?*) command="review"; request="${body#"/oc review: "}" ;;
+            "/oc plan") command="plan" ;;
+            "/oc plan: "?*) command="plan"; request="${body#"/oc plan: "}" ;;
+            *) fail "command must be exact /oc review or /oc plan syntax" ;;
+          esac
+
+          if [[ -n "$request" ]]; then
+            request_bytes="$(printf '%s' "$request" | wc -c)"
+            (( request_bytes >= 1 && request_bytes <= 4096 )) || fail "request is outside byte bounds"
+          fi
+
+          issue_number=""
+          target_kind=""
+          target_sha=""
+          title=""
+          context_body=""
+
+          if [[ "$EVENT_NAME" == "pull_request_review_comment" ]]; then
+            issue_number="$(jq -r '.pull_request.number // empty' "$event_path")"
+            target_kind="pull_request"
+            title="$(jq -r '
+              def clean: explode | map(select(. == 9 or . == 10 or (. >= 32 and . != 127))) | implode;
+              (.pull_request.title // "") | clean | .[0:512]
+            ' "$event_path")"
+            context_body="$(jq -r '
+              def clean: explode | map(select(. == 9 or . == 10 or (. >= 32 and . != 127))) | implode;
+              (.pull_request.body // "") | clean | .[0:8000]
+            ' "$event_path")"
+          else
+            issue_number="$(jq -r '.issue.number // empty' "$event_path")"
+            title="$(jq -r '
+              def clean: explode | map(select(. == 9 or . == 10 or (. >= 32 and . != 127))) | implode;
+              (.issue.title // "") | clean | .[0:512]
+            ' "$event_path")"
+            context_body="$(jq -r '
+              def clean: explode | map(select(. == 9 or . == 10 or (. >= 32 and . != 127))) | implode;
+              (.issue.body // "") | clean | .[0:8000]
+            ' "$event_path")"
+            if jq -e '.issue.pull_request != null' "$event_path" >/dev/null; then
+              target_kind="pull_request"
+            else
+              target_kind="issue"
+            fi
+          fi
+
+          [[ "$issue_number" =~ ^[1-9][0-9]*$ ]] || fail "invalid issue number"
+
+          if [[ "$target_kind" == "pull_request" ]]; then
+            pr_json="$(api_get \
+              "repos/${REPOSITORY}/pulls/${issue_number}" \
+              "${OPENCODE_TEST_PR_JSON:-}")"
+            jq -e --arg repository "$REPOSITORY" --argjson number "$issue_number" '
+              .number == $number and
+              .state == "open" and
+              .base.repo.full_name == $repository and
+              .head.repo.full_name == $repository and
+              ((.head.sha | type) == "string")
+            ' <<<"$pr_json" >/dev/null || fail "pull request is closed, forked, or mismatched"
+            target_sha="$(jq -r '.head.sha' <<<"$pr_json")"
+          else
+            repo_json="$(api_get \
+              "repos/${REPOSITORY}" \
+              "${OPENCODE_TEST_REPO_JSON:-}")"
+            default_branch="$(jq -r --arg repository "$REPOSITORY" '
+              select(.full_name == $repository) | .default_branch // empty
+            ' <<<"$repo_json")"
+            [[ "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "invalid default branch"
+            ref_json="$(api_get \
+              "repos/${REPOSITORY}/git/ref/heads/${default_branch}" \
+              "${OPENCODE_TEST_REF_JSON:-}")"
+            target_sha="$(jq -r '.object.sha // empty' <<<"$ref_json")"
+          fi
+
+          [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || fail "invalid target SHA"
+
+          if [[ -z "$request" ]]; then
+            request="Analyze this ${target_kind} and return a concise ${command} with concrete findings and next actions."
+          fi
+
+          prompt="$(printf '%s\n\n%s\n%s\n\nTitle:\n%s\n\nTarget context:\n%s\n' \
+            "You are performing an owner-authorized, read-only OpenCode ${command}." \
+            "Repository: ${REPOSITORY}; exact target: ${target_sha}." \
+            "Owner request: ${request}" \
+            "$title" \
+            "$context_body")"
+          prompt_bytes="$(printf '%s' "$prompt" | wc -c)"
+          (( prompt_bytes >= 1 && prompt_bytes <= 49152 )) || fail "prompt is outside byte bounds"
+
+          printf 'command=%s\n' "$command" >>"$output_path"
+          printf 'issue_number=%s\n' "$issue_number" >>"$output_path"
+          printf 'prompt_base64=%s\n' "$(printf '%s' "$prompt" | base64 -w 0)" >>"$output_path"
+          printf 'target_kind=%s\n' "$target_kind" >>"$output_path"
+          printf 'target_sha=%s\n' "$target_sha" >>"$output_path"
+          # runtime:review-gate:end
+
+  model:
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: opencode-review
+    permissions:
+      contents: read
+    outputs:
+      response_base64: ${{ steps.model.outputs.response_base64 }}
+      response_sha256: ${{ steps.model.outputs.response_sha256 }}
+    steps:
+      - name: Checkout exact authorized target
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.target_sha }}
+
+      - name: Verify immutable checkout shape
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.gate.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          if git ls-files -s | awk '$1 == "120000" || $1 == "160000" { found = 1 } END { exit !found }'; then
+            printf 'OpenCode remote review refuses tracked symlinks or submodules\n' >&2
+            exit 1
+          fi
+
+      - name: Install checksum-verified OpenCode
+        id: install
+        shell: bash
+        run: |
+          # runtime:review-install:start
+          set -euo pipefail
+
+          readonly version="1.18.4"
+          readonly expected_size="59265621"
+          readonly expected_sha256="bab463c3fb3224d388bb7cfad63f38703df9cf0be2cfd2ce8cb49d886b53a174"
+          readonly archive="${RUNNER_TEMP}/opencode-linux-x64-v${version}.tar.gz"
+          readonly install_dir="${RUNNER_TEMP}/opencode-v${version}"
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --max-time 300 \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --tlsv1.2 \
+            --output "$archive" \
+            "https://github.com/anomalyco/opencode/releases/download/v${version}/opencode-linux-x64.tar.gz"
+
+          test "$(stat -c '%s' "$archive")" = "$expected_size"
+          printf '%s  %s\n' "$expected_sha256" "$archive" | sha256sum --check --strict
+          test "$(tar -tzf "$archive")" = "opencode"
+
+          mkdir -p "$install_dir"
+          tar \
+            --extract \
+            --gzip \
+            --file "$archive" \
+            --directory "$install_dir" \
+            --no-same-owner \
+            --no-same-permissions
+          test -x "$install_dir/opencode"
+          test "$("$install_dir/opencode" --version)" = "$version"
+          printf '%s\n' "$install_dir" >>"$GITHUB_PATH"
+          # runtime:review-install:end
+
+      - name: Run bounded read-only model
+        id: model
+        shell: bash
+        env:
+          HOME: ${{ runner.temp }}/opencode-home
+          MODEL: opencode/claude-sonnet-4-6
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_AUTO_SHARE: "false"
+          OPENCODE_CONFIG_CONTENT: >-
+            {"default_agent":"build","permission":{"*":"deny","read":{"*":"allow",".env":"deny",".env.*":"deny","**/.env":"deny","**/.env.*":"deny",".netrc":"deny","**/.netrc":"deny",".npmrc":"deny","**/.npmrc":"deny",".pypirc":"deny","**/.pypirc":"deny",".git-credentials":"deny","**/.git-credentials":"deny","credentials.json":"deny","**/credentials.json":"deny","secrets.json":"deny","**/secrets.json":"deny","secrets.yaml":"deny","**/secrets.yaml":"deny","secrets.yml":"deny","**/secrets.yml":"deny","*.pem":"deny","**/*.pem":"deny","*.key":"deny","**/*.key":"deny","*credentials*":"deny","**/*credentials*":"deny","id_rsa":"deny","**/id_rsa":"deny","id_ed25519":"deny","**/id_ed25519":"deny"},"glob":"allow","grep":"deny","lsp":"deny","list":"allow","external_directory":"deny"},"agent":{"build":{"permission":{"*":"deny","read":{"*":"allow",".env":"deny",".env.*":"deny","**/.env":"deny","**/.env.*":"deny",".netrc":"deny","**/.netrc":"deny",".npmrc":"deny","**/.npmrc":"deny",".pypirc":"deny","**/.pypirc":"deny",".git-credentials":"deny","**/.git-credentials":"deny","credentials.json":"deny","**/credentials.json":"deny","secrets.json":"deny","**/secrets.json":"deny","secrets.yaml":"deny","**/secrets.yaml":"deny","secrets.yml":"deny","**/secrets.yml":"deny","*.pem":"deny","**/*.pem":"deny","*.key":"deny","**/*.key":"deny","*credentials*":"deny","**/*credentials*":"deny","id_rsa":"deny","**/id_rsa":"deny","id_ed25519":"deny","**/id_ed25519":"deny"},"glob":"allow","grep":"deny","lsp":"deny","list":"allow","external_directory":"deny"}}}}
+          OPENCODE_DISABLE_AUTOUPDATE: "true"
+          OPENCODE_DISABLE_CLAUDE_CODE: "true"
+          OPENCODE_DISABLE_DEFAULT_PLUGINS: "true"
+          OPENCODE_DISABLE_EXTERNAL_SKILLS: "true"
+          OPENCODE_DISABLE_LSP_DOWNLOAD: "true"
+          OPENCODE_DISABLE_PROJECT_CONFIG: "true"
+          PROMPT_BASE64: ${{ needs.gate.outputs.prompt_base64 }}
+          XDG_CACHE_HOME: ${{ runner.temp }}/opencode-xdg/cache
+          XDG_CONFIG_HOME: ${{ runner.temp }}/opencode-xdg/config
+          XDG_DATA_HOME: ${{ runner.temp }}/opencode-xdg/data
+          XDG_STATE_HOME: ${{ runner.temp }}/opencode-xdg/state
+        run: |
+          # runtime:review-model:start
+          set -euo pipefail
+
+          mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
+          readonly request_path="${RUNNER_TEMP}/opencode-review-request.txt"
+          readonly output_path="${RUNNER_TEMP}/opencode-review-output.jsonl"
+          readonly error_path="${RUNNER_TEMP}/opencode-review-error.log"
+          readonly response_path="${RUNNER_TEMP}/opencode-review-response.md"
+
+          printf '%s' "${PROMPT_BASE64:?PROMPT_BASE64 is required}" | base64 --decode >"$request_path"
+          test -s "$request_path"
+          test "$(wc -c <"$request_path")" -le 49152
+          iconv -f UTF-8 -t UTF-8 "$request_path" >/dev/null
+          prompt="$(<"$request_path")"
+
+          set +e
+          opencode --pure run \
+            --model "${MODEL:?MODEL is required}" \
+            --agent build \
+            --format json \
+            -- "$prompt" >"$output_path" 2>"$error_path"
+          status="$?"
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            printf 'OpenCode review model failed with status %s\n' "$status" >&2
+            exit "$status"
+          fi
+
+          test -s "$output_path"
+          test "$(wc -c <"$output_path")" -le 1048576
+          jq -s -e 'all(.[]; type == "object")' "$output_path" >/dev/null
+          jq -rs -r '[.[] | select(.type == "text") | .part.text // empty] | join("\n")' \
+            "$output_path" >"${response_path}.raw"
+          jq -Rs -r '
+            explode |
+            map(select(. == 9 or . == 10 or (. >= 32 and . != 127))) |
+            implode |
+            gsub("@"; "@\u200b")
+          ' "${response_path}.raw" >"$response_path"
+
+          test -s "$response_path"
+          response_bytes="$(wc -c <"$response_path")"
+          (( response_bytes >= 1 && response_bytes <= 40960 ))
+          iconv -f UTF-8 -t UTF-8 "$response_path" >/dev/null
+
+          printf 'response_base64=%s\n' "$(base64 -w 0 "$response_path")" >>"$GITHUB_OUTPUT"
+          printf 'response_sha256=%s\n' "$(sha256sum "$response_path" | awk '{print $1}')" >>"$GITHUB_OUTPUT"
+          # runtime:review-model:end
+
+  publish:
+    needs: [gate, model]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Publish one bounded top-level comment
+        shell: bash
+        env:
+          API_URL: ${{ github.api_url }}
+          COMMAND: ${{ needs.gate.outputs.command }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
+          REPOSITORY: ${{ github.repository }}
+          RESPONSE_BASE64: ${{ needs.model.outputs.response_base64 }}
+          RESPONSE_SHA256: ${{ needs.model.outputs.response_sha256 }}
+          RUN_ID: ${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+          TARGET_SHA: ${{ needs.gate.outputs.target_sha }}
+        run: |
+          # runtime:review-publish:start
+          set -euo pipefail
+
+          readonly response_path="${RUNNER_TEMP}/opencode-review-response.md"
+          readonly payload_path="${RUNNER_TEMP}/opencode-review-comment.json"
+
+          fail() {
+            printf 'OpenCode review publisher: %s\n' "$1" >&2
+            exit 1
+          }
+
+          existing_comment_matches() {
+            local comments
+            local count
+            local page=1
+
+            if [[ -n "${OPENCODE_TEST_COMMENTS_JSON:-}" ]]; then
+              [[ -f "$OPENCODE_TEST_COMMENTS_JSON" ]] || fail "comment fixture is missing"
+              comments="$(<"$OPENCODE_TEST_COMMENTS_JSON")"
+              jq -e --arg marker "$comment_marker" '
+                type == "array" and any(.[];
+                  .user.id == 41898282 and
+                  ((.body | type) == "string") and
+                  (.body | contains($marker))
+                )
+              ' <<<"$comments" >/dev/null
+              return
+            fi
+
+            while (( page <= 100 )); do
+              comments="$(curl \
+                --fail-with-body \
+                --silent \
+                --show-error \
+                --retry 2 \
+                --retry-all-errors \
+                --connect-timeout 15 \
+                --max-time 60 \
+                --proto '=https' \
+                --tlsv1.2 \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN is required}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "${API_URL:-https://api.github.com}/repos/${REPOSITORY}/issues/${ISSUE_NUMBER}/comments?per_page=100&page=${page}")"
+              test "$(printf '%s' "$comments" | wc -c)" -le 10485760 ||
+                fail "comment preflight response is too large"
+              jq -e 'type == "array" and length <= 100' <<<"$comments" >/dev/null ||
+                fail "comment preflight response is invalid"
+              if jq -e --arg marker "$comment_marker" 'any(.[];
+                .user.id == 41898282 and
+                ((.body | type) == "string") and
+                (.body | contains($marker))
+              )' <<<"$comments" >/dev/null; then
+                return 0
+              fi
+              count="$(jq 'length' <<<"$comments")"
+              (( count < 100 )) && return 1
+              ((page += 1))
+            done
+            fail "comment preflight exceeded its pagination bound"
+          }
+
+          printf '%s' "${RESPONSE_BASE64:?RESPONSE_BASE64 is required}" | base64 --decode >"$response_path"
+          test -s "$response_path"
+          test "$(wc -c <"$response_path")" -le 40960
+          test "$(sha256sum "$response_path" | awk '{print $1}')" = "${RESPONSE_SHA256:?RESPONSE_SHA256 is required}"
+          iconv -f UTF-8 -t UTF-8 "$response_path" >/dev/null
+          [[ "${ISSUE_NUMBER:?ISSUE_NUMBER is required}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${RUN_ID:?RUN_ID is required}" =~ ^[0-9]+$ ]]
+          [[ "${TARGET_SHA:?TARGET_SHA is required}" =~ ^[0-9a-f]{40}$ ]]
+
+          run_url="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
+          comment_marker="<!-- opencode-review:${RUN_ID}:${TARGET_SHA}:${COMMAND} -->"
+          {
+            printf '### OpenCode read-only %s\n\n' "$COMMAND"
+            cat "$response_path"
+            printf '\n\n---\nExact target `%s` · [workflow run](%s)\n%s\n' \
+              "$TARGET_SHA" "$run_url" "$comment_marker"
+          } >"${response_path}.comment"
+          test "$(wc -c <"${response_path}.comment")" -le 49152
+          jq -n --rawfile body "${response_path}.comment" '{body: $body}' >"$payload_path"
+
+          if existing_comment_matches; then
+            printf 'OpenCode review comment already exists for this run, target, and command\n'
+            exit 0
+          fi
+
+          set +e
+          response="$(curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --connect-timeout 15 \
+            --max-time 60 \
+            --proto '=https' \
+            --tlsv1.2 \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN is required}" \
+            --header "Content-Type: application/json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --data-binary "@${payload_path}" \
+            "${API_URL:-https://api.github.com}/repos/${REPOSITORY}/issues/${ISSUE_NUMBER}/comments")"
+          post_status="$?"
+          set -e
+          if [[ "$post_status" -ne 0 ]]; then
+            fail "one-shot comment publication failed; outcome may be unknown, so rerun to preflight the marker"
+          fi
+          jq -e '.id | numbers' <<<"$response" >/dev/null
+          # runtime:review-publish:end

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+
+for script in \
+  "$fleet_root/scripts/check" \
+  "$fleet_root/scripts/doctor" \
+  "$fleet_root/scripts/github-rollout" \
+  "$fleet_root/scripts/github-runtime/extract-inline.sh" \
+  "$fleet_root/scripts/install-local" \
+  "$fleet_root/scripts/install-opencode-cli" \
+  "$fleet_root/scripts/oc" \
+  "$fleet_root/scripts/render-callers" \
+  "$fleet_root/scripts/rollback" \
+  "$fleet_root/scripts/sync-clones" \
+  "$fleet_root/tests/launcher.test.sh" \
+  "$fleet_root/tests/local-lane.test.sh" \
+  "$fleet_root/tests/manifest.test.sh" \
+  "$fleet_root/tests/rollout.test.sh" \
+  "$fleet_root/tests/workflow-security.test.sh"; do
+  bash -n "$script"
+done
+
+bash -n "$fleet_root/tests/fixtures/fake-gh-rollout"
+bash -n "$fleet_root/tests/fixtures/fake-opencode-pure"
+
+bash "$fleet_root/tests/manifest.test.sh"
+bash "$fleet_root/tests/launcher.test.sh"
+bash "$fleet_root/tests/local-lane.test.sh"
+bash "$fleet_root/tests/workflow-security.test.sh"
+bash "$fleet_root/tests/rollout.test.sh"

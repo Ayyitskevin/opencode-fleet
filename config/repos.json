@@ -1,0 +1,215 @@
+{
+  "schemaVersion": 1,
+  "owner": "Ayyitskevin",
+  "workspaceRoot": "/home/kevin-lee/ai-workspace/opencode",
+  "repositories": [
+    {
+      "name": "curriculum",
+      "fullName": "Ayyitskevin/curriculum",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "upstream",
+      "githubMode": "manual"
+    },
+    {
+      "name": "Focal",
+      "fullName": "Ayyitskevin/Focal",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "athena",
+      "fullName": "Ayyitskevin/athena",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "mnemosyne",
+      "fullName": "Ayyitskevin/mnemosyne",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "standard",
+      "githubMode": "manual-build"
+    },
+    {
+      "name": "plutus",
+      "fullName": "Ayyitskevin/plutus",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "dionysus",
+      "fullName": "Ayyitskevin/dionysus",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "standard",
+      "githubMode": "manual-build"
+    },
+    {
+      "name": "aphrodite",
+      "fullName": "Ayyitskevin/aphrodite",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "standard",
+      "githubMode": "manual-build"
+    },
+    {
+      "name": "argus",
+      "fullName": "Ayyitskevin/argus",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "standard",
+      "githubMode": "manual-build"
+    },
+    {
+      "name": "Midas",
+      "fullName": "Ayyitskevin/Midas",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "hestia",
+      "fullName": "Ayyitskevin/hestia",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "atlas",
+      "fullName": "Ayyitskevin/atlas",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "eos",
+      "fullName": "Ayyitskevin/eos",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "Tyche",
+      "fullName": "Ayyitskevin/Tyche",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "kleephotography",
+      "fullName": "Ayyitskevin/kleephotography",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "Hermes",
+      "fullName": "Ayyitskevin/Hermes",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "Hippocrates",
+      "fullName": "Ayyitskevin/Hippocrates",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "Iris",
+      "fullName": "Ayyitskevin/Iris",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "Chronos",
+      "fullName": "Ayyitskevin/Chronos",
+      "state": "active",
+      "defaultBranch": "feat/wheel-dashboard-mvp",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "Icarus",
+      "fullName": "Ayyitskevin/Icarus",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "Vulcan",
+      "fullName": "Ayyitskevin/Vulcan",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "opencode-fleet",
+      "fullName": "Ayyitskevin/opencode-fleet",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "Apollo",
+      "fullName": "Ayyitskevin/Apollo",
+      "state": "placeholder",
+      "defaultBranch": "main",
+      "risk": "placeholder",
+      "githubMode": "disabled"
+    },
+    {
+      "name": "Themis",
+      "fullName": "Ayyitskevin/Themis",
+      "state": "placeholder",
+      "defaultBranch": "main",
+      "risk": "placeholder",
+      "githubMode": "disabled"
+    },
+    {
+      "name": "Harmonia",
+      "fullName": "Ayyitskevin/Harmonia",
+      "state": "placeholder",
+      "defaultBranch": "main",
+      "risk": "placeholder",
+      "githubMode": "disabled"
+    },
+    {
+      "name": "Prometheus",
+      "fullName": "Ayyitskevin/Prometheus",
+      "state": "placeholder",
+      "defaultBranch": "main",
+      "risk": "placeholder",
+      "githubMode": "disabled"
+    },
+    {
+      "name": "Minerva",
+      "fullName": "Ayyitskevin/Minerva",
+      "state": "placeholder",
+      "defaultBranch": "main",
+      "risk": "placeholder",
+      "githubMode": "disabled"
+    }
+  ]
+}

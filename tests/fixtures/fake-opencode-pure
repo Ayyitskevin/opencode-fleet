@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ "${1:-}" == --version ]]; then
+  printf '1.18.4\n'
+  exit 0
+fi
+
+[[ "$#" -eq 10 ]] || {
+  printf 'fake-opencode-pure: expected the exact ten-argument pure run contract\n' >&2
+  exit 2
+}
+[[ "$1" == --pure && "$2" == run &&
+   "$3" == --model && -n "$4" &&
+   "$5" == --agent && "$6" == build &&
+   "$7" == --format && "$8" == json &&
+   "$9" == -- && -n "${10}" ]] || {
+  printf 'fake-opencode-pure: invocation did not use the exact pure run contract\n' >&2
+  exit 2
+}
+
+for required_flag in \
+  OPENCODE_DISABLE_AUTOUPDATE \
+  OPENCODE_DISABLE_CLAUDE_CODE \
+  OPENCODE_DISABLE_DEFAULT_PLUGINS \
+  OPENCODE_DISABLE_EXTERNAL_SKILLS \
+  OPENCODE_DISABLE_LSP_DOWNLOAD \
+  OPENCODE_DISABLE_PROJECT_CONFIG; do
+  [[ "${!required_flag:-}" == true ]] || {
+    printf 'fake-opencode-pure: isolation flag is missing: %s\n' "$required_flag" >&2
+    exit 3
+  }
+done
+[[ "${OPENCODE_AUTO_SHARE:-}" == false &&
+   -n "${OPENCODE_CONFIG_CONTENT:-}" &&
+   -n "${HOME:-}" &&
+   -n "${XDG_CACHE_HOME:-}" &&
+   -n "${XDG_CONFIG_HOME:-}" &&
+   -n "${XDG_DATA_HOME:-}" &&
+   -n "${XDG_STATE_HOME:-}" ]] || {
+  printf 'fake-opencode-pure: isolated runtime roots or config are missing\n' >&2
+  exit 3
+}
+jq -e '
+  .permission["*"] == "deny" and
+  .permission.grep == "deny" and .permission.lsp == "deny" and
+  .agent.build.permission["*"] == "deny" and
+  .agent.build.permission.grep == "deny" and
+  .agent.build.permission.lsp == "deny"
+' <<<"$OPENCODE_CONFIG_CONTENT" >/dev/null || {
+  printf 'fake-opencode-pure: alternate content-returning tools are not denied\n' >&2
+  exit 3
+}
+
+case "${OPENCODE_TEST_PURE_MODE:-}" in
+  build)
+    if (printf 'hostile\n' >.git/config) 2>/dev/null; then
+      printf 'fake-opencode-pure: protected Git config was writable\n' >&2
+      exit 97
+    fi
+    if (printf 'hostile\n' >.git/refs/heads/injected) 2>/dev/null; then
+      printf 'fake-opencode-pure: protected Git refs were writable\n' >&2
+      exit 98
+    fi
+    printf 'after model\n' >docs/base.txt
+    ;;
+  review)
+    ;;
+  *)
+    printf 'fake-opencode-pure: OPENCODE_TEST_PURE_MODE must be build or review\n' >&2
+    exit 3
+    ;;
+esac
+
+printf '%s\n' '{"type":"text","part":{"text":"offline pure-mode fixture complete"}}'

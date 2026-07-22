@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "owner": "Ayyitskevin",
+  "workspaceRoot": "/tmp/opencode-fleet-rollout-fixture",
+  "repositories": [
+    {
+      "name": "ExampleStandard",
+      "fullName": "Ayyitskevin/ExampleStandard",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "standard",
+      "githubMode": "manual-build"
+    },
+    {
+      "name": "ExampleRestricted",
+      "fullName": "Ayyitskevin/ExampleRestricted",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "curriculum",
+      "fullName": "Ayyitskevin/curriculum",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "upstream",
+      "githubMode": "manual"
+    },
+    {
+      "name": "Focal",
+      "fullName": "Ayyitskevin/Focal",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "Vulcan",
+      "fullName": "Ayyitskevin/Vulcan",
+      "state": "active",
+      "defaultBranch": "main",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "Chronos",
+      "fullName": "Ayyitskevin/Chronos",
+      "state": "active",
+      "defaultBranch": "feat/wheel-dashboard-mvp",
+      "risk": "restricted",
+      "githubMode": "review"
+    },
+    {
+      "name": "Empty",
+      "fullName": "Ayyitskevin/Empty",
+      "state": "placeholder",
+      "defaultBranch": "main",
+      "risk": "placeholder",
+      "githubMode": "disabled"
+    },
+    {
+      "name": "Minerva",
+      "fullName": "Ayyitskevin/Minerva",
+      "state": "placeholder",
+      "defaultBranch": "main",
+      "risk": "placeholder",
+      "githubMode": "disabled"
+    }
+  ]
+}

@@ -1,0 +1,470 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+manifest="${OPENCODE_FLEET_MANIFEST:-$fleet_root/config/repos.json}"
+target_home="${OPENCODE_FLEET_HOME:-$HOME}"
+state_root="${OPENCODE_FLEET_STATE_ROOT:-$target_home/.local/state/opencode-fleet}"
+apply=false
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  rollback run <run-id> [--apply]
+  rollback install [--apply]
+  rollback cli [--apply]
+
+All modes preview by default. Run rollback refuses committed changes, writes
+binary patches and quarantines untracked files before restoring the base commit.
+Install rollback moves current targets into recovery before restoring backups.
+USAGE
+}
+
+die() {
+  printf 'rollback: %s\n' "$*" >&2
+  exit 1
+}
+
+validate_path_chain() {
+  local base="$1"
+  local path="$2"
+  local label="$3"
+  local relative current component
+  local -a components
+
+  [[ "$base" == /* && -d "$base" && ! -L "$base" &&
+     "$(realpath -e -- "$base")" == "$base" ]] ||
+    die "$label containment root is not a canonical directory"
+  [[ "$path" == "$base" || "$path" == "$base/"* ]] ||
+    die "$label escapes its containment root"
+  [[ "$(realpath -m -- "$path")" == "$path" ]] ||
+    die "$label contains an existing symlink or is non-canonical"
+  [[ "$path" != "$base" ]] || return 0
+  relative="${path#"$base"/}"
+  current="$base"
+  IFS='/' read -r -a components <<<"$relative"
+  for component in "${components[@]}"; do
+    [[ -n "$component" && "$component" != "." && "$component" != ".." ]] ||
+      die "$label contains an unsafe path component"
+    current="$current/$component"
+    if [[ -e "$current" || -L "$current" ]]; then
+      [[ -d "$current" && ! -L "$current" &&
+         "$(realpath -e -- "$current")" == "$current" ]] ||
+        die "$label traverses a non-directory or symlink"
+    fi
+  done
+}
+
+validate_target_parent() {
+  validate_path_chain "$1" "$(dirname -- "$2")" "$3 parent"
+}
+
+validate_backup_object() {
+  local backup="$1"
+  local backup_root="$2"
+  local label="$3"
+
+  [[ -n "$backup" ]] || return 0
+  [[ "$backup" == "$backup_root/"* &&
+     ( -e "$backup" || -L "$backup" ) && ! -d "$backup" ]] ||
+    die "$label backup is missing, a directory, or outside its backup root"
+  validate_target_parent "$backup_root" "$backup" "$label backup"
+}
+
+acquire_global_lock() {
+  local lock_path="$state_root/session.lock"
+  [[ ! -L "$lock_path" ]] || die "global session lock must not be a symlink"
+  exec 9>"$lock_path"
+  chmod 600 "$lock_path"
+  flock -n 9 || die "another OpenCode fleet operation owns the local lane"
+}
+
+validate_state() {
+  [[ -d "$state_root" && ! -L "$state_root" &&
+     "$(realpath -e "$state_root")" == "$state_root" ]] ||
+    die "fleet state root is missing or unsafe"
+}
+
+restore_install_target() {
+  local target="$1"
+  local backup="$2"
+  local backup_root="$3"
+  local recovery_name="$4"
+  local temporary
+
+  [[ ! -d "$target" ]] || die "recorded install target is unexpectedly a directory"
+  validate_backup_object "$backup" "$backup_root" "$recovery_name"
+  if [[ -e "$target" || -L "$target" ]]; then
+    mv -- "$target" "$recovery_dir/$recovery_name.current"
+  fi
+  if [[ -n "$backup" ]]; then
+    temporary="${target}.rollback.$timestamp"
+    [[ ! -e "$temporary" && ! -L "$temporary" ]] ||
+      die "rollback temporary target already exists"
+    cp -a -- "$backup" "$temporary"
+    mv -fT -- "$temporary" "$target"
+  fi
+}
+
+rollback_install_kind() {
+  local kind="$1"
+  local record target_home_expected backup_root
+  local config_path config_backup launcher_path launcher_backup
+  local target backup record_backup expected_record recovery_label
+
+  [[ -d "$target_home" && ! -L "$target_home" &&
+     "$(realpath -e "$target_home")" == "$target_home" ]] ||
+    die "target home must be an existing canonical directory"
+  [[ "$state_root" == "$target_home/"* ]] ||
+    die "fleet state root must remain inside the selected home"
+
+  if [[ "$kind" == "install" ]]; then
+    record="$state_root/install.json"
+    expected_record="$state_root/install.json"
+  else
+    record="$state_root/cli-install.json"
+    expected_record="$state_root/cli-install.json"
+  fi
+  [[ -f "$record" && ! -L "$record" ]] || die "install record is missing or unsafe"
+
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)-$BASHPID"
+  recovery_dir="$state_root/recovery/$kind-$timestamp"
+
+  if [[ "$kind" == "install" ]]; then
+    jq -e '
+      .schemaVersion == 1 and
+      ((.status // "installed") == "installed" or .status == "prepared") and
+      (.backupRoot | type == "string" and length > 0) and
+      (.previousInstallRecordBackup | type == "string") and
+      (.config.path | type == "string" and length > 0) and
+      (.config.backup | type == "string") and
+      .config.installedType == "regular" and .config.mode == "600" and
+      (.launcher.path | type == "string" and length > 0) and
+      (.launcher.backup | type == "string") and
+      .launcher.installedType == "symlink"
+    ' "$record" >/dev/null || die "install record is invalid"
+    config_path="$(jq -r '.config.path' "$record")"
+    launcher_path="$(jq -r '.launcher.path' "$record")"
+    config_backup="$(jq -r '.config.backup' "$record")"
+    launcher_backup="$(jq -r '.launcher.backup' "$record")"
+    backup_root="$(jq -r '.backupRoot' "$record")"
+    record_backup="$(jq -r '.previousInstallRecordBackup' "$record")"
+    [[ "$config_path" == "$target_home/.config/opencode/opencode.jsonc" &&
+       "$launcher_path" == "$target_home/.local/bin/oc" ]] ||
+      die "install record targets do not match the selected home"
+    jq -n \
+      --arg kind "$kind" \
+      --arg record "$record" \
+      --arg recovery "$recovery_dir" \
+      --arg config "$config_path" \
+      --arg launcher "$launcher_path" \
+      '{
+        action: "rollback-install",
+        kind: $kind,
+        record: $record,
+        recovery: $recovery,
+        targets: [$config, $launcher],
+        applyRequired: true
+      }'
+  else
+    jq -e '
+      .schemaVersion == 1 and
+      ((.status // "installed") == "installed" or .status == "prepared") and
+      (.backupRoot | type == "string" and length > 0) and
+      (.previousInstallRecordBackup | type == "string") and
+      (.target | type == "string" and length > 0) and
+      (.backup | type == "string") and
+      (.binarySha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+      .installedType == "regular" and .mode == "700"
+    ' "$record" >/dev/null || die "CLI install record is invalid"
+    target="$(jq -r '.target' "$record")"
+    backup="$(jq -r '.backup' "$record")"
+    backup_root="$(jq -r '.backupRoot' "$record")"
+    record_backup="$(jq -r '.previousInstallRecordBackup' "$record")"
+    [[ "$target" == "$target_home/.opencode/bin/opencode" ]] ||
+      die "CLI install record target does not match the selected home"
+    jq -n \
+      --arg kind "$kind" \
+      --arg record "$record" \
+      --arg recovery "$recovery_dir" \
+      --arg target "$target" \
+      '{
+        action: "rollback-install",
+        kind: $kind,
+        record: $record,
+        recovery: $recovery,
+        targets: [$target],
+        applyRequired: true
+      }'
+  fi
+  [[ "$apply" == true ]] || return 0
+
+  [[ -d "$backup_root" && ! -L "$backup_root" &&
+     "$backup_root" == "$state_root/"* ]] ||
+    die "install backup root is missing or outside fleet state"
+  if [[ "$kind" == "install" ]]; then
+    [[ "$backup_root" == "$state_root/install-backups/"* ]] ||
+      die "local install backup root has the wrong lane"
+  else
+    [[ "$backup_root" == "$state_root/cli-backups/"* ]] ||
+      die "CLI install backup root has the wrong lane"
+  fi
+  [[ ! -e "$recovery_dir" && ! -L "$recovery_dir" ]] ||
+    die "rollback recovery path already exists"
+  validate_path_chain "$target_home" "$state_root" "fleet state root"
+  validate_path_chain "$state_root" "$backup_root" "install backup root"
+  validate_path_chain "$state_root" "$recovery_dir" "rollback recovery"
+  validate_target_parent "$target_home" "$expected_record" "install record"
+  if [[ "$kind" == "install" ]]; then
+    validate_target_parent "$target_home" "$config_path" "config target"
+    validate_target_parent "$target_home" "$launcher_path" "launcher target"
+    validate_backup_object "$config_backup" "$backup_root" "config"
+    validate_backup_object "$launcher_backup" "$backup_root" "launcher"
+  else
+    validate_target_parent "$target_home" "$target" "CLI target"
+    validate_backup_object "$backup" "$backup_root" "CLI"
+  fi
+  if [[ -n "$record_backup" ]]; then
+    validate_backup_object "$record_backup" "$backup_root" "previous install record"
+    [[ -f "$record_backup" && ! -L "$record_backup" ]] ||
+      die "previous install record backup must be a regular file"
+    jq -e '.schemaVersion == 1' "$record_backup" >/dev/null ||
+      die "previous install record backup is invalid"
+  fi
+  acquire_global_lock
+  if [[ "$kind" == "install" ]]; then
+    validate_backup_object "$config_backup" "$backup_root" "config"
+    validate_backup_object "$launcher_backup" "$backup_root" "launcher"
+  else
+    validate_backup_object "$backup" "$backup_root" "CLI"
+  fi
+  if [[ -n "$record_backup" ]]; then
+    validate_backup_object "$record_backup" "$backup_root" "previous install record"
+    [[ -f "$record_backup" && ! -L "$record_backup" ]] ||
+      die "previous install record backup changed during preflight"
+  fi
+  install -d -m 700 "$state_root/recovery" "$recovery_dir"
+
+  if [[ "$kind" == "install" ]]; then
+    restore_install_target "$config_path" "$config_backup" "$backup_root" "config"
+    restore_install_target "$launcher_path" "$launcher_backup" "$backup_root" "launcher"
+  else
+    restore_install_target "$target" "$backup" "$backup_root" "cli"
+  fi
+
+  mv -- "$record" "$recovery_dir/current-install-record.json"
+  if [[ -n "$record_backup" ]]; then
+    cp -a -- "$record_backup" "$expected_record"
+  fi
+  chmod -R go-rwx "$recovery_dir"
+  jq -n \
+    --arg rolledBackAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg kind "$kind" \
+    --arg recovery "$recovery_dir" \
+    '{schemaVersion: 1, rolledBackAt: $rolledBackAt, kind: $kind, recovery: $recovery}' \
+    >"$recovery_dir/rollback.json"
+  chmod 600 "$recovery_dir/rollback.json"
+  printf 'rolled back %s install; recovery: %s\n' "$kind" "$recovery_dir"
+}
+
+rollback_run() {
+  local run_id="$1"
+  local run_dir record repository full_name source_path worktree_path
+  local base_commit run_branch expected_source expected_worktree common head
+  local dirty=false
+  local untracked=false
+  local -a matches
+
+  [[ "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    die "run ID contains unsafe characters"
+  run_dir="$state_root/runs/$run_id"
+  record="$run_dir/record.json"
+  [[ -f "$record" && ! -L "$record" ]] || die "run record is missing or unsafe"
+  jq -e --arg id "$run_id" '
+    .schemaVersion == 1 and .runId == $id and .mode == "build" and
+    (.repository | type == "string") and
+    (.fullName | type == "string") and
+    (.sourcePath | type == "string") and
+    (.worktreePath | type == "string" and length > 0) and
+    (.baseCommit | test("^[0-9a-f]{40,64}$")) and
+    (.runBranch | type == "string" and length > 0)
+  ' "$record" >/dev/null || die "run record is invalid or is not a build"
+
+  repository="$(jq -r '.repository' "$record")"
+  full_name="$(jq -r '.fullName' "$record")"
+  source_path="$(jq -r '.sourcePath' "$record")"
+  worktree_path="$(jq -r '.worktreePath' "$record")"
+  base_commit="$(jq -r '.baseCommit' "$record")"
+  run_branch="$(jq -r '.runBranch' "$record")"
+
+  workspace_root="${OPENCODE_FLEET_WORKSPACE_ROOT:-$(jq -r '.workspaceRoot' "$manifest")}"
+  mapfile -t matches < <(jq -r \
+    --arg repository "$repository" --arg fullName "$full_name" \
+    '.repositories[] |
+      select(.name == $repository and .fullName == $fullName and .state == "active") |
+      .name' "$manifest")
+  [[ "${#matches[@]}" -eq 1 ]] || die "run repository is not an active exact catalog entry"
+
+  expected_source="$workspace_root/$repository"
+  expected_worktree="$state_root/worktrees/${repository,,}/$run_id"
+  [[ "$source_path" == "$expected_source" &&
+     "$worktree_path" == "$expected_worktree" ]] ||
+    die "run record paths do not match lane-owned locations"
+  [[ -d "$workspace_root" && ! -L "$workspace_root" &&
+     "$(realpath -e -- "$workspace_root")" == "$workspace_root" ]] ||
+    die "workspace root is missing or non-canonical"
+  [[ -d "$source_path/.git" && ! -L "$source_path" && ! -L "$source_path/.git" ]] ||
+    die "source clone is missing or not independent"
+  [[ -d "$worktree_path" && ! -L "$worktree_path" && -f "$worktree_path/.git" ]] ||
+    die "private run worktree is missing or unsafe"
+  [[ "$(realpath -e -- "$source_path")" == "$source_path" &&
+     "$(realpath -e -- "$worktree_path")" == "$worktree_path" ]] ||
+    die "run paths must be canonical and contain no symlink"
+  validate_path_chain "$workspace_root" "$source_path" "run source clone"
+  validate_path_chain "$state_root" "$worktree_path" "private run worktree"
+
+  common="$(git -C "$worktree_path" rev-parse --path-format=absolute --git-common-dir)"
+  common="$(realpath -e "$common")"
+  [[ "$common" == "$source_path/.git" ]] ||
+    die "private worktree no longer belongs to its dedicated clone"
+  head="$(git -C "$worktree_path" rev-parse --verify HEAD)"
+  [[ "$head" == "$base_commit" ]] ||
+    die "rollback refuses committed changes; preserve or review the run branch manually"
+  current_run_branch="$(git -C "$worktree_path" symbolic-ref --quiet --short HEAD || true)"
+  [[ "$current_run_branch" == "$run_branch" ]] ||
+    die "private worktree branch does not match the run record"
+
+  [[ -z "$(git -C "$worktree_path" diff --name-only)" &&
+     -z "$(git -C "$worktree_path" diff --cached --name-only)" ]] || dirty=true
+  [[ -z "$(git -C "$worktree_path" ls-files --others --exclude-standard)" &&
+     -z "$(git -C "$worktree_path" ls-files --others --ignored --exclude-standard)" ]] ||
+    untracked=true
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)-$BASHPID"
+  recovery_dir="$state_root/recovery/$run_id/$timestamp"
+
+  jq -n \
+    --arg runId "$run_id" \
+    --arg repository "$repository" \
+    --arg worktree "$worktree_path" \
+    --arg recovery "$recovery_dir" \
+    --argjson trackedChanges "$dirty" \
+    --argjson untrackedChanges "$untracked" \
+    '{
+      action: "rollback-run",
+      runId: $runId,
+      repository: $repository,
+      worktree: $worktree,
+      recovery: $recovery,
+      trackedChanges: $trackedChanges,
+      untrackedChanges: $untrackedChanges,
+      applyRequired: true
+    }'
+  [[ "$apply" == true ]] || return 0
+
+  [[ ! -e "$recovery_dir" && ! -L "$recovery_dir" ]] ||
+    die "run recovery path already exists"
+  validate_path_chain "$state_root" "$recovery_dir" "run recovery"
+  acquire_global_lock
+  validate_path_chain "$state_root" "$worktree_path" "private run worktree"
+  install -d -m 700 "$state_root/recovery" "$state_root/recovery/$run_id" \
+    "$recovery_dir" "$recovery_dir/untracked"
+  git -C "$worktree_path" diff --binary --no-ext-diff >"$recovery_dir/unstaged.patch"
+  git -C "$worktree_path" diff --cached --binary --no-ext-diff \
+    >"$recovery_dir/staged.patch"
+  git -C "$worktree_path" status --porcelain=v1 -z >"$recovery_dir/status.z"
+  {
+    git -C "$worktree_path" ls-files --others --exclude-standard -z
+    git -C "$worktree_path" ls-files --others --ignored --exclude-standard -z
+  } | sort -z -u >"$recovery_dir/untracked-paths.z"
+  chmod 600 "$recovery_dir/unstaged.patch" "$recovery_dir/staged.patch" \
+    "$recovery_dir/status.z" "$recovery_dir/untracked-paths.z"
+
+  while IFS= read -r -d '' relative; do
+    [[ -n "$relative" && "$relative" != "." && "$relative" != /* &&
+       "/$relative/" != *"/../"* ]] ||
+      die "Git returned an unsafe untracked path"
+    source_untracked="$worktree_path/$relative"
+    recovery_untracked="$recovery_dir/untracked/$relative"
+    [[ -e "$source_untracked" || -L "$source_untracked" ]] ||
+      die "an untracked path disappeared during rollback"
+    validate_target_parent "$worktree_path" "$source_untracked" \
+      "untracked source"
+    validate_target_parent "$recovery_dir/untracked" "$recovery_untracked" \
+      "untracked recovery"
+    install -d -m 700 "$(dirname -- "$recovery_untracked")"
+    validate_target_parent "$recovery_dir/untracked" "$recovery_untracked" \
+      "untracked recovery"
+    mv -- "$source_untracked" "$recovery_untracked"
+  done <"$recovery_dir/untracked-paths.z"
+
+  git -C "$worktree_path" restore --source "$base_commit" --staged --worktree -- .
+  [[ -z "$(git -C "$worktree_path" status --porcelain=v1 --untracked-files=all)" &&
+     -z "$(git -C "$worktree_path" ls-files --others --exclude-standard)" &&
+     -z "$(git -C "$worktree_path" ls-files --others --ignored --exclude-standard)" ]] ||
+    die "worktree was not clean after rollback"
+
+  record_temporary="$(mktemp "$run_dir/.record.XXXXXX")"
+  jq \
+    --arg rolledBackAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg recovery "$recovery_dir" \
+    '.status = "rolled-back" |
+     .rolledBackAt = $rolledBackAt |
+     .rollbackRecovery = $recovery' \
+    "$record" >"$record_temporary"
+  chmod 600 "$record_temporary"
+  mv -fT -- "$record_temporary" "$record"
+  chmod -R go-rwx "$recovery_dir"
+  printf 'rolled back run %s; recovery: %s\n' "$run_id" "$recovery_dir"
+}
+
+for command_name in jq git realpath flock install mktemp cp mv chmod dirname date sort id; do
+  command -v "$command_name" >/dev/null 2>&1 ||
+    die "required command is missing: $command_name"
+done
+[[ "$(id -u)" -ne 0 ]] || die "refusing to roll back OpenCode state as root"
+
+kind="${1:-}"
+case "$kind" in
+  run)
+    shift
+    run_id="${1:-}"
+    [[ -n "$run_id" ]] || die "run rollback requires a run ID"
+    shift
+    ;;
+  install|cli)
+    shift
+    ;;
+  ""|-h|--help)
+    usage
+    [[ -n "$kind" ]] && exit 0
+    exit 2
+    ;;
+  *)
+    die "unknown rollback kind: $kind"
+    ;;
+esac
+
+while (($#)); do
+  case "$1" in
+    --apply)
+      apply=true
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+  shift
+done
+
+validate_state
+case "$kind" in
+  run) rollback_run "$run_id" ;;
+  install|cli) rollback_install_kind "$kind" ;;
+esac

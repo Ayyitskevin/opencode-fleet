@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+source_root="$fleet_root"
+source_root_explicit=false
+manifest=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  render-callers --repository NAME --central-sha COMMIT --output DIRECTORY
+    [--source-root PINNED-SOURCE-DIRECTORY]
+
+COMMIT must be the exact 40-character lowercase Git commit ID of the central
+opencode-fleet workflow revision. The output directory must be absent or empty.
+When --source-root is supplied, every rendering input comes only from that
+canonical, symlink-free pinned source directory; manifest overrides are ignored.
+EOF
+}
+
+die() {
+  printf 'render-callers: %s\n' "$*" >&2
+  exit 1
+}
+
+repository_query=""
+central_sha=""
+output_dir=""
+
+while (($#)); do
+  case "$1" in
+    --repository)
+      (($# >= 2)) || die "--repository requires a value"
+      repository_query="$2"
+      shift 2
+      ;;
+    --central-sha)
+      (($# >= 2)) || die "--central-sha requires a value"
+      central_sha="$2"
+      shift 2
+      ;;
+    --output)
+      (($# >= 2)) || die "--output requires a value"
+      output_dir="$2"
+      shift 2
+      ;;
+    --source-root)
+      (($# >= 2)) || die "--source-root requires a value"
+      source_root="$2"
+      source_root_explicit=true
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+command -v jq >/dev/null 2>&1 || die "required command is missing: jq"
+command -v realpath >/dev/null 2>&1 || die "required command is missing: realpath"
+[[ "$source_root" == /* && -d "$source_root" && ! -L "$source_root" &&
+   "$(realpath -e -- "$source_root")" == "$source_root" ]] ||
+  die "source root must be an absolute canonical directory"
+if [[ "$source_root_explicit" == true ]]; then
+  manifest="$source_root/config/repos.json"
+else
+  manifest="${OPENCODE_FLEET_MANIFEST:-$source_root/config/repos.json}"
+fi
+[[ -r "$manifest" ]] || die "manifest is not readable: $manifest"
+[[ -f "$manifest" && ! -L "$manifest" ]] || die "manifest must be a regular file"
+if [[ "$source_root_explicit" == true ]]; then
+  [[ "$(realpath -e -- "$manifest")" == "$manifest" ]] ||
+    die "pinned manifest contains a symlink"
+fi
+[[ -n "$repository_query" ]] || die "--repository is required"
+[[ "$central_sha" =~ ^[0-9a-f]{40}$ ]] || \
+  die "--central-sha must be exactly 40 lowercase hexadecimal characters"
+[[ "$central_sha" != 0000000000000000000000000000000000000000 ]] || \
+  die "--central-sha cannot be the all-zero object ID"
+[[ -n "$output_dir" ]] || die "--output is required"
+
+matches="$(
+  jq -c --arg query "${repository_query,,}" \
+    '[.repositories[] | select(
+      (.name | ascii_downcase) == $query or
+      (.fullName | ascii_downcase) == $query
+    )]' "$manifest"
+)"
+match_count="$(jq 'length' <<<"$matches")"
+[[ "$match_count" == 1 ]] || {
+  if [[ "$match_count" == 0 ]]; then
+    die "repository is not catalogued: $repository_query"
+  fi
+  die "repository query is ambiguous: $repository_query"
+}
+
+entry="$(jq -c '.[0]' <<<"$matches")"
+repository_name="$(jq -r '.name' <<<"$entry")"
+repository_full_name="$(jq -r '.fullName' <<<"$entry")"
+repository_state="$(jq -r '.state' <<<"$entry")"
+repository_risk="$(jq -r '.risk' <<<"$entry")"
+github_mode="$(jq -r '.githubMode' <<<"$entry")"
+
+[[ "$repository_state" == active ]] || \
+  die "$repository_name is a placeholder; rendering would fabricate repository content"
+[[ "$github_mode" != disabled ]] || die "$repository_name has GitHub automation disabled"
+[[ "$github_mode" != manual ]] || \
+  die "$repository_name is local/manual-only; no remote caller is rendered"
+
+case "$repository_risk" in
+  standard|restricted|upstream|placeholder) ;;
+  *) die "unsupported risk classification for $repository_name: $repository_risk" ;;
+esac
+
+case "$github_mode:$repository_risk" in
+  review:restricted|manual-build:standard) ;;
+  *) die "unsupported GitHub mode/risk pair for $repository_name: $github_mode/$repository_risk" ;;
+esac
+
+if [[ -e "$output_dir" ]]; then
+  [[ -d "$output_dir" && ! -L "$output_dir" ]] || \
+    die "output exists but is not a real directory: $output_dir"
+  [[ -z "$(ls -A "$output_dir")" ]] || die "output directory is not empty: $output_dir"
+else
+  mkdir -p "$output_dir"
+fi
+
+workflow_dir="$output_dir/.github/workflows"
+policy_dir="$output_dir/.github"
+mkdir -p "$workflow_dir" "$policy_dir"
+
+render_sha_template() {
+  local source="$1"
+  local destination="$2"
+  local content
+
+  [[ -f "$source" && ! -L "$source" && -r "$source" ]] ||
+    die "template is not a readable regular file: $source"
+  [[ "$(realpath -e -- "$source")" == "$source" ]] ||
+    die "template contains a symlink: $source"
+  content="$(<"$source")"
+  [[ "$content" == *'__CENTRAL_SHA__'* ]] || die "template lacks central SHA placeholder: $source"
+  content="${content//__CENTRAL_SHA__/$central_sha}"
+  [[ "$content" != *'__CENTRAL_SHA__'* ]] || die "central SHA placeholder survived rendering"
+  printf '%s\n' "$content" >"$destination"
+}
+
+render_sha_template \
+  "$source_root/templates/callers/review.yml.tpl" \
+  "$workflow_dir/opencode-review.yml"
+
+rendered_files=(
+  ".github/workflows/opencode-review.yml"
+  ".github/opencode-policy.json"
+)
+
+if [[ "$github_mode" == manual-build ]]; then
+  render_sha_template \
+    "$source_root/templates/callers/build.yml.tpl" \
+    "$workflow_dir/opencode-build.yml"
+  rendered_files+=(".github/workflows/opencode-build.yml")
+fi
+
+policy_template="$source_root/templates/policies/$repository_risk.json.tpl"
+[[ -f "$policy_template" && ! -L "$policy_template" && -r "$policy_template" ]] ||
+  die "policy template is not a readable regular file: $policy_template"
+[[ "$(realpath -e -- "$policy_template")" == "$policy_template" ]] ||
+  die "policy template contains a symlink"
+cp "$policy_template" "$policy_dir/opencode-policy.json"
+
+jq -e '
+  (keys | sort) == [
+    "allowed_exact",
+    "allowed_prefixes",
+    "max_files",
+    "max_patch_bytes",
+    "mode",
+    "version"
+  ] and
+  .version == 1 and
+  (.mode == "review-only" or .mode == "draft-pr") and
+  (.allowed_exact | type == "array") and
+  (.allowed_prefixes | type == "array") and
+  (.max_files | type == "number" and . >= 1 and . <= 20 and floor == .) and
+  (.max_patch_bytes | type == "number" and . >= 1 and . <= 204800 and floor == .)
+' "$policy_dir/opencode-policy.json" >/dev/null || die "rendered policy violates the central schema"
+
+expected_policy_mode=review-only
+[[ "$github_mode" == manual-build ]] && expected_policy_mode=draft-pr
+jq -e --arg mode "$expected_policy_mode" '.mode == $mode' \
+  "$policy_dir/opencode-policy.json" >/dev/null || \
+  die "rendered policy authority does not match $github_mode"
+
+printf '%s\n' "${rendered_files[@]}" | sort -u | jq -Rsc \
+  --arg repository "$repository_name" \
+  --arg full_name "$repository_full_name" \
+  --arg github_mode "$github_mode" \
+  --arg risk "$repository_risk" \
+  --arg central_sha "$central_sha" \
+  '{
+    repository: $repository,
+    fullName: $full_name,
+    githubMode: $github_mode,
+    risk: $risk,
+    centralSha: $central_sha,
+    files: (split("\n") | map(select(length > 0)))
+  }'

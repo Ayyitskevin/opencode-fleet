@@ -1,0 +1,891 @@
+name: reusable OpenCode draft build
+
+on:
+  workflow_call:
+    inputs:
+      request:
+        description: Bounded owner-authored build request
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: opencode-build-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    outputs:
+      default_branch: ${{ steps.gate.outputs.default_branch }}
+      policy_base64: ${{ steps.gate.outputs.policy_base64 }}
+      policy_sha256: ${{ steps.gate.outputs.policy_sha256 }}
+      request_base64: ${{ steps.gate.outputs.request_base64 }}
+      target_sha: ${{ steps.gate.outputs.target_sha }}
+    steps:
+      - name: Authorize owner dispatch, immutable target, and policy
+        id: gate
+        shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
+          API_URL: ${{ github.api_url }}
+          CONTEXT_REF: ${{ github.ref }}
+          CONTEXT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PATH: ${{ github.event_path }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          REQUEST: ${{ inputs.request }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          # runtime:build-gate:start
+          set -euo pipefail
+
+          readonly expected_owner="Ayyitskevin"
+          readonly expected_owner_id="133295304"
+          readonly event_path="${EVENT_PATH:?EVENT_PATH is required}"
+          readonly output_path="${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
+          readonly policy_path="${RUNNER_TEMP}/opencode-policy.json"
+
+          fail() {
+            printf 'OpenCode build gate: %s\n' "$1" >&2
+            exit 1
+          }
+
+          api_get() {
+            local route="$1"
+            local fixture="${2:-}"
+            if [[ -n "$fixture" ]]; then
+              [[ -f "$fixture" ]] || fail "API fixture is missing"
+              cat "$fixture"
+              return
+            fi
+            curl \
+              --fail-with-body \
+              --silent \
+              --show-error \
+              --retry 2 \
+              --retry-all-errors \
+              --connect-timeout 15 \
+              --max-time 60 \
+              --proto '=https' \
+              --tlsv1.2 \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN is required}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${API_URL:-https://api.github.com}/${route}"
+          }
+
+          safe_policy_path() {
+            local value="$1"
+            local kind="$2"
+            local segment
+
+            [[ -n "$value" && "$(printf '%s' "$value" | wc -c)" -le 256 ]] || return 1
+            [[ "$value" != /* && "$value" != *\\* && "$value" != *//* ]] || return 1
+            [[ "$value" != "." && "$value" != ".." ]] || return 1
+            if [[ "$kind" == "prefix" ]]; then
+              [[ "$value" == */ ]] || return 1
+              value="${value%/}"
+            else
+              [[ "$value" != */ ]] || return 1
+            fi
+            IFS='/' read -r -a segments <<<"$value"
+            ((${#segments[@]} > 0)) || return 1
+            for segment in "${segments[@]}"; do
+              [[ -n "$segment" && "$segment" != "." && "$segment" != ".." ]] || return 1
+              [[ "$segment" != *$'\n'* && "$segment" != *$'\r'* && "$segment" != *$'\t'* ]] || return 1
+            done
+          }
+
+          validate_policy() {
+            jq -e '
+              type == "object" and
+              ((keys | sort) == ["allowed_exact", "allowed_prefixes", "max_files", "max_patch_bytes", "mode", "version"]) and
+              .version == 1 and
+              .mode == "draft-pr" and
+              ((.allowed_exact | type) == "array") and
+              ((.allowed_prefixes | type) == "array") and
+              ((.allowed_exact | length) <= 100) and
+              ((.allowed_prefixes | length) <= 100) and
+              (((.allowed_exact | length) + (.allowed_prefixes | length)) > 0) and
+              (.allowed_exact | all(type == "string")) and
+              (.allowed_prefixes | all(type == "string")) and
+              (.allowed_exact | all(explode | all(. >= 32 and . != 127))) and
+              (.allowed_prefixes | all(explode | all(. >= 32 and . != 127))) and
+              ((.max_files | type) == "number") and
+              (.max_files == (.max_files | floor)) and
+              (.max_files >= 1 and .max_files <= 20) and
+              ((.max_patch_bytes | type) == "number") and
+              (.max_patch_bytes == (.max_patch_bytes | floor)) and
+              (.max_patch_bytes >= 1 and .max_patch_bytes <= 204800)
+            ' "$policy_path" >/dev/null || fail "policy schema or bounds are invalid"
+
+            while IFS= read -r value; do
+              safe_policy_path "$value" exact || fail "unsafe allowed_exact path"
+            done < <(jq -r '.allowed_exact[]' "$policy_path")
+            while IFS= read -r value; do
+              safe_policy_path "$value" prefix || fail "unsafe allowed_prefixes path"
+            done < <(jq -r '.allowed_prefixes[]' "$policy_path")
+          }
+
+          [[ -s "$event_path" ]] || fail "event payload is missing"
+          [[ "$EVENT_NAME" == "workflow_dispatch" ]] || fail "builds require workflow_dispatch"
+          [[ "$REPOSITORY_OWNER" == "$expected_owner" ]] || fail "repository owner mismatch"
+          [[ "$ACTOR" == "$expected_owner" ]] || fail "workflow actor mismatch"
+          [[ "$TRIGGERING_ACTOR" == "$expected_owner" ]] || fail "rerun actor mismatch"
+          [[ "$REPOSITORY" == "${expected_owner}/"* ]] || fail "repository namespace mismatch"
+          [[ "$CONTEXT_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "invalid workflow target SHA"
+
+          jq -e --arg repository "$REPOSITORY" --argjson owner_id "$expected_owner_id" '
+            .repository.full_name == $repository and
+            .repository.owner.id == $owner_id and
+            .sender.id == $owner_id
+          ' "$event_path" >/dev/null || fail "dispatch owner or repository validation failed"
+
+          request_bytes="$(printf '%s' "${REQUEST:-}" | wc -c)"
+          (( request_bytes >= 1 && request_bytes <= 4096 )) || fail "request is outside byte bounds"
+          printf '%s' "$REQUEST" | jq -Rs -e '
+            explode | all(. == 9 or . == 10 or (. >= 32 and . != 127))
+          ' >/dev/null || fail "request contains control characters"
+
+          repo_json="$(api_get "repos/${REPOSITORY}" "${OPENCODE_TEST_REPO_JSON:-}")"
+          default_branch="$(jq -r --arg repository "$REPOSITORY" '
+            select(.full_name == $repository) | .default_branch // empty
+          ' <<<"$repo_json")"
+          [[ "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "invalid default branch"
+          [[ "$CONTEXT_REF" == "refs/heads/${default_branch}" ]] || fail "dispatch must target the default branch"
+
+          ref_json="$(api_get \
+            "repos/${REPOSITORY}/git/ref/heads/${default_branch}" \
+            "${OPENCODE_TEST_REF_JSON:-}")"
+          target_sha="$(jq -r '.object.sha // empty' <<<"$ref_json")"
+          [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || fail "invalid live default-branch SHA"
+          [[ "$target_sha" == "$CONTEXT_SHA" ]] || fail "default branch moved before authorization"
+
+          if [[ -n "${OPENCODE_TEST_POLICY_JSON:-}" ]]; then
+            [[ -f "$OPENCODE_TEST_POLICY_JSON" ]] || fail "policy fixture is missing"
+            cp "$OPENCODE_TEST_POLICY_JSON" "$policy_path"
+          else
+            policy_json="$(api_get \
+              "repos/${REPOSITORY}/contents/.github/opencode-policy.json?ref=${target_sha}" \
+              "")"
+            jq -e '
+              .type == "file" and
+              .path == ".github/opencode-policy.json" and
+              .encoding == "base64" and
+              ((.content | type) == "string")
+            ' <<<"$policy_json" >/dev/null || fail "policy API response is invalid"
+            jq -r '.content' <<<"$policy_json" | tr -d '\n' | base64 --decode >"$policy_path" ||
+              fail "policy base64 is invalid"
+          fi
+
+          [[ -s "$policy_path" ]] || fail "policy is empty"
+          test "$(wc -c <"$policy_path")" -le 32768 || fail "policy is too large"
+          iconv -f UTF-8 -t UTF-8 "$policy_path" >/dev/null || fail "policy is not UTF-8"
+          validate_policy
+
+          printf 'default_branch=%s\n' "$default_branch" >>"$output_path"
+          printf 'policy_base64=%s\n' "$(base64 -w 0 "$policy_path")" >>"$output_path"
+          printf 'policy_sha256=%s\n' "$(sha256sum "$policy_path" | awk '{print $1}')" >>"$output_path"
+          printf 'request_base64=%s\n' "$(printf '%s' "$REQUEST" | base64 -w 0)" >>"$output_path"
+          printf 'target_sha=%s\n' "$target_sha" >>"$output_path"
+          # runtime:build-gate:end
+
+  model:
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: opencode-build
+    permissions:
+      contents: read
+    outputs:
+      patch_base64: ${{ steps.validate.outputs.patch_base64 }}
+      patch_sha256: ${{ steps.validate.outputs.patch_sha256 }}
+    steps:
+      - name: Checkout exact authorized target
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.target_sha }}
+
+      - name: Verify immutable checkout and policy
+        shell: bash
+        env:
+          EXPECTED_POLICY_BASE64: ${{ needs.gate.outputs.policy_base64 }}
+          EXPECTED_POLICY_SHA256: ${{ needs.gate.outputs.policy_sha256 }}
+          EXPECTED_SHA: ${{ needs.gate.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          if git ls-files -s | awk '$1 == "120000" || $1 == "160000" { found = 1 } END { exit !found }'; then
+            printf 'OpenCode remote build refuses tracked symlinks or submodules\n' >&2
+            exit 1
+          fi
+          printf '%s' "$EXPECTED_POLICY_BASE64" | base64 --decode >"${RUNNER_TEMP}/authorized-policy.json"
+          test "$(sha256sum "${RUNNER_TEMP}/authorized-policy.json" | awk '{print $1}')" = "$EXPECTED_POLICY_SHA256"
+          test "$(sha256sum .github/opencode-policy.json | awk '{print $1}')" = "$EXPECTED_POLICY_SHA256"
+
+      - name: Install checksum-verified OpenCode
+        shell: bash
+        run: |
+          # runtime:build-install:start
+          set -euo pipefail
+
+          readonly version="1.18.4"
+          readonly expected_size="59265621"
+          readonly expected_sha256="bab463c3fb3224d388bb7cfad63f38703df9cf0be2cfd2ce8cb49d886b53a174"
+          readonly archive="${RUNNER_TEMP}/opencode-linux-x64-v${version}.tar.gz"
+          readonly install_dir="${RUNNER_TEMP}/opencode-v${version}"
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --max-time 300 \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --tlsv1.2 \
+            --output "$archive" \
+            "https://github.com/anomalyco/opencode/releases/download/v${version}/opencode-linux-x64.tar.gz"
+
+          test "$(stat -c '%s' "$archive")" = "$expected_size"
+          printf '%s  %s\n' "$expected_sha256" "$archive" | sha256sum --check --strict
+          test "$(tar -tzf "$archive")" = "opencode"
+
+          mkdir -p "$install_dir"
+          tar \
+            --extract \
+            --gzip \
+            --file "$archive" \
+            --directory "$install_dir" \
+            --no-same-owner \
+            --no-same-permissions
+          test -x "$install_dir/opencode"
+          test "$("$install_dir/opencode" --version)" = "$version"
+          printf '%s\n' "$install_dir" >>"$GITHUB_PATH"
+          # runtime:build-install:end
+
+      - name: Run bounded edit-only model
+        shell: bash
+        env:
+          HOME: ${{ runner.temp }}/opencode-home
+          EXPECTED_SHA: ${{ needs.gate.outputs.target_sha }}
+          GIT_ATTR_NOSYSTEM: "1"
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_KEY_0: core.hooksPath
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_CONFIG_VALUE_0: /dev/null
+          GIT_OPTIONAL_LOCKS: "0"
+          MODEL: opencode/claude-sonnet-4-6
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_AUTO_SHARE: "false"
+          OPENCODE_CONFIG_CONTENT: >-
+            {"default_agent":"build","permission":{"*":"deny","read":{"*":"allow",".env":"deny",".env.*":"deny","**/.env":"deny","**/.env.*":"deny",".netrc":"deny","**/.netrc":"deny",".npmrc":"deny","**/.npmrc":"deny",".pypirc":"deny","**/.pypirc":"deny",".git-credentials":"deny","**/.git-credentials":"deny","credentials.json":"deny","**/credentials.json":"deny","secrets.json":"deny","**/secrets.json":"deny","secrets.yaml":"deny","**/secrets.yaml":"deny","secrets.yml":"deny","**/secrets.yml":"deny","*.pem":"deny","**/*.pem":"deny","*.key":"deny","**/*.key":"deny","*credentials*":"deny","**/*credentials*":"deny","id_rsa":"deny","**/id_rsa":"deny","id_ed25519":"deny","**/id_ed25519":"deny"},"glob":"allow","grep":"deny","lsp":"deny","list":"allow","edit":{"*":"allow",".git/**":"deny",".github/**":"deny",".opencode/**":"deny",".gitattributes":"deny","**/.gitattributes":"deny","**/AGENTS.md":"deny","opencode.json":"deny","opencode.jsonc":"deny"},"external_directory":"deny"},"agent":{"build":{"permission":{"*":"deny","read":{"*":"allow",".env":"deny",".env.*":"deny","**/.env":"deny","**/.env.*":"deny",".netrc":"deny","**/.netrc":"deny",".npmrc":"deny","**/.npmrc":"deny",".pypirc":"deny","**/.pypirc":"deny",".git-credentials":"deny","**/.git-credentials":"deny","credentials.json":"deny","**/credentials.json":"deny","secrets.json":"deny","**/secrets.json":"deny","secrets.yaml":"deny","**/secrets.yaml":"deny","secrets.yml":"deny","**/secrets.yml":"deny","*.pem":"deny","**/*.pem":"deny","*.key":"deny","**/*.key":"deny","*credentials*":"deny","**/*credentials*":"deny","id_rsa":"deny","**/id_rsa":"deny","id_ed25519":"deny","**/id_ed25519":"deny"},"glob":"allow","grep":"deny","lsp":"deny","list":"allow","edit":{"*":"allow",".git/**":"deny",".github/**":"deny",".opencode/**":"deny",".gitattributes":"deny","**/.gitattributes":"deny","**/AGENTS.md":"deny","opencode.json":"deny","opencode.jsonc":"deny"},"external_directory":"deny"}}}}
+          OPENCODE_DISABLE_AUTOUPDATE: "true"
+          OPENCODE_DISABLE_CLAUDE_CODE: "true"
+          OPENCODE_DISABLE_DEFAULT_PLUGINS: "true"
+          OPENCODE_DISABLE_EXTERNAL_SKILLS: "true"
+          OPENCODE_DISABLE_LSP_DOWNLOAD: "true"
+          OPENCODE_DISABLE_PROJECT_CONFIG: "true"
+          POLICY_BASE64: ${{ needs.gate.outputs.policy_base64 }}
+          REQUEST_BASE64: ${{ needs.gate.outputs.request_base64 }}
+          XDG_CACHE_HOME: ${{ runner.temp }}/opencode-xdg/cache
+          XDG_CONFIG_HOME: ${{ runner.temp }}/opencode-xdg/config
+          XDG_DATA_HOME: ${{ runner.temp }}/opencode-xdg/data
+          XDG_STATE_HOME: ${{ runner.temp }}/opencode-xdg/state
+        run: |
+          # runtime:build-model:start
+          set -euo pipefail
+
+          mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
+          readonly request_path="${RUNNER_TEMP}/opencode-build-request.txt"
+          readonly policy_path="${RUNNER_TEMP}/opencode-build-policy.json"
+          readonly output_path="${RUNNER_TEMP}/opencode-build-output.jsonl"
+          readonly error_path="${RUNNER_TEMP}/opencode-build-error.log"
+
+          git_metadata_digest() {
+            while IFS= read -r -d '' path; do
+              printf '%s\0' "$path"
+              stat --printf='%f\0%u\0%g\0' "$path"
+              if [[ -L "$path" ]]; then
+                printf '%s\0' "$(readlink -- "$path")"
+              elif [[ -f "$path" ]]; then
+                printf '%s\0' "$(sha256sum "$path" | awk '{print $1}')"
+              fi
+            done < <(find .git -print0 | sort -z)
+          }
+
+          git_protected_metadata_digest() {
+            while IFS= read -r -d '' path; do
+              printf '%s\0' "$path"
+              stat --printf='%f\0%u\0%g\0' "$path"
+              if [[ -L "$path" ]]; then
+                printf '%s\0' "$(readlink -- "$path")"
+              elif [[ -f "$path" ]]; then
+                printf '%s\0' "$(sha256sum "$path" | awk '{print $1}')"
+              fi
+            done < <(
+              find .git \
+                \( -path '.git/index' -o -path '.git/objects' -o -path '.git/objects/*' \) -prune -o \
+                -print0 | sort -z
+            )
+          }
+
+          printf '%s' "${REQUEST_BASE64:?REQUEST_BASE64 is required}" | base64 --decode >"$request_path"
+          printf '%s' "${POLICY_BASE64:?POLICY_BASE64 is required}" | base64 --decode >"$policy_path"
+          test -s "$request_path"
+          test "$(wc -c <"$request_path")" -le 4096
+          iconv -f UTF-8 -t UTF-8 "$request_path" >/dev/null
+          request="$(<"$request_path")"
+          policy="$(jq -c . "$policy_path")"
+          prompt="$(printf '%s\n\n%s\n\nPolicy:\n%s\n\nRequest:\n%s\n' \
+            'Make the smallest maintainable change that satisfies the owner request.' \
+            'You may edit only paths allowed by the policy. Do not use shell, network, external directories, or change policy/agent/workflow/dependency/security-sensitive files. Do not delete files. Leave all changes in the working tree for deterministic validation.' \
+            "$policy" \
+            "$request")"
+          test "$(printf '%s' "$prompt" | wc -c)" -le 49152
+
+          [[ "$(git rev-parse HEAD)" == "${EXPECTED_SHA:?EXPECTED_SHA is required}" ]]
+          chmod -R a-w .git
+          git_metadata_before="$(git_metadata_digest | sha256sum | awk '{print $1}')"
+
+          set +e
+          opencode --pure run \
+            --model "${MODEL:?MODEL is required}" \
+            --agent build \
+            --format json \
+            -- "$prompt" >"$output_path" 2>"$error_path"
+          status="$?"
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            printf 'OpenCode build model failed with status %s\n' "$status" >&2
+            exit "$status"
+          fi
+          test -s "$output_path"
+          test "$(wc -c <"$output_path")" -le 1048576
+          jq -s -e 'all(.[]; type == "object")' "$output_path" >/dev/null
+
+          [[ "$(git_metadata_digest | sha256sum | awk '{print $1}')" == "$git_metadata_before" ]] || {
+            printf 'OpenCode changed protected Git metadata\n' >&2
+            exit 1
+          }
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_SHA" ]]
+
+          # Reopen only the paths Git needs to create an index lock and loose
+          # objects. Config, refs, hooks, HEAD, logs, and packed metadata stay
+          # read-only while deterministic staging runs.
+          chmod u+w .git .git/index .git/objects
+          find .git/objects -type d -exec chmod u+w {} +
+          git_protected_before="$(git_protected_metadata_digest | sha256sum | awk '{print $1}')"
+          git add -A
+          [[ "$(git_protected_metadata_digest | sha256sum | awk '{print $1}')" == "$git_protected_before" ]] || {
+            printf 'Git staging changed metadata outside the index and object database\n' >&2
+            exit 1
+          }
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_SHA" ]]
+          git diff --quiet || {
+            printf 'OpenCode left unstaged changes\n' >&2
+            exit 1
+          }
+          # runtime:build-model:end
+
+      - name: Validate and serialize bounded patch
+        id: validate
+        shell: bash
+        env:
+          POLICY_BASE64: ${{ needs.gate.outputs.policy_base64 }}
+          POLICY_SHA256: ${{ needs.gate.outputs.policy_sha256 }}
+          VALIDATED_PATCH_PATH: ${{ runner.temp }}/opencode-build.patch
+        run: |
+          printf '%s' "${POLICY_BASE64:?POLICY_BASE64 is required}" | base64 --decode >"${RUNNER_TEMP}/validation-policy.json"
+          export POLICY_PATH="${RUNNER_TEMP}/validation-policy.json"
+          # runtime:build-validate-model:start
+          set -euo pipefail
+
+          fail() {
+            printf 'OpenCode patch validator: %s\n' "$1" >&2
+            exit 1
+          }
+
+          safe_changed_path() {
+            local value="$1"
+            local segment
+            [[ -n "$value" && "$(printf '%s' "$value" | wc -c)" -le 256 ]] || return 1
+            [[ "$value" != /* && "$value" != *\\* && "$value" != *//* && "$value" != */ ]] || return 1
+            IFS='/' read -r -a segments <<<"$value"
+            for segment in "${segments[@]}"; do
+              [[ -n "$segment" && "$segment" != "." && "$segment" != ".." ]] || return 1
+              [[ "$segment" != *$'\n'* && "$segment" != *$'\r'* && "$segment" != *$'\t'* ]] || return 1
+            done
+          }
+
+          centrally_denied() {
+            local value="$1"
+            local lower="${value,,}"
+            local base="${lower##*/}"
+            case "/$lower/" in
+              */.github/*|*/.opencode/*|*/infra/*|*/infrastructure/*|*/deploy/*|*/deployment/*|*/migrations/*|*/auth/*|*/billing/*|*/payment/*|*/payments/*|*/clinical/*|*/secrets/*) return 0 ;;
+            esac
+            case "$base" in
+              .gitattributes|agents.md|opencode.json|opencode.jsonc|.gitmodules|.env|.env.*|*.key|*.pem|package.json|package-lock.json|npm-shrinkwrap.json|yarn.lock|pnpm-lock.yaml|bun.lock|bun.lockb|pyproject.toml|poetry.lock|uv.lock|requirements.txt|requirements-*.txt|pipfile|pipfile.lock|cargo.toml|cargo.lock|go.mod|go.sum|composer.json|composer.lock|gemfile|gemfile.lock) return 0 ;;
+            esac
+            return 1
+          }
+
+          policy_allows() {
+            local value="$1"
+            local candidate
+            for candidate in "${allowed_exact[@]}"; do
+              [[ "$value" == "$candidate" ]] && return 0
+            done
+            for candidate in "${allowed_prefixes[@]}"; do
+              [[ "$value" == "$candidate"* ]] && return 0
+            done
+            return 1
+          }
+
+          [[ -s "${POLICY_PATH:?POLICY_PATH is required}" ]] || fail "policy is missing"
+          [[ "$(sha256sum "$POLICY_PATH" | awk '{print $1}')" == "${POLICY_SHA256:?POLICY_SHA256 is required}" ]] ||
+            fail "policy digest mismatch"
+          [[ -n "${VALIDATED_PATCH_PATH:?VALIDATED_PATCH_PATH is required}" ]] || fail "patch path is missing"
+          mapfile -t allowed_exact < <(jq -r '.allowed_exact[]' "$POLICY_PATH")
+          mapfile -t allowed_prefixes < <(jq -r '.allowed_prefixes[]' "$POLICY_PATH")
+          max_files="$(jq -r '.max_files' "$POLICY_PATH")"
+          max_patch_bytes="$(jq -r '.max_patch_bytes' "$POLICY_PATH")"
+          [[ "$max_files" =~ ^[0-9]+$ && "$max_patch_bytes" =~ ^[0-9]+$ ]] || fail "invalid policy bounds"
+
+          mapfile -d '' changed_paths < <(git diff --cached --name-only -z --diff-filter=ACM --no-renames)
+          ((${#changed_paths[@]} >= 1)) || fail "model produced no eligible changes"
+          ((${#changed_paths[@]} <= max_files && ${#changed_paths[@]} <= 20)) || fail "too many changed files"
+          git diff --cached --quiet --diff-filter=DRTUXB --no-renames || fail "deletes, renames, or unmerged changes are denied"
+
+          for path in "${changed_paths[@]}"; do
+            safe_changed_path "$path" || fail "unsafe changed path"
+            centrally_denied "$path" && fail "centrally denied path: $path"
+            policy_allows "$path" || fail "path is not allowed by repository policy: $path"
+          done
+
+          raw_count=0
+          while IFS= read -r -d '' metadata && IFS= read -r -d '' path; do
+            [[ "$metadata" =~ ^:([0-9]{6})\ ([0-9]{6})\ ([0-9a-f]+)\ ([0-9a-f]+)\ ([AM])$ ]] ||
+              fail "unsupported Git index record"
+            old_mode="${BASH_REMATCH[1]}"
+            new_mode="${BASH_REMATCH[2]}"
+            [[ "$new_mode" == "100644" || "$new_mode" == "100755" ]] || fail "unsupported file mode"
+            [[ "$old_mode" == "000000" || "$old_mode" == "$new_mode" ]] || fail "file mode changes are denied"
+            ((raw_count += 1))
+          done < <(git diff --cached --raw -z --no-renames --no-abbrev)
+          (( raw_count == ${#changed_paths[@]} )) || fail "Git index record count mismatch"
+
+          git diff --cached --check || fail "patch has whitespace errors"
+          git diff --cached --numstat --no-renames | awk '$1 == "-" || $2 == "-" { found = 1 } END { exit found }' ||
+            fail "binary changes are denied"
+          git diff --cached --binary --full-index --no-color --no-ext-diff --no-renames >"$VALIDATED_PATCH_PATH"
+          patch_bytes="$(wc -c <"$VALIDATED_PATCH_PATH")"
+          (( patch_bytes >= 1 && patch_bytes <= max_patch_bytes && patch_bytes <= 204800 )) ||
+            fail "patch is outside byte bounds"
+          # runtime:build-validate-model:end
+          printf 'patch_base64=%s\n' "$(base64 -w 0 "$VALIDATED_PATCH_PATH")" >>"$GITHUB_OUTPUT"
+          printf 'patch_sha256=%s\n' "$(sha256sum "$VALIDATED_PATCH_PATH" | awk '{print $1}')" >>"$GITHUB_OUTPUT"
+
+  publish:
+    needs: [gate, model]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout exact authorized target without credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.target_sha }}
+
+      - name: Apply and independently revalidate patch
+        shell: bash
+        env:
+          PATCH_BASE64: ${{ needs.model.outputs.patch_base64 }}
+          PATCH_SHA256: ${{ needs.model.outputs.patch_sha256 }}
+          POLICY_BASE64: ${{ needs.gate.outputs.policy_base64 }}
+          POLICY_SHA256: ${{ needs.gate.outputs.policy_sha256 }}
+          TARGET_SHA: ${{ needs.gate.outputs.target_sha }}
+          VALIDATED_PATCH_PATH: ${{ runner.temp }}/opencode-revalidated.patch
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${TARGET_SHA:?TARGET_SHA is required}"
+          printf '%s' "${POLICY_BASE64:?POLICY_BASE64 is required}" | base64 --decode >"${RUNNER_TEMP}/validation-policy.json"
+          export POLICY_PATH="${RUNNER_TEMP}/validation-policy.json"
+          printf '%s' "${PATCH_BASE64:?PATCH_BASE64 is required}" | base64 --decode >"${RUNNER_TEMP}/model.patch"
+          test "$(sha256sum "${RUNNER_TEMP}/model.patch" | awk '{print $1}')" = "${PATCH_SHA256:?PATCH_SHA256 is required}"
+          test "$(wc -c <"${RUNNER_TEMP}/model.patch")" -le 204800
+          git apply --index --whitespace=error-all "${RUNNER_TEMP}/model.patch"
+          # runtime:build-validate-publish:start
+          set -euo pipefail
+
+          fail() {
+            printf 'OpenCode patch validator: %s\n' "$1" >&2
+            exit 1
+          }
+
+          safe_changed_path() {
+            local value="$1"
+            local segment
+            [[ -n "$value" && "$(printf '%s' "$value" | wc -c)" -le 256 ]] || return 1
+            [[ "$value" != /* && "$value" != *\\* && "$value" != *//* && "$value" != */ ]] || return 1
+            IFS='/' read -r -a segments <<<"$value"
+            for segment in "${segments[@]}"; do
+              [[ -n "$segment" && "$segment" != "." && "$segment" != ".." ]] || return 1
+              [[ "$segment" != *$'\n'* && "$segment" != *$'\r'* && "$segment" != *$'\t'* ]] || return 1
+            done
+          }
+
+          centrally_denied() {
+            local value="$1"
+            local lower="${value,,}"
+            local base="${lower##*/}"
+            case "/$lower/" in
+              */.github/*|*/.opencode/*|*/infra/*|*/infrastructure/*|*/deploy/*|*/deployment/*|*/migrations/*|*/auth/*|*/billing/*|*/payment/*|*/payments/*|*/clinical/*|*/secrets/*) return 0 ;;
+            esac
+            case "$base" in
+              .gitattributes|agents.md|opencode.json|opencode.jsonc|.gitmodules|.env|.env.*|*.key|*.pem|package.json|package-lock.json|npm-shrinkwrap.json|yarn.lock|pnpm-lock.yaml|bun.lock|bun.lockb|pyproject.toml|poetry.lock|uv.lock|requirements.txt|requirements-*.txt|pipfile|pipfile.lock|cargo.toml|cargo.lock|go.mod|go.sum|composer.json|composer.lock|gemfile|gemfile.lock) return 0 ;;
+            esac
+            return 1
+          }
+
+          policy_allows() {
+            local value="$1"
+            local candidate
+            for candidate in "${allowed_exact[@]}"; do
+              [[ "$value" == "$candidate" ]] && return 0
+            done
+            for candidate in "${allowed_prefixes[@]}"; do
+              [[ "$value" == "$candidate"* ]] && return 0
+            done
+            return 1
+          }
+
+          [[ -s "${POLICY_PATH:?POLICY_PATH is required}" ]] || fail "policy is missing"
+          [[ "$(sha256sum "$POLICY_PATH" | awk '{print $1}')" == "${POLICY_SHA256:?POLICY_SHA256 is required}" ]] ||
+            fail "policy digest mismatch"
+          [[ -n "${VALIDATED_PATCH_PATH:?VALIDATED_PATCH_PATH is required}" ]] || fail "patch path is missing"
+          mapfile -t allowed_exact < <(jq -r '.allowed_exact[]' "$POLICY_PATH")
+          mapfile -t allowed_prefixes < <(jq -r '.allowed_prefixes[]' "$POLICY_PATH")
+          max_files="$(jq -r '.max_files' "$POLICY_PATH")"
+          max_patch_bytes="$(jq -r '.max_patch_bytes' "$POLICY_PATH")"
+          [[ "$max_files" =~ ^[0-9]+$ && "$max_patch_bytes" =~ ^[0-9]+$ ]] || fail "invalid policy bounds"
+
+          mapfile -d '' changed_paths < <(git diff --cached --name-only -z --diff-filter=ACM --no-renames)
+          ((${#changed_paths[@]} >= 1)) || fail "model produced no eligible changes"
+          ((${#changed_paths[@]} <= max_files && ${#changed_paths[@]} <= 20)) || fail "too many changed files"
+          git diff --cached --quiet --diff-filter=DRTUXB --no-renames || fail "deletes, renames, or unmerged changes are denied"
+
+          for path in "${changed_paths[@]}"; do
+            safe_changed_path "$path" || fail "unsafe changed path"
+            centrally_denied "$path" && fail "centrally denied path: $path"
+            policy_allows "$path" || fail "path is not allowed by repository policy: $path"
+          done
+
+          raw_count=0
+          while IFS= read -r -d '' metadata && IFS= read -r -d '' path; do
+            [[ "$metadata" =~ ^:([0-9]{6})\ ([0-9]{6})\ ([0-9a-f]+)\ ([0-9a-f]+)\ ([AM])$ ]] ||
+              fail "unsupported Git index record"
+            old_mode="${BASH_REMATCH[1]}"
+            new_mode="${BASH_REMATCH[2]}"
+            [[ "$new_mode" == "100644" || "$new_mode" == "100755" ]] || fail "unsupported file mode"
+            [[ "$old_mode" == "000000" || "$old_mode" == "$new_mode" ]] || fail "file mode changes are denied"
+            ((raw_count += 1))
+          done < <(git diff --cached --raw -z --no-renames --no-abbrev)
+          (( raw_count == ${#changed_paths[@]} )) || fail "Git index record count mismatch"
+
+          git diff --cached --check || fail "patch has whitespace errors"
+          git diff --cached --numstat --no-renames | awk '$1 == "-" || $2 == "-" { found = 1 } END { exit found }' ||
+            fail "binary changes are denied"
+          git diff --cached --binary --full-index --no-color --no-ext-diff --no-renames >"$VALIDATED_PATCH_PATH"
+          patch_bytes="$(wc -c <"$VALIDATED_PATCH_PATH")"
+          (( patch_bytes >= 1 && patch_bytes <= max_patch_bytes && patch_bytes <= 204800 )) ||
+            fail "patch is outside byte bounds"
+          # runtime:build-validate-publish:end
+          test "$(sha256sum "$VALIDATED_PATCH_PATH" | awk '{print $1}')" = "$PATCH_SHA256"
+
+      - name: Create deterministic branch and draft pull request
+        shell: bash
+        env:
+          API_URL: ${{ github.api_url }}
+          DEFAULT_BRANCH: ${{ needs.gate.outputs.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          PATCH_SHA256: ${{ needs.model.outputs.patch_sha256 }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+          TARGET_SHA: ${{ needs.gate.outputs.target_sha }}
+        run: |
+          # runtime:build-publish:start
+          set -euo pipefail
+
+          fail() {
+            printf 'OpenCode draft publisher: %s\n' "$1" >&2
+            exit 1
+          }
+
+          api_get() {
+            local route="$1"
+            curl \
+              --fail-with-body \
+              --silent \
+              --show-error \
+              --retry 2 \
+              --retry-all-errors \
+              --connect-timeout 15 \
+              --max-time 60 \
+              --proto '=https' \
+              --tlsv1.2 \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN is required}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${API_URL:-https://api.github.com}/${route}"
+          }
+
+          api_get_optional() {
+            local route="$1"
+            local destination="$2"
+            local curl_status
+            local http_status
+
+            set +e
+            http_status="$(curl \
+              --silent \
+              --show-error \
+              --retry 2 \
+              --retry-all-errors \
+              --connect-timeout 15 \
+              --max-time 60 \
+              --proto '=https' \
+              --tlsv1.2 \
+              --output "$destination" \
+              --write-out '%{http_code}' \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN is required}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${API_URL:-https://api.github.com}/${route}")"
+            curl_status="$?"
+            set -e
+            [[ "$curl_status" -eq 0 ]] || fail "optional API preflight failed"
+            case "$http_status" in
+              200) return 0 ;;
+              404) return 1 ;;
+              *) fail "optional API preflight returned HTTP ${http_status}" ;;
+            esac
+          }
+
+          verify_branch_commit() {
+            local branch_commit
+            local branch_sha="$1"
+            [[ "$branch_sha" =~ ^[0-9a-f]{40}$ ]] || fail "existing branch SHA is invalid"
+            branch_commit="$(api_get "repos/${REPOSITORY}/git/commits/${branch_sha}")"
+            jq -e \
+              --arg sha "$branch_sha" \
+              --arg parent "$TARGET_SHA" \
+              --arg tree "$expected_tree" '
+                .sha == $sha and .tree.sha == $tree and
+                ([.parents[].sha] == [$parent])
+              ' <<<"$branch_commit" >/dev/null ||
+              fail "existing deterministic branch does not match this patch and base"
+          }
+
+          [[ "${TARGET_SHA:?TARGET_SHA is required}" =~ ^[0-9a-f]{40}$ ]] || fail "invalid target SHA"
+          [[ "${PATCH_SHA256:?PATCH_SHA256 is required}" =~ ^[0-9a-f]{64}$ ]] || fail "invalid patch digest"
+          [[ "${DEFAULT_BRANCH:?DEFAULT_BRANCH is required}" =~ ^[A-Za-z0-9._/-]+$ ]] || fail "invalid default branch"
+          [[ "${RUN_ID:?RUN_ID is required}" =~ ^[0-9]+$ ]] || fail "invalid run ID"
+          [[ "${RUN_ATTEMPT:?RUN_ATTEMPT is required}" =~ ^[0-9]+$ ]] || fail "invalid run attempt"
+          branch="opencode/${RUN_ID}"
+          run_url="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
+          pull_marker="<!-- opencode-build:${RUN_ID}:${PATCH_SHA256} -->"
+          pull_title="OpenCode draft ${RUN_ID}"
+          pull_body="Owner-authorized OpenCode draft from [workflow run](${run_url}). Exact base: \`${TARGET_SHA}\`. Review and merge manually; this workflow never pushes to the default branch.
+
+          ${pull_marker}"
+
+          live_ref="$(api_get "repos/${REPOSITORY}/git/ref/heads/${DEFAULT_BRANCH}")"
+          jq -e --arg ref "refs/heads/$DEFAULT_BRANCH" --arg sha "$TARGET_SHA" '
+            .ref == $ref and .object.type == "commit" and .object.sha == $sha
+          ' <<<"$live_ref" >/dev/null ||
+            fail "default branch moved after model execution"
+          [[ "$(git rev-parse HEAD)" == "$TARGET_SHA" ]] || fail "local base SHA mismatch"
+          expected_tree="$(git write-tree)"
+          [[ "$expected_tree" =~ ^[0-9a-f]{40}$ ]] || fail "invalid staged tree"
+
+          branch_ref_path="${RUNNER_TEMP}/opencode-existing-branch.json"
+          branch_exists=false
+          if api_get_optional "repos/${REPOSITORY}/git/ref/heads/${branch}" "$branch_ref_path"; then
+            jq -e --arg ref "refs/heads/$branch" '
+              .ref == $ref and .object.type == "commit" and
+              (.object.sha | type == "string" and test("^[0-9a-f]{40}$"))
+            ' "$branch_ref_path" >/dev/null ||
+              fail "existing deterministic branch ref is malformed"
+            branch_sha="$(jq -r '.object.sha // empty' "$branch_ref_path")"
+            verify_branch_commit "$branch_sha"
+            branch_exists=true
+          fi
+
+          existing_pulls="$(api_get \
+            "repos/${REPOSITORY}/pulls?state=all&head=Ayyitskevin%3Aopencode%2F${RUN_ID}&per_page=10")"
+          test "$(printf '%s' "$existing_pulls" | wc -c)" -le 1048576 ||
+            fail "pull request preflight response is too large"
+          jq -e 'type == "array" and length <= 1' <<<"$existing_pulls" >/dev/null ||
+            fail "pull request preflight response is invalid or ambiguous"
+          if [[ "$(jq 'length' <<<"$existing_pulls")" -eq 1 ]]; then
+            [[ "$branch_exists" == true ]] ||
+              fail "the deterministic pull request exists without its branch"
+            jq -e \
+              --arg base "$DEFAULT_BRANCH" \
+              --arg base_sha "$TARGET_SHA" \
+              --arg branch "$branch" \
+              --arg body "$pull_body" \
+              --arg repository "$REPOSITORY" \
+              --arg title "$pull_title" \
+              --arg sha "$branch_sha" '
+                (.[0].state == "open" or .[0].state == "closed") and
+                (.[0].draft | type) == "boolean" and
+                .[0].base.ref == $base and
+                .[0].base.sha == $base_sha and
+                .[0].base.repo.full_name == $repository and
+                .[0].head.ref == $branch and
+                .[0].head.repo.full_name == $repository and
+                .[0].head.sha == $sha and
+                .[0].title == $title and .[0].body == $body and
+                (.[0].number | type == "number" and . >= 1 and floor == .) and
+                .[0].html_url ==
+                  ("https://github.com/" + $repository + "/pull/" + (.[0].number | tostring))
+              ' <<<"$existing_pulls" >/dev/null ||
+              fail "the deterministic branch already has a different pull request"
+            if [[ "$(jq -r '.[0].state' <<<"$existing_pulls")" == closed ]]; then
+              fail "the exact deterministic pull request is closed or merged; that run is terminal"
+            fi
+            if [[ "$(jq -r '.[0].draft' <<<"$existing_pulls")" == true ]]; then
+              printf 'OpenCode draft pull request already exists for this run and patch\n'
+            else
+              printf 'OpenCode pull request was already promoted by a human; rerun is read-only\n'
+            fi
+            exit 0
+          fi
+
+          if [[ "$branch_exists" != true ]]; then
+            git config --local user.name "opencode-fleet[bot]"
+            git config --local user.email "opencode-fleet[bot]@users.noreply.github.com"
+            git -c commit.gpgsign=false commit -m "chore: OpenCode draft ${RUN_ID}-${RUN_ATTEMPT}"
+            [[ "$(git rev-parse HEAD^)" == "$TARGET_SHA" ]] || fail "commit parent mismatch"
+            [[ "$(git rev-parse HEAD^{tree})" == "$expected_tree" ]] || fail "commit tree mismatch"
+
+            askpass="$(mktemp "${RUNNER_TEMP}/opencode-askpass.XXXXXX")"
+            trap 'rm -f "$askpass"' EXIT
+            printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$GH_TOKEN"' >"$askpass"
+            chmod 700 "$askpass"
+            GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+              git push "https://x-access-token@github.com/${REPOSITORY}.git" \
+              "HEAD:refs/heads/${branch}" ||
+              fail "one-shot branch push failed; rerun to preflight the deterministic branch"
+            branch_sha="$(git rev-parse HEAD)"
+          fi
+
+          persisted_ref="$(api_get "repos/${REPOSITORY}/git/ref/heads/${branch}")"
+          jq -e --arg ref "refs/heads/$branch" --arg sha "$branch_sha" '
+            .ref == $ref and .object.type == "commit" and .object.sha == $sha
+          ' <<<"$persisted_ref" >/dev/null ||
+            fail "deterministic branch post-write verification failed"
+          verify_branch_commit "$branch_sha"
+
+          payload="$(jq -n \
+            --arg base "$DEFAULT_BRANCH" \
+            --arg body "$pull_body" \
+            --arg head "$branch" \
+            --arg title "$pull_title" \
+            '{title: $title, head: $head, base: $base, body: $body, draft: true}')"
+          set +e
+          response="$(curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --connect-timeout 15 \
+            --max-time 60 \
+            --proto '=https' \
+            --tlsv1.2 \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN is required}" \
+            --header "Content-Type: application/json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --data-binary "$payload" \
+            "${API_URL:-https://api.github.com}/repos/${REPOSITORY}/pulls")"
+          post_status="$?"
+          set -e
+          if [[ "$post_status" -ne 0 ]]; then
+            fail "one-shot pull request publication failed; outcome may be unknown, so rerun to preflight it"
+          fi
+          jq -e \
+            --arg base "$DEFAULT_BRANCH" \
+            --arg base_sha "$TARGET_SHA" \
+            --arg branch "$branch" \
+            --arg body "$pull_body" \
+            --arg repository "$REPOSITORY" \
+            --arg title "$pull_title" \
+            --arg sha "$branch_sha" '
+              .draft == true and
+              .state == "open" and
+              .base.ref == $base and
+              .base.sha == $base_sha and
+              .base.repo.full_name == $repository and
+              .head.ref == $branch and
+              .head.repo.full_name == $repository and
+              .head.sha == $sha and
+              .title == $title and .body == $body and
+              (.number | type == "number" and . >= 1 and floor == .) and
+              .html_url ==
+                ("https://github.com/" + $repository + "/pull/" + (.number | tostring))
+            ' <<<"$response" >/dev/null || fail "created pull request failed verification"
+          pull_number="$(jq -r '.number' <<<"$response")"
+          [[ "$pull_number" =~ ^[1-9][0-9]*$ ]] ||
+            fail "created pull request number is invalid"
+
+          post_pull_ref="$(api_get "repos/${REPOSITORY}/git/ref/heads/${branch}")"
+          jq -e --arg ref "refs/heads/$branch" --arg sha "$branch_sha" '
+            .ref == $ref and .object.type == "commit" and .object.sha == $sha
+          ' <<<"$post_pull_ref" >/dev/null ||
+            fail "deterministic branch moved during pull request publication"
+          verify_branch_commit "$branch_sha"
+
+          persisted_pull="$(api_get "repos/${REPOSITORY}/pulls/${pull_number}")"
+          jq -e \
+            --arg base "$DEFAULT_BRANCH" \
+            --arg base_sha "$TARGET_SHA" \
+            --arg branch "$branch" \
+            --arg body "$pull_body" \
+            --argjson number "$pull_number" \
+            --arg repository "$REPOSITORY" \
+            --arg title "$pull_title" \
+            --arg sha "$branch_sha" '
+              .number == $number and .draft == true and .state == "open" and
+              .base.ref == $base and .base.sha == $base_sha and
+              .base.repo.full_name == $repository and
+              .head.ref == $branch and .head.repo.full_name == $repository and
+              .head.sha == $sha and
+              .title == $title and .body == $body and
+              .html_url ==
+                ("https://github.com/" + $repository + "/pull/" + (.number | tostring))
+            ' <<<"$persisted_pull" >/dev/null ||
+            fail "created pull request did not persist with the authorized commit and metadata"
+          # runtime:build-publish:end

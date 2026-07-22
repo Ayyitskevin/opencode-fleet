@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+versions="${OPENCODE_FLEET_VERSIONS:-$fleet_root/config/versions.json}"
+target_home="${OPENCODE_FLEET_HOME:-$HOME}"
+state_root="${OPENCODE_FLEET_STATE_ROOT:-$target_home/.local/state/opencode-fleet}"
+archive=""
+apply=false
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  install-opencode-cli [--archive <local-tar.gz>] [--apply]
+
+The installer never downloads. It accepts only the pinned Linux x64 archive,
+verifies its SHA-256 before extraction, validates the binary version, backs up
+the current target, and installs atomically. The default is a dry run.
+USAGE
+}
+
+die() {
+  printf 'install-opencode-cli: %s\n' "$*" >&2
+  exit 1
+}
+
+validate_path_chain() {
+  local base="$1"
+  local path="$2"
+  local label="$3"
+  local relative current component
+  local -a components
+
+  [[ "$base" == /* && -d "$base" && ! -L "$base" &&
+     "$(realpath -e -- "$base")" == "$base" ]] ||
+    die "$label containment root is not a canonical directory"
+  [[ "$path" == "$base" || "$path" == "$base/"* ]] ||
+    die "$label escapes its containment root"
+  [[ "$(realpath -m -- "$path")" == "$path" ]] ||
+    die "$label contains an existing symlink or is non-canonical"
+  [[ "$path" != "$base" ]] || return 0
+  relative="${path#"$base"/}"
+  current="$base"
+  IFS='/' read -r -a components <<<"$relative"
+  for component in "${components[@]}"; do
+    [[ -n "$component" && "$component" != "." && "$component" != ".." ]] ||
+      die "$label contains an unsafe path component"
+    current="$current/$component"
+    if [[ -e "$current" || -L "$current" ]]; then
+      [[ -d "$current" && ! -L "$current" &&
+         "$(realpath -e -- "$current")" == "$current" ]] ||
+        die "$label traverses a non-directory or symlink"
+    fi
+  done
+}
+
+validate_target_parent() {
+  validate_path_chain "$1" "$(dirname -- "$2")" "$3 parent"
+}
+
+reconcile_cli_failure() {
+  local original_status="$1"
+  local reconciliation_failed=false
+  local failed_binary="$backup_root/opencode.failed-current"
+  local failed_record="$backup_root/cli-install.json.failed-transaction"
+  local restore_temporary
+
+  [[ "${transaction_active:-false}" == true ]] || return 0
+  set +e
+  if [[ -e "$target_binary" || -L "$target_binary" ]]; then
+    if [[ ! -e "$failed_binary" && ! -L "$failed_binary" ]]; then
+      mv -- "$target_binary" "$failed_binary" || reconciliation_failed=true
+    else
+      reconciliation_failed=true
+    fi
+  fi
+  if [[ -n "$binary_backup" ]]; then
+    restore_temporary="${target_binary}.reconcile.$timestamp"
+    cp -a -- "$binary_backup" "$restore_temporary" &&
+      mv -fT -- "$restore_temporary" "$target_binary" ||
+      reconciliation_failed=true
+  fi
+  if [[ -e "$install_record" || -L "$install_record" ]]; then
+    if [[ ! -e "$failed_record" && ! -L "$failed_record" ]]; then
+      mv -- "$install_record" "$failed_record" || reconciliation_failed=true
+    else
+      reconciliation_failed=true
+    fi
+  fi
+  if [[ -n "$record_backup" ]]; then
+    restore_temporary="${install_record}.reconcile.$timestamp"
+    cp -a -- "$record_backup" "$restore_temporary" &&
+      mv -fT -- "$restore_temporary" "$install_record" ||
+      reconciliation_failed=true
+  fi
+  sync -f "$backup_root" >/dev/null 2>&1 || reconciliation_failed=true
+  transaction_active=false
+  if [[ "$reconciliation_failed" == true ]]; then
+    printf 'install-opencode-cli: install failed with status %s and automatic reconciliation was incomplete; preserve and inspect %s\n' "$original_status" "$backup_root" >&2
+  else
+    printf 'install-opencode-cli: install failed with status %s; previous CLI state was restored and failed state was preserved under %s\n' "$original_status" "$backup_root" >&2
+  fi
+}
+
+while (($#)); do
+  case "$1" in
+    --archive)
+      shift
+      [[ -n "${1:-}" ]] || die "--archive requires a path"
+      archive="$1"
+      ;;
+    --apply)
+      apply=true
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+  shift
+done
+
+for command_name in jq sha256sum tar mktemp install realpath stat cp mv chmod \
+  rmdir uname cut date basename dirname id sync flock; do
+  command -v "$command_name" >/dev/null 2>&1 ||
+    die "required command is missing: $command_name"
+done
+[[ "$(id -u)" -ne 0 ]] || die "refusing to install OpenCode as root"
+[[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] ||
+  die "the pinned archive supports only Linux x86_64"
+[[ -d "$target_home" && ! -L "$target_home" &&
+   "$(realpath -e "$target_home")" == "$target_home" ]] ||
+  die "target home must be an existing canonical directory"
+[[ "$state_root" == "$target_home/"* ]] ||
+  die "state root must remain inside the selected home"
+jq -e '
+  (keys == ["opencode"] or (keys | sort) == ["actionsCheckout", "opencode"]) and
+  (.opencode | keys | sort) ==
+    ["linuxX64Archive", "linuxX64Sha256", "version"] and
+  (.opencode.version | type == "string" and
+    test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+  (.opencode.linuxX64Archive | type == "string" and length > 0) and
+  (.opencode.linuxX64Sha256 | type == "string" and
+    test("^[0-9a-f]{64}$"))
+' "$versions" >/dev/null || die "version pin file is invalid"
+if [[ "${OPENCODE_FLEET_TESTING:-0}" != "1" ]]; then
+  [[ -z "${OPENCODE_FLEET_VERSIONS:-}" ]] ||
+    die "version pin overrides are test-only"
+fi
+
+expected_version="$(jq -r '.opencode.version' "$versions")"
+expected_archive="$(jq -r '.opencode.linuxX64Archive' "$versions")"
+expected_sha256="$(jq -r '.opencode.linuxX64Sha256' "$versions")"
+[[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || die "pinned SHA-256 is invalid"
+
+archive_status="not-supplied"
+if [[ -n "$archive" ]]; then
+  [[ "$archive" == /* && -f "$archive" && ! -L "$archive" &&
+     "$(realpath -e -- "$archive")" == "$archive" ]] ||
+    die "archive must be an absolute regular local file"
+  [[ "$(basename "$archive")" == "$expected_archive" ]] ||
+    die "archive filename does not match the pin"
+  actual_sha256="$(sha256sum "$archive" | cut -d' ' -f1)"
+  [[ "$actual_sha256" == "$expected_sha256" ]] ||
+    die "archive SHA-256 does not match the pin"
+  archive_status="verified"
+fi
+
+target_dir="$target_home/.opencode/bin"
+target_binary="$target_dir/opencode"
+install_record="$state_root/cli-install.json"
+timestamp="$(date -u +%Y%m%dT%H%M%SZ)-$BASHPID"
+backup_root="$state_root/cli-backups/$timestamp"
+
+jq -n \
+  --arg version "$expected_version" \
+  --arg archive "$expected_archive" \
+  --arg sha256 "$expected_sha256" \
+  --arg archiveStatus "$archive_status" \
+  --arg target "$target_binary" \
+  --arg backupRoot "$backup_root" \
+  '{
+    action: "install-opencode-cli",
+    applyRequired: true,
+    version: $version,
+    archive: $archive,
+    sha256: $sha256,
+    archiveStatus: $archiveStatus,
+    target: $target,
+    backupRoot: $backupRoot
+  }'
+[[ "$apply" == true ]] || exit 0
+[[ -n "$archive" ]] || die "--apply requires --archive with the pinned local file"
+
+for target in "$target_binary" "$install_record"; do
+  [[ ! -d "$target" ]] || die "installation target is unexpectedly a directory"
+done
+validate_target_parent "$target_home" "$target_binary" "CLI target"
+validate_target_parent "$target_home" "$install_record" "CLI install record"
+validate_path_chain "$target_home" "$backup_root" "CLI backup root"
+[[ "$state_root" == /* && "$(realpath -m "$state_root")" == "$state_root" ]] ||
+  die "state root must be an absolute canonical path"
+install -d -m 700 "$state_root"
+validate_path_chain "$target_home" "$state_root" "fleet state root"
+chmod 700 "$state_root"
+lock_path="$state_root/session.lock"
+[[ ! -L "$lock_path" ]] || die "global session lock must not be a symlink"
+exec 9>"$lock_path"
+chmod 600 "$lock_path"
+flock -n 9 || die "another OpenCode fleet session owns the local lane"
+
+for target in "$target_binary" "$install_record"; do
+  [[ ! -d "$target" ]] || die "installation target became a directory"
+done
+install -d -m 700 "$target_home/.opencode" "$target_dir" \
+  "$state_root/cli-backups" "$backup_root"
+validate_target_parent "$target_home" "$target_binary" "CLI target"
+validate_target_parent "$target_home" "$install_record" "CLI install record"
+validate_path_chain "$target_home" "$backup_root" "CLI backup root"
+chmod 700 "$target_home/.opencode" "$target_dir" "$state_root" \
+  "$state_root/cli-backups" "$backup_root"
+
+binary_backup=""
+record_backup=""
+if [[ -e "$target_binary" || -L "$target_binary" ]]; then
+  binary_backup="$backup_root/opencode.previous"
+  cp -a -- "$target_binary" "$binary_backup"
+fi
+if [[ -e "$install_record" || -L "$install_record" ]]; then
+  record_backup="$backup_root/cli-install.json.previous"
+  cp -a -- "$install_record" "$record_backup"
+fi
+chmod -R go-rwx "$backup_root"
+
+members="$(tar -tzf "$archive")"
+[[ "$members" == "opencode" || "$members" == "./opencode" ]] ||
+  die "archive must contain exactly one root-level opencode binary"
+extract_dir="$(mktemp -d "$target_dir/.extract.XXXXXX")"
+chmod 700 "$extract_dir"
+tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$extract_dir"
+candidate="$extract_dir/opencode"
+[[ -f "$candidate" && ! -L "$candidate" ]] ||
+  die "extracted opencode is not a regular file"
+chmod 700 "$candidate"
+actual_version="$("$candidate" --version 2>/dev/null || true)"
+[[ "$actual_version" == "$expected_version" ]] ||
+  die "archive binary version does not match the pin"
+binary_sha256="$(sha256sum "$candidate" | cut -d' ' -f1)"
+
+binary_temporary="$target_dir/.opencode.$timestamp"
+[[ ! -e "$binary_temporary" && ! -L "$binary_temporary" ]] ||
+  die "temporary binary target already exists"
+mv -- "$candidate" "$binary_temporary"
+rmdir "$extract_dir"
+
+prepared_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+record_temporary="$(mktemp "$state_root/.cli-install.XXXXXX")"
+jq -n \
+  --arg preparedAt "$prepared_at" \
+  --arg transactionId "$timestamp" \
+  --arg version "$expected_version" \
+  --arg archive "$archive" \
+  --arg archiveSha256 "$expected_sha256" \
+  --arg binarySha256 "$binary_sha256" \
+  --arg target "$target_binary" \
+  --arg backup "$binary_backup" \
+  --arg previousRecordBackup "$record_backup" \
+  --arg backupRoot "$backup_root" \
+  '{
+    schemaVersion: 1,
+    status: "prepared",
+    transactionId: $transactionId,
+    preparedAt: $preparedAt,
+    version: $version,
+    archive: $archive,
+    archiveSha256: $archiveSha256,
+    binarySha256: $binarySha256,
+    target: $target,
+    backup: $backup,
+    previousInstallRecordBackup: $previousRecordBackup,
+    backupRoot: $backupRoot,
+    installedType: "regular",
+    mode: "700"
+  }' >"$record_temporary"
+chmod 600 "$record_temporary"
+transaction_active=true
+trap 'status=$?; reconcile_cli_failure "$status"; exit "$status"' EXIT
+mv -fT -- "$record_temporary" "$install_record"
+chmod 600 "$install_record"
+sync -f "$install_record" "$state_root"
+
+if [[ "${OPENCODE_FLEET_TESTING:-0}" == 1 &&
+      "${OPENCODE_FLEET_TEST_FAIL_AFTER_RECORD:-0}" == 1 ]]; then
+  die "injected failure after durable CLI install record"
+fi
+
+mv -fT -- "$binary_temporary" "$target_binary"
+chmod 700 "$target_binary"
+if [[ "${OPENCODE_FLEET_TESTING:-0}" == 1 &&
+      "${OPENCODE_FLEET_TEST_FAIL_AFTER_FIRST_TARGET:-0}" == 1 ]]; then
+  die "injected failure after CLI target replacement"
+fi
+
+[[ -f "$target_binary" && -x "$target_binary" && ! -L "$target_binary" &&
+   "$(stat -c %a "$target_binary")" == "700" &&
+   "$(sha256sum "$target_binary" | cut -d' ' -f1)" == "$binary_sha256" &&
+   "$("$target_binary" --version 2>/dev/null)" == "$expected_version" ]] ||
+  die "installed binary failed final validation"
+completed_record="$(mktemp "$state_root/.cli-install-complete.XXXXXX")"
+jq --arg completedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '.status = "installed" | .completedAt = $completedAt' \
+  "$install_record" >"$completed_record"
+chmod 600 "$completed_record"
+mv -fT -- "$completed_record" "$install_record"
+sync -f "$install_record" "$state_root"
+transaction_active=false
+trap - EXIT
+printf 'installed OpenCode CLI %s; record: %s\n' "$expected_version" "$install_record"

@@ -1,0 +1,1025 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+manifest=""
+renderer="$fleet_root/scripts/render-callers"
+owner_id=133295304
+owner_login=Ayyitskevin
+
+usage() {
+  cat <<'EOF'
+Usage:
+  github-rollout REPOSITORY --central-sha COMMIT [--apply]
+
+The default is a read-only GitHub API plan. --apply prepares one rollout branch
+and one draft pull request for exactly the selected repository. It never uses a
+local clone and never reads or writes secret values.
+EOF
+}
+
+die() {
+  printf 'github-rollout: %s\n' "$*" >&2
+  exit 1
+}
+
+command -v jq >/dev/null 2>&1 || die "required command is missing: jq"
+command -v gh >/dev/null 2>&1 || die "required command is missing: gh"
+command -v git >/dev/null 2>&1 || die "required command is missing: git"
+command -v base64 >/dev/null 2>&1 || die "required command is missing: base64"
+[[ -x "$renderer" ]] || die "renderer is not executable: $renderer"
+
+repository_query="${1:-}"
+case "$repository_query" in
+  ""|-h|--help)
+    usage
+    exit 0
+    ;;
+  --*) die "repository must be the first argument" ;;
+esac
+shift
+
+central_sha=""
+apply=false
+while (($#)); do
+  case "$1" in
+    --central-sha)
+      (($# >= 2)) || die "--central-sha requires a value"
+      central_sha="$2"
+      shift 2
+      ;;
+    --apply)
+      apply=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[[ "$central_sha" =~ ^[0-9a-f]{40}$ ]] || \
+  die "--central-sha must be exactly 40 lowercase hexadecimal characters"
+[[ "$central_sha" != 0000000000000000000000000000000000000000 ]] || \
+  die "--central-sha cannot be the all-zero object ID"
+
+temp_root="$(mktemp -d)"
+trap 'rm -rf "$temp_root"' EXIT
+central_source_root="$temp_root/central-source"
+mkdir -p "$central_source_root"
+
+fetch_api() {
+  local endpoint="$1"
+  local destination="$2"
+  gh api "$endpoint" >"$destination" 2>/dev/null
+}
+
+urlencode() {
+  jq -rn --arg value "$1" '$value | @uri'
+}
+
+fetch_central_file() {
+  local relative_path="$1"
+  local maximum_bytes="$2"
+  local destination="$central_source_root/$relative_path"
+  local response="${destination}.api-response"
+
+  mkdir -p "$(dirname -- "$destination")"
+  fetch_api "repos/$owner_login/opencode-fleet/contents/$relative_path?ref=$central_sha" "$response" ||
+    die "central source file is unavailable at the pinned commit: $relative_path"
+  jq -e \
+    --arg path "$relative_path" \
+    --argjson maximum "$maximum_bytes" '
+      .type == "file" and .path == $path and .encoding == "base64" and
+      (.sha | type == "string" and test("^[0-9a-f]{40}$")) and
+      (.size | type == "number" and . >= 1 and . <= $maximum and floor == .) and
+      (.content | type == "string")
+    ' "$response" >/dev/null ||
+    die "central source response is invalid or outside bounds: $relative_path"
+  jq -r '.content' "$response" | tr -d '\n' | base64 --decode >"$destination" ||
+    die "central source content is not valid base64: $relative_path"
+  [[ -f "$destination" && ! -L "$destination" &&
+     "$(wc -c <"$destination")" -ge 1 &&
+     "$(wc -c <"$destination")" -le "$maximum_bytes" ]] ||
+    die "decoded central source is invalid or outside bounds: $relative_path"
+  [[ "$(git hash-object -- "$destination")" == "$(jq -r '.sha' "$response")" ]] ||
+    die "decoded central source does not match its Git blob ID: $relative_path"
+  chmod 600 "$destination"
+}
+
+central_repository_json="$temp_root/central-repository.json"
+fetch_api "repos/$owner_login/opencode-fleet" "$central_repository_json" ||
+  die "central repository metadata is unavailable"
+central_default_branch="$(jq -r '.default_branch // empty' "$central_repository_json")"
+git check-ref-format --branch "$central_default_branch" >/dev/null 2>&1 ||
+  die "central repository default branch is invalid"
+jq -e --arg owner "$owner_login" --argjson owner_id "$owner_id" '
+  .full_name == ($owner + "/opencode-fleet") and
+  .owner.login == $owner and .owner.id == $owner_id
+' "$central_repository_json" >/dev/null ||
+  die "central repository identity differs from the fixed fleet owner"
+jq -e '
+  .visibility == "public" and .private == false
+' "$central_repository_json" >/dev/null ||
+  die "central repository must be explicitly public for public reusable-workflow callers"
+
+encoded_central_default="$(urlencode "$central_default_branch")"
+central_ref_json="$temp_root/central-default-ref.json"
+fetch_api "repos/$owner_login/opencode-fleet/git/ref/heads/$encoded_central_default" "$central_ref_json" ||
+  die "central default branch ref is unavailable"
+jq -e --arg ref "refs/heads/$central_default_branch" '
+  .ref == $ref and .object.type == "commit" and
+  (.object.sha | type == "string" and test("^[0-9a-f]{40}$"))
+' "$central_ref_json" >/dev/null ||
+  die "central default branch did not resolve to an exact commit"
+central_head="$(jq -r '.object.sha' "$central_ref_json")"
+
+central_commit_json="$temp_root/central-commit.json"
+fetch_api "repos/$owner_login/opencode-fleet/git/commits/$central_sha" "$central_commit_json" ||
+  die "central workflow commit is unavailable"
+jq -e --arg sha "$central_sha" '
+  .sha == $sha and
+  (.tree.sha | type == "string" and test("^[0-9a-f]{40}$"))
+' "$central_commit_json" >/dev/null ||
+  die "central workflow commit did not resolve exactly"
+
+central_compare_json="$temp_root/central-compare.json"
+fetch_api "repos/$owner_login/opencode-fleet/compare/$central_sha...$central_head" "$central_compare_json" ||
+  die "central default-branch lineage is unavailable"
+jq -e --arg base "$central_sha" --arg head "$central_head" '
+  (.status == "ahead" or .status == "identical") and
+  .base_commit.sha == $base and .merge_base_commit.sha == $base and
+  .head_commit.sha == $head
+' "$central_compare_json" >/dev/null ||
+  die "supplied central commit is not in the authorized default-branch lineage"
+
+fetch_central_file "config/repos.json" 1048576
+manifest="$central_source_root/config/repos.json"
+jq -e --arg owner "$owner_login" '
+  .schemaVersion == 1 and
+  .owner == $owner and
+  (.repositories | type == "array") and
+  ([.repositories[].name | ascii_downcase] | length == (unique | length)) and
+  ([.repositories[].fullName | ascii_downcase] | length == (unique | length)) and
+  all(.repositories[];
+    (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+    .fullName == ($owner + "/" + .name) and
+    (.defaultBranch | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._/-]*$") and
+      (contains("..") | not)) and
+    (.state == "active" or .state == "placeholder") and
+    (.risk == "upstream" or .risk == "restricted" or
+      .risk == "standard" or .risk == "placeholder") and
+    (.githubMode == "manual" or .githubMode == "review" or
+      .githubMode == "manual-build" or .githubMode == "disabled") and
+    (if .state == "placeholder"
+      then .risk == "placeholder" and .githubMode == "disabled"
+      else .risk != "placeholder" and .githubMode != "disabled"
+      end)
+  )
+' "$manifest" >/dev/null || die "pinned manifest violates the strict owner and repository schema"
+
+while IFS= read -r default_branch; do
+  git check-ref-format --branch "$default_branch" >/dev/null 2>&1 ||
+    die "pinned manifest contains an invalid Git default branch"
+done < <(jq -r '.repositories[].defaultBranch' "$manifest")
+
+matches="$(
+  jq -c --arg query "${repository_query,,}" \
+    '[.repositories[] | select(
+      (.name | ascii_downcase) == $query or
+      (.fullName | ascii_downcase) == $query
+    )]' "$manifest"
+)"
+match_count="$(jq 'length' <<<"$matches")"
+[[ "$match_count" == 1 ]] || {
+  if [[ "$match_count" == 0 ]]; then
+    die "repository is not catalogued: $repository_query"
+  fi
+  die "repository query is ambiguous: $repository_query"
+}
+
+entry="$(jq -c '.[0]' <<<"$matches")"
+repository_name="$(jq -r '.name' <<<"$entry")"
+repository_full_name="$(jq -r '.fullName' <<<"$entry")"
+repository_state="$(jq -r '.state' <<<"$entry")"
+manifest_default_branch="$(jq -r '.defaultBranch' <<<"$entry")"
+repository_risk="$(jq -r '.risk' <<<"$entry")"
+github_mode="$(jq -r '.githubMode' <<<"$entry")"
+
+emit_non_rollout_plan() {
+  local reason="$1"
+  jq -n \
+    --arg repository "$repository_name" \
+    --arg full_name "$repository_full_name" \
+    --arg state "$repository_state" \
+    --arg github_mode "$github_mode" \
+    --arg risk "$repository_risk" \
+    --arg central_sha "$central_sha" \
+    --arg reason "$reason" \
+    --argjson apply_requested "$apply" \
+    '{
+      repository: $repository,
+      fullName: $full_name,
+      state: $state,
+      githubMode: $github_mode,
+      risk: $risk,
+      centralSha: $central_sha,
+      applyRequested: $apply_requested,
+      ready: false,
+      operations: {write: [], delete: [], draftPullRequest: false},
+      blockers: [$reason]
+    }'
+}
+
+if [[ "$repository_state" != active || "$github_mode" == disabled ]]; then
+  reason="$repository_name is an empty placeholder; rollout must wait for its first intentional commit"
+  [[ "$repository_name" != Minerva ]] || \
+    reason="Minerva main is an empty initialization commit while product content remains on an unmerged draft PR; rollout must not create the first main content commit or race that review"
+  emit_non_rollout_plan "$reason"
+  [[ "$apply" == false ]] || exit 1
+  exit 0
+fi
+
+if [[ "$github_mode" == manual ]]; then
+  emit_non_rollout_plan \
+    "$repository_name is upstream/local-manual-only; the comment workflow is intentionally not installed"
+  [[ "$apply" == false ]] || exit 1
+  exit 0
+fi
+
+case "$github_mode:$repository_risk" in
+  review:restricted|manual-build:standard) ;;
+  *) die "unsupported GitHub mode/risk pair for $repository_name: $github_mode/$repository_risk" ;;
+esac
+
+fetch_central_file "templates/callers/review.yml.tpl" 131072
+fetch_central_file "templates/policies/$repository_risk.json.tpl" 131072
+fetch_central_file ".github/workflows/review.yml" 1048576
+if [[ "$github_mode" == manual-build ]]; then
+  fetch_central_file "templates/callers/build.yml.tpl" 131072
+  fetch_central_file ".github/workflows/build.yml" 1048576
+fi
+
+render_root="$temp_root/rendered"
+render_metadata="$temp_root/render.json"
+"$renderer" \
+  --repository "$repository_name" \
+  --central-sha "$central_sha" \
+  --source-root "$central_source_root" \
+  --output "$render_root" >"$render_metadata"
+
+case "$github_mode" in
+  review)
+    expected_rendered_files='[
+      ".github/opencode-policy.json",
+      ".github/workflows/opencode-review.yml"
+    ]'
+    ;;
+  manual-build)
+    expected_rendered_files='[
+      ".github/opencode-policy.json",
+      ".github/workflows/opencode-build.yml",
+      ".github/workflows/opencode-review.yml"
+    ]'
+    ;;
+  *) die "unsupported rendered GitHub mode: $github_mode" ;;
+esac
+
+jq -e \
+  --arg repository "$repository_name" \
+  --arg full_name "$repository_full_name" \
+  --arg github_mode "$github_mode" \
+  --arg risk "$repository_risk" \
+  --arg central_sha "$central_sha" \
+  --argjson files "$expected_rendered_files" '
+    type == "object" and
+    (keys | sort) == ["centralSha", "files", "fullName", "githubMode", "repository", "risk"] and
+    .repository == $repository and
+    .fullName == $full_name and
+    .githubMode == $github_mode and
+    .risk == $risk and
+    .centralSha == $central_sha and
+    .files == $files
+  ' "$render_metadata" >/dev/null || die "owned renderer returned an invalid closed-schema contract"
+
+actual_rendered_files="$(
+  find "$render_root" -type f -printf '%P\n' | sort | jq -Rsc 'split("\n") | map(select(length > 0))'
+)"
+[[ "$actual_rendered_files" == "$(jq -c . <<<"$expected_rendered_files")" ]] || \
+  die "owned renderer output does not match its exact file contract"
+if find "$render_root" -type l -print -quit | grep -q .; then
+  die "owned renderer output contains a symlink"
+fi
+
+blockers=()
+special_cases=()
+
+add_blocker() {
+  blockers+=("$1")
+}
+
+add_special_case() {
+  special_cases+=("$1")
+}
+
+repo_json="$temp_root/repository.json"
+live_default_branch="$manifest_default_branch"
+encoded_default_branch="$(urlencode "$manifest_default_branch")"
+if fetch_api "repos/$repository_full_name" "$repo_json"; then
+  live_full_name="$(jq -r '.full_name // empty' "$repo_json")"
+  live_default_branch="$(jq -r '.default_branch // empty' "$repo_json")"
+  repo_size="$(jq -r '.size // 0' "$repo_json")"
+  [[ "$live_full_name" == "$repository_full_name" ]] || \
+    add_blocker "GitHub canonical identity differs from the manifest"
+  jq -e --arg owner "$owner_login" --argjson owner_id "$owner_id" '
+    .owner.login == $owner and .owner.id == $owner_id
+  ' "$repo_json" >/dev/null || add_blocker "GitHub owner identity differs from the fixed fleet owner"
+  [[ "$live_default_branch" == "$manifest_default_branch" ]] || \
+    add_blocker "live default branch differs from manifest: expected $manifest_default_branch"
+  [[ "$repo_size" =~ ^[0-9]+$ && "$repo_size" -gt 0 ]] || \
+    add_blocker "GitHub repository has no committed content"
+else
+  add_blocker "GitHub repository metadata is unavailable"
+fi
+
+base_commit=""
+base_tree=""
+default_ref_json="$temp_root/default-ref.json"
+if fetch_api \
+  "repos/$repository_full_name/git/ref/heads/$encoded_default_branch" \
+  "$default_ref_json"; then
+  if jq -e --arg ref "refs/heads/$manifest_default_branch" '
+       .ref == $ref and .object.type == "commit" and
+       (.object.sha | type == "string" and test("^[0-9a-f]{40}$"))
+     ' "$default_ref_json" >/dev/null; then
+    base_commit="$(jq -r '.object.sha' "$default_ref_json")"
+  else
+    add_blocker "default branch ref did not return an exact commit ID"
+  fi
+else
+  add_blocker "default branch ref is unavailable"
+fi
+
+base_commit_json="$temp_root/base-commit.json"
+if [[ "$base_commit" =~ ^[0-9a-f]{40}$ ]] &&
+   fetch_api "repos/$repository_full_name/git/commits/$base_commit" "$base_commit_json"; then
+  if jq -e --arg commit "$base_commit" '
+       .sha == $commit and
+       (.tree.sha | type == "string" and test("^[0-9a-f]{40}$"))
+     ' "$base_commit_json" >/dev/null; then
+    base_tree="$(jq -r '.tree.sha' "$base_commit_json")"
+  else
+    add_blocker "default branch commit did not return an exact tree ID"
+  fi
+else
+  add_blocker "default branch commit is unavailable"
+fi
+
+base_tree_json="$temp_root/base-tree.json"
+if [[ "$base_tree" =~ ^[0-9a-f]{40}$ ]] &&
+   fetch_api "repos/$repository_full_name/git/trees/$base_tree?recursive=1" "$base_tree_json" &&
+   jq -e --arg tree "$base_tree" '
+     .sha == $tree and .truncated == false and (.tree | type == "array") and
+     ([.tree[].path] | length == (unique | length)) and
+     all(.tree[];
+       (.path | type == "string" and length > 0) and
+       (.type == "blob" or .type == "tree" or .type == "commit") and
+       (.sha | type == "string" and test("^[0-9a-f]{40}$"))
+     )
+   ' "$base_tree_json" >/dev/null; then
+  :
+else
+  add_blocker "exact default-branch tree is unavailable, invalid, or truncated"
+fi
+
+[[ "$repository_name" != Chronos ]] || \
+  add_special_case "Chronos intentionally uses feat/wheel-dashboard-mvp as its default branch; main must not be assumed"
+[[ "$repository_name" != Focal ]] || \
+  add_special_case "Focal is the canonical GitHub identity; the local Ayyitskevin/mise remote alias is ignored"
+[[ "$repository_name" != Vulcan ]] || \
+  add_special_case "Vulcan currently has no OpenCode caller and must acquire environment-scoped readiness before rollout"
+
+check_environment_secret() {
+  local environment_name="$1"
+  local environment_json="$temp_root/environment-$environment_name.json"
+  local secrets_json="$temp_root/environment-$environment_name-secrets.json"
+
+  if ! fetch_api \
+    "repos/$repository_full_name/environments/$environment_name" \
+    "$environment_json"; then
+    add_blocker "missing $environment_name environment"
+    return 1
+  fi
+  if ! fetch_api \
+    "repos/$repository_full_name/environments/$environment_name/secrets" \
+    "$secrets_json" ||
+     ! jq -e 'any(.secrets[]?; .name == "OPENCODE_API_KEY")' "$secrets_json" >/dev/null; then
+    add_blocker "missing OPENCODE_API_KEY in $environment_name environment"
+    return 1
+  fi
+}
+
+check_environment_secret opencode-review || true
+
+if [[ "$github_mode" == manual-build ]]; then
+  check_environment_secret opencode-build || true
+  build_environment_json="$temp_root/environment-opencode-build.json"
+  if [[ -s "$build_environment_json" ]] &&
+     jq -e --argjson owner_id "$owner_id" --arg owner "$owner_login" '
+       ([.protection_rules[]? | select(.type == "required_reviewers")] | length) == 1 and
+       ([.protection_rules[]? | select(.type == "required_reviewers")][0].reviewers | length) == 1 and
+       [.protection_rules[]? | select(.type == "required_reviewers")][0].reviewers[0].type == "User" and
+       [.protection_rules[]? | select(.type == "required_reviewers")][0].reviewers[0].reviewer.id == $owner_id and
+       [.protection_rules[]? | select(.type == "required_reviewers")][0].reviewers[0].reviewer.login == $owner
+     ' "$build_environment_json" >/dev/null; then
+    :
+  else
+    add_blocker "opencode-build must have exactly one required reviewer: the fixed fleet owner"
+  fi
+
+  if [[ -s "$build_environment_json" ]] &&
+     jq -e '
+       .deployment_branch_policy.custom_branch_policies == true and
+       .deployment_branch_policy.protected_branches == false
+     ' "$build_environment_json" >/dev/null; then
+    branch_policies_json="$temp_root/environment-opencode-build-branches.json"
+    if fetch_api \
+      "repos/$repository_full_name/environments/opencode-build/deployment-branch-policies" \
+      "$branch_policies_json" &&
+       jq -e --arg branch "$manifest_default_branch" '
+         (.branch_policies | length) == 1 and .branch_policies[0].name == $branch
+       ' "$branch_policies_json" >/dev/null; then
+      :
+    else
+      add_blocker "opencode-build is not restricted to the exact default branch"
+    fi
+  else
+    add_blocker "opencode-build does not use custom default-branch-only deployment policy"
+  fi
+fi
+
+protection_json="$temp_root/default-branch-protection.json"
+if fetch_api \
+  "repos/$repository_full_name/branches/$encoded_default_branch/protection" \
+  "$protection_json" &&
+     jq -e '
+       (.required_status_checks | type) == "object" and
+       .required_status_checks.strict == true and
+       (.required_status_checks.contexts | type) == "array" and
+       (.required_status_checks.checks | type) == "array" and
+       (.required_status_checks.checks | length) >= 1 and
+       ([.required_status_checks.checks[].context] | length == (unique | length)) and
+       all(.required_status_checks.checks[];
+         (.context | type == "string" and length > 0) and
+         .app_id == 15368
+       ) and
+       (.required_status_checks.contexts | sort) ==
+         ([.required_status_checks.checks[].context] | sort) and
+       .enforce_admins.enabled == true and
+       (.required_pull_request_reviews | type) == "object" and
+       .required_pull_request_reviews.dismiss_stale_reviews == true and
+       .required_pull_request_reviews.require_last_push_approval == true and
+       (.required_pull_request_reviews.required_approving_review_count | type) == "number" and
+       .required_pull_request_reviews.required_approving_review_count >= 1 and
+       .required_pull_request_reviews.required_approving_review_count <= 6 and
+       .required_pull_request_reviews.required_approving_review_count ==
+         (.required_pull_request_reviews.required_approving_review_count | floor) and
+       (.required_pull_request_reviews.bypass_pull_request_allowances | type) == "object" and
+       .required_pull_request_reviews.bypass_pull_request_allowances.users == [] and
+       .required_pull_request_reviews.bypass_pull_request_allowances.teams == [] and
+       .required_pull_request_reviews.bypass_pull_request_allowances.apps == [] and
+       (.allow_force_pushes | type) == "object" and
+       (.allow_force_pushes.enabled | type) == "boolean" and
+       .allow_force_pushes.enabled == false and
+       (.allow_deletions | type) == "object" and
+       (.allow_deletions.enabled | type) == "boolean" and
+       .allow_deletions.enabled == false
+   ' "$protection_json" >/dev/null; then
+  :
+else
+  add_blocker "enrollment requires strict app-bound checks, stale-review dismissal, last-push human approval, enforced administrators, no PR bypass actors, and no force-push or deletion on the default branch"
+fi
+
+writes=()
+deletes=()
+rendered_blob_entries='[]'
+
+while IFS= read -r relative_path; do
+  [[ -n "$relative_path" ]] || continue
+  source_path="$render_root/$relative_path"
+  [[ -f "$source_path" && ! -L "$source_path" ]] || die "rendered file is unsafe: $relative_path"
+  rendered_blob="$(git hash-object -- "$source_path")"
+  [[ "$rendered_blob" =~ ^[0-9a-f]{40}$ ]] || die "could not hash rendered file: $relative_path"
+  rendered_blob_entries="$(
+    jq \
+      --arg path "$relative_path" \
+      --arg sha "$rendered_blob" \
+      '. + [{path: $path, mode: "100644", type: "blob", sha: $sha}]' \
+      <<<"$rendered_blob_entries"
+  )"
+  existing_blob="$(
+    jq -r --arg path "$relative_path" '
+      [.tree[]? | select(.path == $path and .type == "blob") | .sha] |
+      if length == 1 then .[0] else "" end
+    ' "$base_tree_json" 2>/dev/null || true
+  )"
+  if [[ "$existing_blob" != "$rendered_blob" ]]; then
+    writes+=("$relative_path")
+  fi
+done < <(jq -r '.files[]' "$render_metadata")
+
+if jq -e 'any(.tree[]?; .path == ".github/workflows/opencode.yml" and .type == "blob")' \
+  "$base_tree_json" >/dev/null 2>&1; then
+  deletes+=(".github/workflows/opencode.yml")
+fi
+
+if [[ "$github_mode" != manual-build ]]; then
+  if jq -e \
+    'any(.tree[]?; .path == ".github/workflows/opencode-build.yml" and .type == "blob")' \
+    "$base_tree_json" >/dev/null 2>&1; then
+    deletes+=(".github/workflows/opencode-build.yml")
+  fi
+fi
+
+writes_json="$(printf '%s\n' "${writes[@]}" | sort -u | jq -Rsc 'split("\n") | map(select(length > 0))')"
+deletes_json="$(printf '%s\n' "${deletes[@]}" | sort -u | jq -Rsc 'split("\n") | map(select(length > 0))')"
+
+# Reconstruct the exact non-tree leaf set expected after the rollout. Parent
+# directory tree IDs legitimately change, so branch recovery compares every
+# blob/submodule leaf, its type/mode, and object ID instead.
+base_leaf_tree="$(
+  jq -c '[.tree[]? | select(.type != "tree") | {path, mode, type, sha}]' \
+    "$base_tree_json" 2>/dev/null || true
+)"
+[[ -n "$base_leaf_tree" ]] || base_leaf_tree='[]'
+expected_leaf_tree="$(
+  jq -n \
+    --argjson base "$base_leaf_tree" \
+    --argjson rendered "$rendered_blob_entries" \
+    --argjson deleted "$deletes_json" '
+      (($rendered | map(.path)) + $deleted) as $replaced |
+      ([
+        $base[] | select((.path as $path | $replaced | index($path)) == null)
+      ] + $rendered) | sort_by(.path)
+    '
+)"
+if [[ "$(jq 'length' <<<"$writes_json")" == 0 && "$(jq 'length' <<<"$deletes_json")" == 0 ]]; then
+  add_blocker "generated callers already match the exact default-branch tree; no rollout change is needed"
+fi
+
+rollout_branch="opencode-fleet/rollout-${central_sha:0:12}"
+encoded_rollout_branch="$(urlencode "$rollout_branch")"
+rollout_marker="<!-- opencode-fleet-rollout central=$central_sha base=$base_commit -->"
+rollout_title="chore: install pinned OpenCode fleet callers"
+rollout_body="Owner-only OpenCode rollout pinned to central commit $central_sha. No environment or secret value is included in this change.
+
+$rollout_marker"
+
+verify_rollout_commit_tree() {
+  local candidate_commit="$1"
+  local artifact_prefix="$2"
+  local candidate_commit_json="$temp_root/$artifact_prefix-commit.json"
+  local candidate_tree_json="$temp_root/$artifact_prefix-tree.json"
+  local candidate_tree
+
+  fetch_api \
+    "repos/$repository_full_name/git/commits/$candidate_commit" \
+    "$candidate_commit_json" || return 1
+  jq -e \
+    --arg commit "$candidate_commit" \
+    --arg parent "$base_commit" '
+      .sha == $commit and
+      (.parents | type == "array" and length == 1) and
+      .parents[0].sha == $parent and
+      (.tree.sha | type == "string" and test("^[0-9a-f]{40}$"))
+    ' "$candidate_commit_json" >/dev/null || return 1
+
+  candidate_tree="$(jq -r '.tree.sha' "$candidate_commit_json")"
+  fetch_api \
+    "repos/$repository_full_name/git/trees/$candidate_tree?recursive=1" \
+    "$candidate_tree_json" || return 1
+  jq -e \
+    --arg tree "$candidate_tree" \
+    --argjson expected "$expected_leaf_tree" '
+      .sha == $tree and .truncated == false and (.tree | type == "array") and
+      ([.tree[].path] | length == (unique | length)) and
+      ([.tree[] | select(.type != "tree") | {path, mode, type, sha}] | sort_by(.path)) ==
+        $expected
+    ' "$candidate_tree_json" >/dev/null || return 1
+
+  printf '%s\n' "$candidate_tree"
+}
+
+existing_branch_commit=""
+existing_branch_tree=""
+reconciled_commit=""
+reconciled_tree=""
+existing_pull_request=""
+existing_pull_number=""
+existing_pull_draft=""
+rollout_ref_present=false
+prevent_branch_recreation=false
+existing_rollout_refs="$temp_root/existing-rollout-refs.json"
+if ! fetch_api \
+  "repos/$repository_full_name/git/matching-refs/heads/$encoded_rollout_branch" \
+  "$existing_rollout_refs" ||
+   ! jq -e '
+     type == "array" and length <= 100 and
+     all(.[];
+       (.ref | type == "string") and
+       .object.type == "commit" and
+       (.object.sha | type == "string" and test("^[0-9a-f]{40}$"))
+     )
+   ' "$existing_rollout_refs" >/dev/null; then
+  add_blocker "rollout branch state is unavailable"
+else
+  exact_rollout_refs="$(
+    jq -c --arg ref "refs/heads/$rollout_branch" '[.[] | select(.ref == $ref)]' \
+      "$existing_rollout_refs"
+  )"
+  if [[ "$(jq 'length' <<<"$exact_rollout_refs")" -gt 1 ]]; then
+    add_blocker "rollout branch state contains duplicate exact refs"
+  elif [[ "$(jq 'length' <<<"$exact_rollout_refs")" == 1 ]]; then
+    rollout_ref_present=true
+    candidate_branch_commit="$(jq -r '.[0].object.sha' <<<"$exact_rollout_refs")"
+    if candidate_branch_tree="$(verify_rollout_commit_tree "$candidate_branch_commit" existing-rollout)"; then
+      existing_branch_commit="$candidate_branch_commit"
+      existing_branch_tree="$candidate_branch_tree"
+      reconciled_commit="$candidate_branch_commit"
+      reconciled_tree="$candidate_branch_tree"
+    else
+      add_blocker "rollout branch already exists but its exact commit does not match this plan's parent/tree"
+    fi
+  fi
+fi
+
+encoded_pull_head="$(urlencode "$owner_login:$rollout_branch")"
+encoded_pull_base="$(urlencode "$manifest_default_branch")"
+existing_pulls_json="$temp_root/existing-rollout-pulls.json"
+if fetch_api \
+  "repos/$repository_full_name/pulls?state=all&head=$encoded_pull_head&base=$encoded_pull_base&per_page=10" \
+  "$existing_pulls_json" &&
+   jq -e 'type == "array" and length <= 1' "$existing_pulls_json" >/dev/null; then
+  if [[ "$(jq 'length' "$existing_pulls_json")" == 1 ]]; then
+    if jq -e \
+      --arg repository "$repository_full_name" \
+      --arg branch "$rollout_branch" \
+      --arg base "$manifest_default_branch" \
+      --arg base_sha "$base_commit" \
+      --arg title "$rollout_title" \
+      --arg body "$rollout_body" '
+        (.[0].state == "open" or .[0].state == "closed") and
+        (.[0].draft | type) == "boolean" and
+        .[0].head.repo.full_name == $repository and
+        .[0].base.repo.full_name == $repository and
+        .[0].head.ref == $branch and .[0].base.ref == $base and
+        (.[0].head.sha | type == "string" and test("^[0-9a-f]{40}$")) and
+        .[0].base.sha == $base_sha and
+        .[0].title == $title and .[0].body == $body and
+        (.[0].number | type == "number" and . >= 1 and floor == .) and
+        .[0].html_url ==
+          ("https://github.com/" + $repository + "/pull/" + (.[0].number | tostring))
+      ' "$existing_pulls_json" >/dev/null; then
+      candidate_pull_commit="$(jq -r '.[0].head.sha' "$existing_pulls_json")"
+      if candidate_pull_tree="$(verify_rollout_commit_tree "$candidate_pull_commit" existing-rollout-pull)"; then
+        if [[ -n "$reconciled_commit" && "$candidate_pull_commit" != "$reconciled_commit" ]]; then
+          add_blocker "existing rollout pull request head commit differs from the exact rollout branch"
+        else
+          reconciled_commit="$candidate_pull_commit"
+          reconciled_tree="$candidate_pull_tree"
+          existing_pull_request="$(jq -r '.[0].html_url' "$existing_pulls_json")"
+          existing_pull_number="$(jq -r '.[0].number' "$existing_pulls_json")"
+          existing_pull_draft="$(jq -r '.[0].draft' "$existing_pulls_json")"
+          if [[ "$(jq -r '.[0].state' "$existing_pulls_json")" == closed ]]; then
+            prevent_branch_recreation=true
+            add_blocker "exact rollout pull request is closed or merged; this deterministic rollout is terminal"
+          elif [[ "$existing_pull_draft" != true ]]; then
+            prevent_branch_recreation=true
+            add_special_case "exact rollout pull request was promoted by a human; reconciliation remains read-only"
+          fi
+        fi
+      else
+        add_blocker "existing rollout pull request head commit/tree does not exactly match this plan"
+      fi
+    else
+      add_blocker "existing rollout pull request does not exactly match this plan"
+    fi
+  fi
+else
+  add_blocker "existing rollout pull request state is unavailable or ambiguous"
+fi
+
+blockers_json="$(printf '%s\n' "${blockers[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+special_cases_json="$(printf '%s\n' "${special_cases[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+ready=true
+[[ "$(jq 'length' <<<"$blockers_json")" == 0 ]] || ready=false
+create_branch=true
+[[ "$rollout_ref_present" != true && "$prevent_branch_recreation" != true ]] || create_branch=false
+create_pull_request=true
+[[ -z "$existing_pull_request" ]] || create_pull_request=false
+
+plan_json="$(
+  jq -n \
+    --arg repository "$repository_name" \
+    --arg full_name "$repository_full_name" \
+    --arg state "$repository_state" \
+    --arg default_branch "$manifest_default_branch" \
+    --arg github_mode "$github_mode" \
+    --arg risk "$repository_risk" \
+    --arg central_sha "$central_sha" \
+    --arg branch "$rollout_branch" \
+    --arg existing_branch_commit "$existing_branch_commit" \
+    --arg existing_pull_request "$existing_pull_request" \
+    --argjson apply_requested "$apply" \
+    --argjson ready "$ready" \
+    --argjson create_branch "$create_branch" \
+    --argjson create_pull_request "$create_pull_request" \
+    --arg base_commit "$base_commit" \
+    --argjson writes "$writes_json" \
+    --argjson deletes "$deletes_json" \
+    --argjson blockers "$blockers_json" \
+    --argjson special_cases "$special_cases_json" \
+    '{
+      repository: $repository,
+      fullName: $full_name,
+      state: $state,
+      defaultBranch: $default_branch,
+      githubMode: $github_mode,
+      risk: $risk,
+      centralSha: $central_sha,
+      baseCommit: $base_commit,
+      applyRequested: $apply_requested,
+      ready: $ready,
+      operations: {
+        write: $writes,
+        delete: $deletes,
+        branch: $branch,
+        createBranch: $create_branch,
+        draftPullRequest: $create_pull_request
+      },
+      recovery: {
+        existingBranchCommit: (if $existing_branch_commit == "" then null else $existing_branch_commit end),
+        existingPullRequest: (if $existing_pull_request == "" then null else $existing_pull_request end)
+      },
+      blockers: $blockers,
+      specialCases: $special_cases
+    }'
+)"
+
+if [[ "$ready" != true ]]; then
+  printf '%s\n' "$plan_json"
+  exit 1
+fi
+
+if [[ "$apply" != true ]]; then
+  printf '%s\n' "$plan_json"
+  exit 0
+fi
+
+# Revalidate public central visibility and mutable refs before any external
+# write. The authorized base commit and inspected tree above own the whole
+# rollout plan.
+central_repository_recheck_json="$temp_root/central-repository-recheck.json"
+fetch_api "repos/$owner_login/opencode-fleet" "$central_repository_recheck_json" ||
+  die "central repository metadata became unavailable after planning"
+jq -e \
+  --arg owner "$owner_login" \
+  --argjson owner_id "$owner_id" \
+  --arg default_branch "$central_default_branch" '
+    .full_name == ($owner + "/opencode-fleet") and
+    .owner.login == $owner and .owner.id == $owner_id and
+    .default_branch == $default_branch and
+    .visibility == "public" and .private == false
+  ' "$central_repository_recheck_json" >/dev/null ||
+  die "central repository became non-public or changed identity after planning"
+
+default_ref_recheck_json="$temp_root/default-ref-recheck.json"
+fetch_api \
+  "repos/$repository_full_name/git/ref/heads/$encoded_default_branch" \
+  "$default_ref_recheck_json" || die "default branch ref became unavailable after planning"
+rechecked_base_commit="$(jq -r '.object.sha // empty' "$default_ref_recheck_json")"
+jq -e --arg ref "refs/heads/$manifest_default_branch" --arg sha "$base_commit" '
+  .ref == $ref and .object.type == "commit" and .object.sha == $sha
+' "$default_ref_recheck_json" >/dev/null || \
+  die "default branch advanced after planning; rerun the read-only plan"
+
+central_ref_recheck_json="$temp_root/central-default-ref-recheck.json"
+fetch_api "repos/$owner_login/opencode-fleet/git/ref/heads/$encoded_central_default" "$central_ref_recheck_json" ||
+  die "central default branch became unavailable after planning"
+jq -e --arg ref "refs/heads/$central_default_branch" '
+  .ref == $ref and .object.type == "commit" and
+  (.object.sha | type == "string" and test("^[0-9a-f]{40}$"))
+' "$central_ref_recheck_json" >/dev/null ||
+  die "central default branch recheck returned an invalid commit"
+rechecked_central_head="$(jq -r '.object.sha' "$central_ref_recheck_json")"
+central_compare_recheck_json="$temp_root/central-compare-recheck.json"
+fetch_api "repos/$owner_login/opencode-fleet/compare/$central_sha...$rechecked_central_head" "$central_compare_recheck_json" ||
+  die "central default-branch lineage became unavailable after planning"
+jq -e --arg base "$central_sha" --arg head "$rechecked_central_head" '
+  (.status == "ahead" or .status == "identical") and
+  .base_commit.sha == $base and .merge_base_commit.sha == $base and
+  .head_commit.sha == $head
+' "$central_compare_recheck_json" >/dev/null ||
+  die "supplied central commit left the authorized default-branch lineage"
+
+# All external writes begin below this line, after every readiness gate and the
+# exact-base recheck passed.
+
+new_tree="$reconciled_tree"
+new_commit="$reconciled_commit"
+if [[ -z "$reconciled_commit" ]]; then
+  tree_entries='[]'
+  while IFS= read -r relative_path; do
+    [[ -n "$relative_path" ]] || continue
+    source_path="$render_root/$relative_path"
+    [[ -f "$source_path" && ! -L "$source_path" ]] || die "rendered file is unsafe: $relative_path"
+    tree_entries="$(
+      jq \
+        --arg path "$relative_path" \
+        --rawfile content "$source_path" \
+        '. + [{path: $path, mode: "100644", type: "blob", content: $content}]' \
+        <<<"$tree_entries"
+    )"
+  done < <(jq -r '.[]' <<<"$writes_json")
+
+  while IFS= read -r relative_path; do
+    [[ -n "$relative_path" ]] || continue
+    tree_entries="$(
+      jq \
+        --arg path "$relative_path" \
+        '. + [{path: $path, mode: "100644", type: "blob", sha: null}]' \
+        <<<"$tree_entries"
+    )"
+  done < <(jq -r '.[]' <<<"$deletes_json")
+
+  tree_input="$temp_root/tree-input.json"
+  jq -n --arg base_tree "$base_tree" --argjson tree "$tree_entries" \
+    '{base_tree: $base_tree, tree: $tree}' >"$tree_input"
+  tree_response="$temp_root/tree-response.json"
+  gh api --method POST "repos/$repository_full_name/git/trees" \
+    --input "$tree_input" >"$tree_response"
+  new_tree="$(jq -r '.sha // empty' "$tree_response")"
+  [[ "$new_tree" =~ ^[0-9a-f]{40}$ ]] || die "GitHub did not return the rollout tree ID"
+  created_tree_json="$temp_root/created-tree.json"
+  fetch_api "repos/$repository_full_name/git/trees/$new_tree?recursive=1" "$created_tree_json" ||
+    die "created rollout tree could not be re-read"
+  jq -e --arg tree "$new_tree" --argjson expected "$expected_leaf_tree" '
+    .sha == $tree and .truncated == false and (.tree | type == "array") and
+    ([.tree[].path] | length == (unique | length)) and
+    ([.tree[] | select(.type != "tree") | {path, mode, type, sha}] | sort_by(.path)) ==
+      $expected
+  ' "$created_tree_json" >/dev/null ||
+    die "created rollout tree does not exactly match the authorized leaf tree"
+
+  commit_input="$temp_root/commit-input.json"
+  jq -n \
+    --arg message "chore: install pinned OpenCode fleet callers" \
+    --arg tree "$new_tree" \
+    --arg parent "$base_commit" \
+    '{message: $message, tree: $tree, parents: [$parent]}' >"$commit_input"
+  commit_response="$temp_root/commit-response.json"
+  gh api --method POST "repos/$repository_full_name/git/commits" \
+    --input "$commit_input" >"$commit_response"
+  new_commit="$(jq -r '.sha // empty' "$commit_response")"
+  [[ "$new_commit" =~ ^[0-9a-f]{40}$ ]] || die "GitHub did not return the rollout commit ID"
+  created_commit_json="$temp_root/created-commit.json"
+  fetch_api "repos/$repository_full_name/git/commits/$new_commit" "$created_commit_json" ||
+    die "created rollout commit could not be re-read"
+  jq -e \
+    --arg commit "$new_commit" \
+    --arg parent "$base_commit" \
+    --arg tree "$new_tree" '
+      .sha == $commit and .tree.sha == $tree and
+      (.parents | type == "array" and length == 1) and
+      .parents[0].sha == $parent
+    ' "$created_commit_json" >/dev/null ||
+    die "created rollout commit does not exactly match the authorized tree and parent"
+
+fi
+
+if [[ "$create_branch" == true ]]; then
+  ref_input="$temp_root/ref-input.json"
+  jq -n --arg ref "refs/heads/$rollout_branch" --arg sha "$new_commit" \
+    '{ref: $ref, sha: $sha}' >"$ref_input"
+  ref_response="$temp_root/ref-response.json"
+  set +e
+  gh api --method POST "repos/$repository_full_name/git/refs" --input "$ref_input" >"$ref_response"
+  ref_post_status="$?"
+  set -e
+fi
+
+if [[ "$rollout_ref_present" == true || "$create_branch" == true ]]; then
+  persisted_ref_json="$temp_root/persisted-rollout-ref.json"
+  if ! fetch_api "repos/$repository_full_name/git/ref/heads/$encoded_rollout_branch" "$persisted_ref_json" ||
+     ! jq -e \
+       --arg ref "refs/heads/$rollout_branch" \
+       --arg sha "$new_commit" '
+         .ref == $ref and .object.type == "commit" and .object.sha == $sha
+       ' "$persisted_ref_json" >/dev/null; then
+    printf 'github-rollout: rollout branch %s could not be verified at exact commit %s after publication (ref POST status %s); preserve external state and rerun the exact preflight\n' "$rollout_branch" "$new_commit" "${ref_post_status:-not-attempted}" >&2
+    exit 1
+  fi
+fi
+
+persisted_commit_json="$temp_root/persisted-rollout-commit.json"
+persisted_tree_json="$temp_root/persisted-rollout-tree.json"
+fetch_api "repos/$repository_full_name/git/commits/$new_commit" "$persisted_commit_json" ||
+  die "persisted rollout commit is unavailable"
+jq -e \
+  --arg commit "$new_commit" \
+  --arg parent "$base_commit" \
+  --arg tree "$new_tree" '
+    .sha == $commit and .tree.sha == $tree and
+    (.parents | type == "array" and length == 1) and .parents[0].sha == $parent
+  ' "$persisted_commit_json" >/dev/null ||
+  die "persisted rollout commit changed from the authorized commit"
+fetch_api "repos/$repository_full_name/git/trees/$new_tree?recursive=1" "$persisted_tree_json" ||
+  die "persisted rollout tree is unavailable"
+jq -e --arg tree "$new_tree" --argjson expected "$expected_leaf_tree" '
+  .sha == $tree and .truncated == false and
+  ([.tree[] | select(.type != "tree") | {path, mode, type, sha}] | sort_by(.path)) ==
+    $expected
+' "$persisted_tree_json" >/dev/null ||
+  die "persisted rollout tree changed from the authorized leaf tree"
+
+if [[ -n "$existing_pull_request" ]]; then
+  [[ "$existing_pull_number" =~ ^[1-9][0-9]*$ ]] ||
+    die "existing rollout pull request number is invalid"
+  persisted_existing_pull="$temp_root/persisted-existing-pull.json"
+  fetch_api "repos/$repository_full_name/pulls/$existing_pull_number" "$persisted_existing_pull" ||
+    die "existing rollout pull request became unavailable"
+  jq -e --arg repository "$repository_full_name" --arg branch "$rollout_branch" --arg base "$manifest_default_branch" --arg base_sha "$base_commit" --arg sha "$new_commit" --arg body "$rollout_body" --arg title "$rollout_title" --arg url "$existing_pull_request" --argjson number "$existing_pull_number" --argjson draft "$existing_pull_draft" '
+    .number == $number and .state == "open" and
+    .draft == $draft and .html_url == $url and
+    .head.repo.full_name == $repository and .base.repo.full_name == $repository and
+    .head.ref == $branch and .base.ref == $base and
+    .head.sha == $sha and .base.sha == $base_sha and
+    .title == $title and .body == $body
+  ' "$persisted_existing_pull" >/dev/null ||
+    die "existing rollout pull request changed after planning"
+  jq \
+    --arg commit "$new_commit" \
+    --arg pull_request "$existing_pull_request" \
+    '. + {applied: true, idempotent: true, commit: $commit, pullRequest: $pull_request}' \
+    <<<"$plan_json"
+  exit 0
+fi
+
+pr_input="$temp_root/pr-input.json"
+jq -n \
+  --arg title "$rollout_title" \
+  --arg head "$rollout_branch" \
+  --arg base "$manifest_default_branch" \
+  --arg body "$rollout_body" \
+  '{title: $title, head: $head, base: $base, body: $body, draft: true}' >"$pr_input"
+pr_response="$temp_root/pr-response.json"
+if ! gh api --method POST "repos/$repository_full_name/pulls" --input "$pr_input" >"$pr_response"; then
+  printf 'github-rollout: rollout branch %s exists at %s but draft PR publication may have failed; preserve the branch and rerun this command so its exact branch/PR preflight can reconcile the outcome (docs/FLEET-ROLLOUT.md)\n' "$rollout_branch" "$new_commit" >&2
+  exit 1
+fi
+jq -e --arg repository "$repository_full_name" --arg branch "$rollout_branch" --arg base "$manifest_default_branch" --arg base_sha "$base_commit" --arg sha "$new_commit" --arg body "$rollout_body" --arg title "$rollout_title" '
+  .state == "open" and .draft == true and
+  .head.repo.full_name == $repository and .base.repo.full_name == $repository and
+  .head.ref == $branch and .base.ref == $base and
+  .head.sha == $sha and .base.sha == $base_sha and
+  .title == $title and .body == $body and
+  (.number | type == "number" and . >= 1 and floor == .) and
+  .html_url == ("https://github.com/" + $repository + "/pull/" + (.number | tostring))
+' "$pr_response" >/dev/null || {
+  printf 'github-rollout: rollout branch %s exists at %s but draft PR publication returned an ambiguous response; preserve the branch and rerun the exact preflight\n' "$rollout_branch" "$new_commit" >&2
+  exit 1
+}
+pr_url="$(jq -r '.html_url // empty' "$pr_response")"
+pr_number="$(jq -r '.number // empty' "$pr_response")"
+[[ "$pr_number" =~ ^[1-9][0-9]*$ ]] ||
+  die "created rollout pull request number is invalid"
+
+post_pr_ref_json="$temp_root/post-pr-rollout-ref.json"
+fetch_api "repos/$repository_full_name/git/ref/heads/$encoded_rollout_branch" "$post_pr_ref_json" ||
+  die "rollout branch became unavailable after pull request publication"
+jq -e --arg ref "refs/heads/$rollout_branch" --arg sha "$new_commit" '
+  .ref == $ref and .object.type == "commit" and .object.sha == $sha
+' "$post_pr_ref_json" >/dev/null ||
+  die "rollout branch moved during pull request publication"
+
+persisted_pr_json="$temp_root/persisted-rollout-pr.json"
+fetch_api "repos/$repository_full_name/pulls/$pr_number" "$persisted_pr_json" ||
+  die "created rollout pull request could not be re-read"
+jq -e --arg repository "$repository_full_name" --arg branch "$rollout_branch" --arg base "$manifest_default_branch" --arg base_sha "$base_commit" --arg sha "$new_commit" --arg body "$rollout_body" --arg title "$rollout_title" --arg url "$pr_url" --argjson number "$pr_number" '
+  .number == $number and .state == "open" and .draft == true and .html_url == $url and
+  .head.repo.full_name == $repository and .base.repo.full_name == $repository and
+  .head.ref == $branch and .base.ref == $base and
+  .head.sha == $sha and .base.sha == $base_sha and
+  .title == $title and .body == $body
+' "$persisted_pr_json" >/dev/null ||
+  die "created rollout pull request did not persist with the authorized commit and metadata"
+
+jq \
+  --arg commit "$new_commit" \
+  --arg pull_request "$pr_url" \
+  '. + {applied: true, idempotent: false, commit: $commit, pullRequest: $pull_request}' \
+  <<<"$plan_json"

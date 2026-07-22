@@ -1,0 +1,514 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+source_config="${OPENCODE_FLEET_CONFIG:-$fleet_root/config/opencode.jsonc}"
+source_guard="${OPENCODE_FLEET_GUARD:-$fleet_root/config/runtime-guard.json}"
+source_routes="${OPENCODE_FLEET_ROUTES:-$fleet_root/config/model-routes.json}"
+target_home="${OPENCODE_FLEET_HOME:-$HOME}"
+apply=false
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  install-local [--apply]
+
+The default is a side-effect-free installation preview. --apply backs up every
+existing target, atomically installs the staged config and canonical oc symlink,
+hardens OpenCode-owned state, and writes a mode-600 install record.
+USAGE
+}
+
+die() {
+  printf 'install-local: %s\n' "$*" >&2
+  exit 1
+}
+
+validate_path_chain() {
+  local base="$1"
+  local path="$2"
+  local label="$3"
+  local relative current component
+  local -a components
+
+  [[ "$base" == /* && -d "$base" && ! -L "$base" &&
+     "$(realpath -e -- "$base")" == "$base" ]] ||
+    die "$label containment root is not a canonical directory"
+  [[ "$path" == "$base" || "$path" == "$base/"* ]] ||
+    die "$label escapes its containment root"
+  [[ "$(realpath -m -- "$path")" == "$path" ]] ||
+    die "$label contains an existing symlink or is non-canonical"
+  [[ "$path" != "$base" ]] || return 0
+  relative="${path#"$base"/}"
+  current="$base"
+  IFS='/' read -r -a components <<<"$relative"
+  for component in "${components[@]}"; do
+    [[ -n "$component" && "$component" != "." && "$component" != ".." ]] ||
+      die "$label contains an unsafe path component"
+    current="$current/$component"
+    if [[ -e "$current" || -L "$current" ]]; then
+      [[ -d "$current" && ! -L "$current" &&
+         "$(realpath -e -- "$current")" == "$current" ]] ||
+        die "$label traverses a non-directory or symlink"
+    fi
+  done
+}
+
+validate_target_parent() {
+  local base="$1"
+  local target="$2"
+  local label="$3"
+
+  validate_path_chain "$base" "$(dirname -- "$target")" "$label parent"
+}
+
+restore_transaction_target() {
+  local target="$1"
+  local backup="$2"
+  local recovery_name="$3"
+  local recovery_target="$backup_root/$recovery_name.failed-current"
+  local restore_temporary
+
+  if [[ -e "$target" || -L "$target" ]]; then
+    [[ ! -e "$recovery_target" && ! -L "$recovery_target" ]] || return 1
+    mv -- "$target" "$recovery_target" || return 1
+  fi
+  if [[ -n "$backup" ]]; then
+    restore_temporary="${target}.reconcile.$timestamp"
+    [[ ! -e "$restore_temporary" && ! -L "$restore_temporary" ]] || return 1
+    cp -a -- "$backup" "$restore_temporary" || return 1
+    mv -fT -- "$restore_temporary" "$target" || return 1
+  fi
+}
+
+reconcile_install_failure() {
+  local original_status="$1"
+  local reconciliation_failed=false
+  local failed_record="$backup_root/install.json.failed-transaction"
+  local record_restore_temporary
+
+  [[ "${transaction_active:-false}" == true ]] || return 0
+  set +e
+  restore_transaction_target "$target_config" "$config_backup" config ||
+    reconciliation_failed=true
+  restore_transaction_target "$target_launcher" "$launcher_backup" launcher ||
+    reconciliation_failed=true
+  if [[ -e "$install_record" || -L "$install_record" ]]; then
+    if [[ ! -e "$failed_record" && ! -L "$failed_record" ]]; then
+      mv -- "$install_record" "$failed_record" || reconciliation_failed=true
+    else
+      reconciliation_failed=true
+    fi
+  fi
+  if [[ -n "$record_backup" ]]; then
+    record_restore_temporary="${install_record}.reconcile.$timestamp"
+    cp -a -- "$record_backup" "$record_restore_temporary" &&
+      mv -fT -- "$record_restore_temporary" "$install_record" ||
+      reconciliation_failed=true
+  fi
+  sync -f "$backup_root" >/dev/null 2>&1 || reconciliation_failed=true
+  transaction_active=false
+  if [[ "$reconciliation_failed" == true ]]; then
+    printf 'install-local: install failed with status %s and automatic reconciliation was incomplete; preserve and inspect %s\n' "$original_status" "$backup_root" >&2
+  else
+    printf 'install-local: install failed with status %s; previous targets were restored and failed state was preserved under %s\n' "$original_status" "$backup_root" >&2
+  fi
+}
+
+case "${1:-}" in
+  "")
+    ;;
+  --apply)
+    apply=true
+    shift
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    die "unknown argument: $1"
+    ;;
+esac
+(($# == 0)) || die "unexpected argument: $1"
+
+for command_name in jq realpath install mktemp sha256sum stat cp mv ln chmod sed cut date readlink dirname id sync flock; do
+  command -v "$command_name" >/dev/null 2>&1 ||
+    die "required command is missing: $command_name"
+done
+[[ "$(id -u)" -ne 0 ]] || die "refusing to install OpenCode as root"
+
+[[ -d "$target_home" && ! -L "$target_home" &&
+   "$(realpath -e "$target_home")" == "$target_home" ]] ||
+  die "target home must be an existing canonical directory"
+[[ -f "$source_config" && ! -L "$source_config" &&
+   -f "$source_guard" && ! -L "$source_guard" &&
+   -f "$source_routes" && ! -L "$source_routes" ]] ||
+  die "staged policy files are not readable"
+[[ -f "$fleet_root/scripts/oc" && -x "$fleet_root/scripts/oc" &&
+   ! -L "$fleet_root/scripts/oc" ]] ||
+  die "canonical launcher source is not an executable regular file"
+
+config_json="$(sed '/^[[:space:]]*\/\//d' "$source_config")"
+jq -e '
+  (keys | sort) ==
+    ["$schema", "agent", "autoupdate", "default_agent", "enabled_providers",
+     "instructions", "mcp", "model", "permission", "plugin", "provider",
+     "share", "skills", "small_model", "snapshot"] and
+  .model == "ollama/qwen3-coder:30b" and
+  .small_model == "ollama/gpt-oss:20b" and
+  .enabled_providers == ["ollama"] and
+  (.provider | keys) == ["ollama"] and
+  (.provider.ollama | keys | sort) == ["models", "name", "npm", "options"] and
+  .provider.ollama.npm == "@ai-sdk/openai-compatible" and
+  .provider.ollama.name == "Ollama (mickey loopback)" and
+  .provider.ollama.options == {baseURL: "http://127.0.0.1:11434/v1"} and
+  (.provider.ollama.models | type) == "object" and
+  (.provider.ollama.models | has("gpt-oss:20b")) and
+  (.provider.ollama.models | has("qwen3-coder:30b")) and
+  (.provider.ollama.models | has("qwen3-coder-next:q8_0")) and
+  .share == "disabled" and
+  .autoupdate == false and
+  .default_agent == "fleet-plan" and
+  .plugin == [] and .mcp == {} and .instructions == [] and
+  .skills == {paths: [], urls: []} and
+  (.permission | keys | sort) ==
+    ["*", "bash", "edit", "external_directory", "glob", "grep", "lsp",
+     "read", "skill", "task", "webfetch", "websearch"] and
+  .permission["*"] == "ask" and
+  .permission.glob == "allow" and .permission.grep == "deny" and
+  .permission.lsp == "deny" and .permission.edit == "ask" and
+  .permission.external_directory == "deny" and
+  .permission.webfetch == "deny" and
+  .permission.websearch == "deny" and
+  .permission.task == "deny" and
+  .permission.skill == "deny" and
+  (.permission.read | to_entries | .[0] == {key: "*", value: "allow"}) and
+  all(.permission.read | to_entries[1:][]; .value == "deny") and
+  (.permission.bash | to_entries | .[0] == {key: "*", value: "ask"}) and
+  all(.permission.bash | to_entries[1:][]; .value == "deny") and
+  (.permission.bash | to_entries | .[-1] ==
+    {key: "*git*push*", value: "deny"}) and
+  (.agent | keys | sort) == ["fleet-build", "fleet-plan", "fleet-review"] and
+  (.agent["fleet-plan"].permission | keys | sort) ==
+    ["bash", "edit", "external_directory", "skill", "task", "webfetch",
+     "websearch"] and
+  .agent["fleet-plan"].permission.bash == "deny" and
+  .agent["fleet-plan"].permission.external_directory == "deny" and
+  .agent["fleet-plan"].permission.webfetch == "deny" and
+  .agent["fleet-plan"].permission.websearch == "deny" and
+  .agent["fleet-plan"].permission.task == "deny" and
+  .agent["fleet-plan"].permission.skill == "deny" and
+  .agent["fleet-plan"].tools == {skill: false} and
+  (.agent["fleet-review"].permission | keys | sort) ==
+    ["bash", "edit", "external_directory", "skill", "task", "webfetch",
+     "websearch"] and
+  .agent["fleet-review"].permission.edit == "deny" and
+  .agent["fleet-review"].permission.external_directory == "deny" and
+  .agent["fleet-review"].permission.webfetch == "deny" and
+  .agent["fleet-review"].permission.websearch == "deny" and
+  .agent["fleet-review"].permission.task == "deny" and
+  .agent["fleet-review"].permission.skill == "deny" and
+  .agent["fleet-review"].tools == {skill: false} and
+  (.agent["fleet-review"].permission.bash | to_entries | .[0] ==
+    {key: "*", value: "ask"}) and
+  all(.agent["fleet-review"].permission.bash | to_entries[1:][];
+    .value == "deny") and
+  (.agent["fleet-review"].permission.bash | to_entries | .[-1] ==
+    {key: "*git*push*", value: "deny"}) and
+  (.agent["fleet-build"].permission | keys | sort) ==
+    ["bash", "edit", "external_directory", "skill", "task", "webfetch",
+     "websearch"] and
+  .agent["fleet-build"].permission.edit == "allow" and
+  .agent["fleet-build"].permission.external_directory == "deny" and
+  .agent["fleet-build"].permission.webfetch == "deny" and
+  .agent["fleet-build"].permission.websearch == "deny" and
+  .agent["fleet-build"].permission.task == "deny" and
+  .agent["fleet-build"].permission.skill == "deny" and
+  .agent["fleet-build"].tools == {skill: false} and
+  (.agent["fleet-build"].permission.bash | to_entries | .[0] ==
+    {key: "*", value: "ask"}) and
+  all(.agent["fleet-build"].permission.bash | to_entries[1:][];
+    if .key == "git commit*" then .value == "ask" else .value == "deny" end) and
+  (.agent["fleet-build"].permission.bash | to_entries | .[-1] ==
+    {key: "*git*push*", value: "deny"})
+' <<<"$config_json" >/dev/null ||
+  die "staged OpenCode config failed install policy"
+jq -e '
+  (keys | sort) ==
+    ["agent", "autoupdate", "enabled_providers", "instructions", "mcp",
+     "permission", "plugin", "share", "skills"] and
+  .share == "disabled" and
+  .autoupdate == false and
+  .enabled_providers == ["ollama"] and
+  .plugin == [] and .mcp == {} and .instructions == [] and
+  .skills == {paths: [], urls: []} and
+  (.permission | keys | sort) ==
+    ["*", "bash", "external_directory", "grep", "lsp", "read", "skill",
+     "task", "webfetch", "websearch"] and
+  .permission["*"] == "ask" and
+  .permission.external_directory == "deny" and
+  .permission.webfetch == "deny" and
+  .permission.websearch == "deny" and
+  .permission.task == "deny" and
+  .permission.skill == "deny" and
+  .permission.grep == "deny" and .permission.lsp == "deny" and
+  (.permission.read | to_entries | .[0] == {key: "*", value: "allow"}) and
+  all(.permission.read | to_entries[1:][]; .value == "deny") and
+  (.permission.bash | to_entries | .[0] == {key: "*", value: "ask"}) and
+  all(.permission.bash | to_entries[1:][]; .value == "deny") and
+  (.permission.bash | to_entries | .[-1] ==
+    {key: "*git*push*", value: "deny"}) and
+  (.agent | keys | sort) == ["fleet-build", "fleet-plan", "fleet-review"] and
+  (.agent["fleet-plan"].permission | keys | sort) ==
+    ["bash", "edit", "external_directory", "skill", "task", "webfetch",
+     "websearch"] and
+  .agent["fleet-plan"].permission.bash == "deny" and
+  all(.agent["fleet-plan"].permission | to_entries[]; .value == "deny") and
+  .agent["fleet-plan"].tools == {skill: false} and
+  (.agent["fleet-review"].permission | keys | sort) ==
+    ["bash", "edit", "external_directory", "skill", "task", "webfetch",
+     "websearch"] and
+  .agent["fleet-review"].permission.external_directory == "deny" and
+  .agent["fleet-review"].permission.edit == "deny" and
+  .agent["fleet-review"].permission.webfetch == "deny" and
+  .agent["fleet-review"].permission.websearch == "deny" and
+  .agent["fleet-review"].permission.task == "deny" and
+  .agent["fleet-review"].permission.skill == "deny" and
+  .agent["fleet-review"].tools == {skill: false} and
+  (.agent["fleet-review"].permission.bash | to_entries | .[0] ==
+    {key: "*", value: "ask"}) and
+  all(.agent["fleet-review"].permission.bash | to_entries[1:][];
+    .value == "deny") and
+  (.agent["fleet-review"].permission.bash | to_entries | .[-1] ==
+    {key: "*git*push*", value: "deny"}) and
+  (.agent["fleet-build"].permission | keys | sort) ==
+    ["bash", "edit", "external_directory", "skill", "task", "webfetch",
+     "websearch"] and
+  .agent["fleet-build"].permission.external_directory == "deny" and
+  .agent["fleet-build"].permission.edit == "allow" and
+  .agent["fleet-build"].permission.webfetch == "deny" and
+  .agent["fleet-build"].permission.websearch == "deny" and
+  .agent["fleet-build"].permission.task == "deny" and
+  .agent["fleet-build"].permission.skill == "deny" and
+  .agent["fleet-build"].tools == {skill: false} and
+  (.agent["fleet-build"].permission.bash | to_entries | .[0] ==
+    {key: "*", value: "ask"}) and
+  all(.agent["fleet-build"].permission.bash | to_entries[1:][];
+    if .key == "git commit*" then .value == "ask" else .value == "deny" end) and
+  (.agent["fleet-build"].permission.bash | to_entries | .[-1] ==
+    {key: "*git*push*", value: "deny"})
+' "$source_guard" >/dev/null ||
+  die "runtime guard failed install policy"
+jq -e '
+  .schemaVersion == 1 and
+  .routes == {
+    plan: {agent: "fleet-plan", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
+    build: {agent: "fleet-build", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
+    review: {agent: "fleet-review", model: "ollama/qwen3-coder:30b", costClass: "local-mid"}
+  } and
+  .ceiling == {
+    model: "ollama/qwen3-coder-next:q8_0",
+    costClass: "local-ceiling"
+  } and
+  (.cloud.enabled | type == "boolean") and
+  (.cloud.allowlist | type == "array") and
+  all(.cloud.allowlist[];
+    type == "string" and
+    test("^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$") and
+    (startswith("ollama/") | not)
+  ) and
+  (.cloud.allowlist | length == (unique | length))
+' "$source_routes" >/dev/null ||
+  die "model routes failed install policy"
+
+config_dir="$target_home/.config/opencode"
+target_config="$config_dir/opencode.jsonc"
+launcher_dir="$target_home/.local/bin"
+target_launcher="$launcher_dir/oc"
+state_root="${OPENCODE_FLEET_STATE_ROOT:-$target_home/.local/state/opencode-fleet}"
+[[ "$state_root" == "$target_home/"* ]] ||
+  die "state root must remain inside the selected home"
+install_record="$state_root/install.json"
+timestamp="$(date -u +%Y%m%dT%H%M%SZ)-$BASHPID"
+backup_root="$state_root/install-backups/$timestamp"
+
+for target in "$target_config" "$target_launcher" "$install_record"; do
+  [[ ! -d "$target" ]] || die "installation target is unexpectedly a directory"
+done
+validate_target_parent "$target_home" "$target_config" "config target"
+validate_target_parent "$target_home" "$target_launcher" "launcher target"
+validate_target_parent "$target_home" "$install_record" "install record"
+validate_path_chain "$target_home" "$backup_root" "backup root"
+for private_root in \
+  "$target_home/.config/opencode" \
+  "$target_home/.local/share/opencode" \
+  "$target_home/.local/state/opencode" \
+  "$target_home/.cache/opencode" \
+  "$state_root"; do
+  validate_target_parent "$target_home" "$private_root" "OpenCode private root"
+  if [[ -e "$private_root" || -L "$private_root" ]]; then
+    validate_path_chain "$target_home" "$private_root" "OpenCode private root"
+  fi
+done
+
+jq -n \
+  --arg config "$target_config" \
+  --arg launcher "$target_launcher" \
+  --arg stateRoot "$state_root" \
+  --arg backupRoot "$backup_root" \
+  --argjson configExists "$([[ -e "$target_config" || -L "$target_config" ]] && printf true || printf false)" \
+  --argjson launcherExists "$([[ -e "$target_launcher" || -L "$target_launcher" ]] && printf true || printf false)" \
+  '{
+    action: "install-local",
+    applyRequired: true,
+    targets: {config: $config, launcher: $launcher, stateRoot: $stateRoot},
+    backupRoot: $backupRoot,
+    existing: {config: $configExists, launcher: $launcherExists}
+  }'
+[[ "$apply" == true ]] || exit 0
+
+[[ "$state_root" == /* && "$(realpath -m "$state_root")" == "$state_root" ]] ||
+  die "state root must be an absolute canonical path"
+install -d -m 700 "$state_root"
+validate_path_chain "$target_home" "$state_root" "fleet state root"
+chmod 700 "$state_root"
+lock_path="$state_root/session.lock"
+[[ ! -L "$lock_path" ]] || die "global session lock must not be a symlink"
+exec 9>"$lock_path"
+chmod 600 "$lock_path"
+flock -n 9 || die "another OpenCode fleet session owns the local lane"
+
+for target in "$target_config" "$target_launcher" "$install_record"; do
+  [[ ! -d "$target" ]] || die "installation target became a directory"
+done
+install -d -m 700 "$config_dir" "$launcher_dir" \
+  "$state_root/install-backups" "$backup_root"
+validate_target_parent "$target_home" "$target_config" "config target"
+validate_target_parent "$target_home" "$target_launcher" "launcher target"
+validate_target_parent "$target_home" "$install_record" "install record"
+validate_path_chain "$target_home" "$backup_root" "backup root"
+chmod 700 "$config_dir" "$state_root" "$state_root/install-backups" "$backup_root"
+
+config_backup=""
+launcher_backup=""
+record_backup=""
+if [[ -e "$target_config" || -L "$target_config" ]]; then
+  config_backup="$backup_root/opencode.jsonc.previous"
+  cp -a -- "$target_config" "$config_backup"
+fi
+if [[ -e "$target_launcher" || -L "$target_launcher" ]]; then
+  launcher_backup="$backup_root/oc.previous"
+  cp -a -- "$target_launcher" "$launcher_backup"
+fi
+if [[ -e "$install_record" || -L "$install_record" ]]; then
+  record_backup="$backup_root/install.json.previous"
+  cp -a -- "$install_record" "$record_backup"
+fi
+chmod -R go-rwx "$backup_root"
+
+config_temporary="$(mktemp "$config_dir/.opencode.jsonc.XXXXXX")"
+cp -- "$source_config" "$config_temporary"
+chmod 600 "$config_temporary"
+source_config_hash="$(sha256sum "$source_config" | cut -d' ' -f1)"
+temporary_config_hash="$(sha256sum "$config_temporary" | cut -d' ' -f1)"
+[[ "$source_config_hash" == "$temporary_config_hash" ]] ||
+  die "staged config copy hash mismatch"
+
+launcher_temporary="$launcher_dir/.oc.$timestamp"
+[[ ! -e "$launcher_temporary" && ! -L "$launcher_temporary" ]] ||
+  die "temporary launcher path already exists"
+ln -s "$fleet_root/scripts/oc" "$launcher_temporary"
+
+prepared_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+record_temporary="$(mktemp "$state_root/.install.XXXXXX")"
+jq -n \
+  --arg preparedAt "$prepared_at" \
+  --arg transactionId "$timestamp" \
+  --arg fleetRoot "$fleet_root" \
+  --arg sourceConfig "$source_config" \
+  --arg configPath "$target_config" \
+  --arg configBackup "$config_backup" \
+  --arg configSha256 "$temporary_config_hash" \
+  --arg launcherPath "$target_launcher" \
+  --arg launcherTarget "$fleet_root/scripts/oc" \
+  --arg launcherBackup "$launcher_backup" \
+  --arg previousRecordBackup "$record_backup" \
+  --arg backupRoot "$backup_root" \
+  '{
+    schemaVersion: 1,
+    status: "prepared",
+    transactionId: $transactionId,
+    preparedAt: $preparedAt,
+    fleetRoot: $fleetRoot,
+    backupRoot: $backupRoot,
+    config: {
+      source: $sourceConfig,
+      path: $configPath,
+      backup: $configBackup,
+      sha256: $configSha256,
+      installedType: "regular",
+      mode: "600"
+    },
+    launcher: {
+      path: $launcherPath,
+      target: $launcherTarget,
+      backup: $launcherBackup,
+      installedType: "symlink"
+    },
+    previousInstallRecordBackup: $previousRecordBackup
+  }' >"$record_temporary"
+chmod 600 "$record_temporary"
+transaction_active=true
+trap 'status=$?; reconcile_install_failure "$status"; exit "$status"' EXIT
+mv -fT -- "$record_temporary" "$install_record"
+chmod 600 "$install_record"
+sync -f "$install_record" "$state_root"
+
+if [[ "${OPENCODE_FLEET_TESTING:-0}" == 1 &&
+      "${OPENCODE_FLEET_TEST_FAIL_AFTER_RECORD:-0}" == 1 ]]; then
+  die "injected failure after durable install record"
+fi
+
+mv -fT -- "$config_temporary" "$target_config"
+chmod 600 "$target_config"
+if [[ "${OPENCODE_FLEET_TESTING:-0}" == 1 &&
+      "${OPENCODE_FLEET_TEST_FAIL_AFTER_FIRST_TARGET:-0}" == 1 ]]; then
+  die "injected failure after first target replacement"
+fi
+mv -fT -- "$launcher_temporary" "$target_launcher"
+
+private_roots=(
+  "$target_home/.config/opencode"
+  "$target_home/.local/share/opencode"
+  "$target_home/.local/state/opencode"
+  "$target_home/.cache/opencode"
+  "$state_root"
+)
+for private_root in "${private_roots[@]}"; do
+  if [[ -e "$private_root" ]]; then
+    validate_path_chain "$target_home" "$private_root" "OpenCode private root"
+    chmod -R go-rwx "$private_root"
+    chmod 700 "$private_root"
+  fi
+done
+
+[[ -f "$target_config" && ! -L "$target_config" &&
+   "$(stat -c %a "$target_config")" == "600" ]] ||
+  die "installed config failed final mode/type validation"
+[[ -L "$target_launcher" &&
+   "$(readlink -f "$target_launcher")" == "$fleet_root/scripts/oc" ]] ||
+  die "installed launcher failed final target validation"
+completed_record="$(mktemp "$state_root/.install-complete.XXXXXX")"
+jq --arg completedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '.status = "installed" | .completedAt = $completedAt' \
+  "$install_record" >"$completed_record"
+chmod 600 "$completed_record"
+mv -fT -- "$completed_record" "$install_record"
+sync -f "$install_record" "$state_root"
+transaction_active=false
+trap - EXIT
+printf 'installed local OpenCode lane; record: %s\n' "$install_record"

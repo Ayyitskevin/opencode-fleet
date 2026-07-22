@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+manifest="${OPENCODE_FLEET_MANIFEST:-$fleet_root/config/repos.json}"
+target_home="${OPENCODE_FLEET_HOME:-$HOME}"
+state_root="${OPENCODE_FLEET_STATE_ROOT:-$target_home/.local/state/opencode-fleet}"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  sync-clones <repository> [--source <independent-local-clone>] [--apply]
+
+The default is a side-effect-free one-repository dry run. --apply is required
+to create the dedicated clone. Without --source, apply uses the catalogued
+credential-free GitHub SSH URL.
+USAGE
+}
+
+die() {
+  printf 'sync-clones: %s\n' "$*" >&2
+  exit 1
+}
+
+validate_path_chain() {
+  local base="$1"
+  local path="$2"
+  local label="$3"
+  local relative current component
+  local -a components
+
+  [[ "$base" == /* && -d "$base" && ! -L "$base" &&
+     "$(realpath -e -- "$base")" == "$base" ]] ||
+    die "$label containment root is not a canonical directory"
+  [[ "$path" == "$base" || "$path" == "$base/"* ]] ||
+    die "$label escapes its containment root"
+  [[ "$(realpath -m -- "$path")" == "$path" ]] ||
+    die "$label contains an existing symlink or is non-canonical"
+  [[ "$path" != "$base" ]] || return 0
+  relative="${path#"$base"/}"
+  current="$base"
+  IFS='/' read -r -a components <<<"$relative"
+  for component in "${components[@]}"; do
+    [[ -n "$component" && "$component" != "." && "$component" != ".." ]] ||
+      die "$label contains an unsafe path component"
+    current="$current/$component"
+    if [[ -e "$current" || -L "$current" ]]; then
+      [[ -d "$current" && ! -L "$current" &&
+         "$(realpath -e -- "$current")" == "$current" ]] ||
+        die "$label traverses a non-directory or symlink"
+    fi
+  done
+}
+
+normalize_github_remote() {
+  local remote="$1"
+  local slug
+
+  case "$remote" in
+    git@github.com:*) slug="${remote#git@github.com:}" ;;
+    ssh://git@github.com/*) slug="${remote#ssh://git@github.com/}" ;;
+    https://github.com/*) slug="${remote#https://github.com/}" ;;
+    *) return 1 ;;
+  esac
+  [[ "$slug" != *'?'* && "$slug" != *'#'* && "$slug" != *'@'* ]] || return 1
+  slug="${slug%.git}"
+  [[ "$slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    return 1
+  printf '%s\n' "$slug"
+}
+
+validate_clone() {
+  local path="$1"
+  local expected="$2"
+  local top common normalized remote
+  local -a origins push_urls
+
+  [[ -d "$path" && ! -L "$path" && -d "$path/.git" && ! -L "$path/.git" ]] ||
+    return 1
+  top="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  top="$(realpath -e "$top" 2>/dev/null)" || return 1
+  [[ "$top" == "$path" ]] || return 1
+  common="$(git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+    return 1
+  common="$(realpath -e "$common" 2>/dev/null)" || return 1
+  [[ "$common" == "$path/.git" ]] || return 1
+  mapfile -t origins < <(git -C "$path" config --get-all remote.origin.url || true)
+  [[ "${#origins[@]}" -eq 1 ]] || return 1
+  normalized="$(normalize_github_remote "${origins[0]}")" || return 1
+  [[ "${normalized,,}" == "${expected,,}" ]] || return 1
+  mapfile -t push_urls < <(git -C "$path" config --get-all remote.origin.pushurl || true)
+  for remote in "${push_urls[@]}"; do
+    normalized="$(normalize_github_remote "$remote")" || return 1
+    [[ "${normalized,,}" == "${expected,,}" ]] || return 1
+  done
+}
+
+for command_name in jq git realpath install flock chmod dirname; do
+  command -v "$command_name" >/dev/null 2>&1 ||
+    die "required command is missing: $command_name"
+done
+[[ "$EUID" -ne 0 ]] || die "refusing to provision OpenCode clones as root"
+[[ -d "$target_home" && ! -L "$target_home" &&
+   "$(realpath -e -- "$target_home")" == "$target_home" ]] ||
+  die "selected home must be an existing canonical directory"
+[[ "$state_root" == "$target_home/"* ]] ||
+  die "state root must remain inside the selected home"
+validate_path_chain "$target_home" "$state_root" "fleet state root"
+[[ -r "$manifest" ]] || die "repository manifest is not readable"
+jq -e '
+  .schemaVersion == 1 and
+  (.owner | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9.-]*$")) and
+  (.workspaceRoot | type == "string" and startswith("/") and
+    (test("[\\r\\n]") | not) and (contains("\u0000") | not)) and
+  (.repositories | type == "array" and length > 0) and
+  (.owner as $owner |
+    all(.repositories[];
+      (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+      .fullName == ($owner + "/" + .name) and
+      (.state == "active" or .state == "placeholder") and
+      (.defaultBranch | type == "string" and length > 0) and
+      (.risk == "upstream" or .risk == "restricted" or
+       .risk == "standard" or .risk == "placeholder") and
+      (.githubMode == "manual" or .githubMode == "review" or
+       .githubMode == "manual-build" or .githubMode == "disabled")
+    )
+  ) and
+  ([.repositories[].name | ascii_downcase] | length == (unique | length)) and
+  ([.repositories[].fullName | ascii_downcase] |
+    length == (unique | length))
+' "$manifest" >/dev/null || die "repository manifest failed strict validation"
+
+repository_query="${1:-}"
+case "$repository_query" in
+  ""|-h|--help)
+    usage
+    [[ -n "$repository_query" ]] && exit 0
+    exit 2
+    ;;
+esac
+shift
+
+apply=false
+source_clone=""
+while (($#)); do
+  case "$1" in
+    --apply)
+      apply=true
+      ;;
+    --source)
+      shift
+      [[ -n "${1:-}" ]] || die "--source requires a path"
+      source_clone="$1"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+  shift
+done
+
+matches="$(
+  jq -c --arg query "${repository_query,,}" '
+    [.repositories[] |
+      select((.name | ascii_downcase) == $query or
+             (.fullName | ascii_downcase) == $query)]
+  ' "$manifest"
+)"
+[[ "$(jq 'length' <<<"$matches")" -eq 1 ]] ||
+  die "repository must resolve to exactly one catalog entry"
+entry="$(jq -c '.[0]' <<<"$matches")"
+name="$(jq -r '.name' <<<"$entry")"
+full_name="$(jq -r '.fullName' <<<"$entry")"
+state="$(jq -r '.state' <<<"$entry")"
+[[ "$state" == "active" ]] || die "placeholder clones are not provisioned"
+
+workspace_root="${OPENCODE_FLEET_WORKSPACE_ROOT:-$(jq -r '.workspaceRoot' "$manifest")}"
+[[ "$workspace_root" == /* && "$(realpath -m "$workspace_root")" == "$workspace_root" ]] ||
+  die "workspace root must be an absolute canonical path"
+target="$workspace_root/$name"
+[[ "$(realpath -m "$target")" == "$target" ]] ||
+  die "target path must be canonical"
+
+if [[ -e "$target" ]]; then
+  if validate_clone "$target" "$full_name"; then
+    jq -n --arg repository "$name" --arg target "$target" \
+      '{repository: $repository, target: $target, action: "none", status: "valid-existing-clone"}'
+    exit 0
+  fi
+  die "target exists but is not the required independent catalogued clone"
+fi
+
+method="github-ssh"
+if [[ -n "$source_clone" ]]; then
+  [[ "$source_clone" == /* && "$(realpath -m "$source_clone")" == "$source_clone" ]] ||
+    die "local source must be an absolute canonical path"
+  validate_clone "$source_clone" "$full_name" ||
+    die "local source is not an independent clone with the catalogued identity"
+  method="local-no-hardlinks"
+fi
+
+if [[ "$apply" != true ]]; then
+  jq -n \
+    --arg repository "$name" \
+    --arg fullName "$full_name" \
+    --arg target "$target" \
+    --arg method "$method" \
+    '{
+      repository: $repository,
+      fullName: $fullName,
+      target: $target,
+      method: $method,
+      action: "clone",
+      applyRequired: true
+    }'
+  exit 0
+fi
+
+if [[ -e "$workspace_root" ]]; then
+  [[ -d "$workspace_root" && ! -L "$workspace_root" &&
+     "$(realpath -e "$workspace_root")" == "$workspace_root" ]] ||
+    die "workspace root exists but is unsafe"
+else
+  workspace_parent="$(dirname "$workspace_root")"
+  [[ -d "$workspace_parent" && ! -L "$workspace_parent" &&
+     "$(realpath -e "$workspace_parent")" == "$workspace_parent" ]] ||
+    die "workspace parent must already be a canonical directory"
+  install -d -m 700 "$workspace_root"
+fi
+chmod 700 "$workspace_root"
+
+if [[ -e "$state_root" ]]; then
+  [[ -d "$state_root" && ! -L "$state_root" &&
+     "$(realpath -e "$state_root")" == "$state_root" ]] ||
+    die "state root exists but is unsafe"
+else
+  validate_path_chain "$target_home" "$state_root" "fleet state root"
+  install -d -m 700 "$state_root"
+fi
+validate_path_chain "$target_home" "$state_root" "fleet state root"
+chmod 700 "$state_root"
+lock_path="$state_root/session.lock"
+[[ ! -L "$lock_path" ]] || die "global session lock must not be a symlink"
+exec 9>"$lock_path"
+chmod 600 "$lock_path"
+flock -n 9 || die "another OpenCode fleet operation owns the local lane"
+[[ ! -e "$target" ]] || die "target appeared while waiting for the global lock"
+
+if [[ -n "$source_clone" ]]; then
+  git clone --quiet --no-hardlinks --origin origin "$source_clone" "$target" ||
+    die "local clone failed; inspect the preserved target before retrying"
+  git -C "$target" remote set-url origin "git@github.com:$full_name.git"
+else
+  git clone --quiet --origin origin "git@github.com:$full_name.git" "$target" ||
+    die "GitHub clone failed; inspect the preserved target before retrying"
+fi
+
+validate_clone "$target" "$full_name" ||
+  die "provisioned clone failed post-clone identity validation"
+printf 'provisioned independent clone: %s\n' "$name"

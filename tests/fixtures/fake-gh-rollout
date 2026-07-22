@@ -1,0 +1,533 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+[[ "${1:-}" == api ]] || {
+  printf 'fake-gh-rollout supports only gh api\n' >&2
+  exit 2
+}
+shift
+
+method=GET
+endpoint=""
+input_file=""
+while (($#)); do
+  case "$1" in
+    --method)
+      method="$2"
+      shift 2
+      ;;
+    --input)
+      input_file="$2"
+      shift 2
+      ;;
+    --*)
+      printf 'fake-gh-rollout: unsupported option: %s\n' "$1" >&2
+      exit 2
+      ;;
+    *)
+      [[ -z "$endpoint" ]] || {
+        printf 'fake-gh-rollout: multiple endpoints\n' >&2
+        exit 2
+      }
+      endpoint="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$endpoint" ]] || {
+  printf 'fake-gh-rollout: endpoint missing\n' >&2
+  exit 2
+}
+
+if [[ -n "${FAKE_GH_LOG:-}" ]]; then
+  printf '%s\t%s\n' "$method" "$endpoint" >>"$FAKE_GH_LOG"
+fi
+
+if [[ -n "$input_file" && -n "${FAKE_GH_CAPTURE_DIR:-}" ]]; then
+  mkdir -p "$FAKE_GH_CAPTURE_DIR"
+  capture_name="${method}_${endpoint//\//_}"
+  capture_name="${capture_name//\?/_}"
+  cp "$input_file" "$FAKE_GH_CAPTURE_DIR/$capture_name.json"
+fi
+
+not_found() {
+  printf 'gh: Not Found (HTTP 404)\n' >&2
+  exit 1
+}
+
+emit_central_file() {
+  local relative_path="$1"
+  local source_root="${FAKE_GH_CENTRAL_ROOT:?FAKE_GH_CENTRAL_ROOT is required}"
+  local source="$source_root/$relative_path"
+  local blob_sha
+
+  case "$relative_path" in
+    config/repos.json|templates/callers/review.yml.tpl|templates/callers/build.yml.tpl|templates/policies/restricted.json.tpl|templates/policies/standard.json.tpl|.github/workflows/review.yml|.github/workflows/build.yml) ;;
+    *) not_found ;;
+  esac
+  [[ -f "$source" && ! -L "$source" ]] || not_found
+  blob_sha="$(git hash-object -- "$source")"
+  if [[ "${FAKE_GH_BAD_CENTRAL_BLOB:-0}" == 1 &&
+        "$relative_path" == "config/repos.json" ]]; then
+    blob_sha=0000000000000000000000000000000000000001
+  fi
+  jq -cn \
+    --arg path "$relative_path" \
+    --arg sha "$blob_sha" \
+    --arg content "$(base64 -w 0 "$source")" \
+    --argjson size "$(wc -c <"$source")" \
+    '{type: "file", path: $path, sha: $sha, size: $size, encoding: "base64", content: $content}'
+}
+
+if [[ "$method" == POST ]]; then
+  case "$endpoint" in
+    repos/Ayyitskevin/*/git/trees)
+      printf '{"sha":"3333333333333333333333333333333333333333"}\n'
+      ;;
+    repos/Ayyitskevin/*/git/commits)
+      printf '{"sha":"4444444444444444444444444444444444444444"}\n'
+      ;;
+    repos/Ayyitskevin/*/git/refs)
+      [[ "${FAKE_GH_REF_FAILURE:-0}" != 1 ]] || {
+        printf 'gh: branch creation outcome unknown (HTTP 503)\n' >&2
+        exit 1
+      }
+      jq -c '{ref: .ref, object: {sha: .sha}}' "$input_file"
+      ;;
+    repos/Ayyitskevin/*/pulls)
+      [[ "${FAKE_GH_PR_FAILURE:-0}" != 1 ]] || {
+        printf 'gh: pull request creation failed (HTTP 503)\n' >&2
+        exit 1
+      }
+      if [[ "${FAKE_GH_INVALID_PR_RESPONSE:-0}" == 1 ]]; then
+        printf '{"unexpected":true}\n'
+        exit 0
+      fi
+      repository="${endpoint#repos/Ayyitskevin/}"
+      repository="${repository%/pulls}"
+      head_sha=4444444444444444444444444444444444444444
+      [[ "${FAKE_GH_PR_HEAD_MISMATCH:-0}" != 1 ]] ||
+        head_sha=5555555555555555555555555555555555555555
+      jq -cn \
+        --arg repository "Ayyitskevin/$repository" \
+        --arg title "$(jq -r '.title' "$input_file")" \
+        --arg head "$(jq -r '.head' "$input_file")" \
+        --arg base "$(jq -r '.base' "$input_file")" \
+        --arg body "$(jq -r '.body' "$input_file")" \
+        --arg sha "$head_sha" '
+          {
+            number: 99,
+            state: "open",
+            draft: true,
+            html_url: ("https://github.com/" + $repository + "/pull/99"),
+            title: $title,
+            body: $body,
+            head: {ref: $head, sha: $sha, repo: {full_name: $repository}},
+            base: {
+              ref: $base,
+              sha: "1111111111111111111111111111111111111111",
+              repo: {full_name: $repository}
+            }
+          }
+        '
+      ;;
+    *) not_found ;;
+  esac
+  exit 0
+fi
+
+[[ "$method" == GET ]] || {
+  printf 'fake-gh-rollout: unsupported method: %s\n' "$method" >&2
+  exit 2
+}
+
+case "$endpoint" in
+  repos/Ayyitskevin/opencode-fleet)
+    central_visibility=public
+    central_private=false
+    [[ "${FAKE_GH_PRIVATE_CENTRAL:-0}" != 1 ]] || {
+      central_visibility=private
+      central_private=true
+    }
+    [[ "${FAKE_GH_CONTRADICTORY_CENTRAL_VISIBILITY:-0}" != 1 ]] ||
+      central_private=true
+    if [[ "${FAKE_GH_CENTRAL_VISIBILITY_FLIP:-0}" == 1 &&
+          -n "${FAKE_GH_LOG:-}" ]]; then
+      central_metadata_reads="$(awk -F '\t' -v endpoint="$endpoint" '
+        $1 == "GET" && $2 == endpoint {count++} END {print count + 0}
+      ' "$FAKE_GH_LOG")"
+      if ((central_metadata_reads >= 2)); then
+        central_visibility=private
+        central_private=true
+      fi
+    fi
+    central_metadata="$(jq -cn \
+      --arg visibility "$central_visibility" \
+      --argjson private "$central_private" '
+        {
+          full_name: "Ayyitskevin/opencode-fleet",
+          default_branch: "main",
+          size: 1,
+          visibility: $visibility,
+          private: $private,
+          owner: {id: 133295304, login: "Ayyitskevin"}
+        }
+      ')"
+    if [[ "${FAKE_GH_MISSING_CENTRAL_VISIBILITY:-0}" == 1 ]]; then
+      central_metadata="$(jq -c 'del(.visibility)' <<<"$central_metadata")"
+    fi
+    if [[ "${FAKE_GH_MISSING_CENTRAL_PRIVATE:-0}" == 1 ]]; then
+      central_metadata="$(jq -c 'del(.private)' <<<"$central_metadata")"
+    fi
+    printf '%s\n' "$central_metadata"
+    exit 0
+    ;;
+  repos/Ayyitskevin/opencode-fleet/git/ref/heads/main)
+    printf '{"ref":"refs/heads/main","object":{"type":"commit","sha":"7777777777777777777777777777777777777777"}}\n'
+    exit 0
+    ;;
+  repos/Ayyitskevin/opencode-fleet/git/commits/*)
+    sha="${endpoint##*/}"
+    printf '{"sha":"%s","tree":{"sha":"6666666666666666666666666666666666666666"},"parents":[]}\n' "$sha"
+    exit 0
+    ;;
+  repos/Ayyitskevin/opencode-fleet/compare/*)
+    comparison="${endpoint##*/compare/}"
+    base="${comparison%%...*}"
+    head="${comparison##*...}"
+    merge_base="$base"
+    [[ "${FAKE_GH_UNAUTHORIZED_CENTRAL_SHA:-0}" != 1 ]] ||
+      merge_base=8888888888888888888888888888888888888888
+    jq -cn --arg base "$base" --arg head "$head" --arg merge "$merge_base" '
+      {
+        status: (if $base == $head then "identical" else "ahead" end),
+        base_commit: {sha: $base},
+        merge_base_commit: {sha: $merge},
+        head_commit: {sha: $head}
+      }
+    '
+    exit 0
+    ;;
+  repos/Ayyitskevin/opencode-fleet/contents/*?ref=*)
+    relative="${endpoint#repos/Ayyitskevin/opencode-fleet/contents/}"
+    relative="${relative%%\?ref=*}"
+    emit_central_file "$relative"
+    exit 0
+    ;;
+esac
+
+if [[ "$endpoint" == repos/Ayyitskevin/*/pulls\?state=all\&head=* ]]; then
+  [[ "${FAKE_GH_PULL_LOOKUP_FAILURE:-0}" != 1 ]] || {
+    printf 'gh: pull request lookup failed (HTTP 503)\n' >&2
+    exit 1
+  }
+  repository="${endpoint#repos/Ayyitskevin/}"
+  repository="${repository%%/*}"
+  if [[ "${FAKE_GH_EXISTING_ROLLOUT_PR:-0}" == 1 ]]; then
+    state=open
+    draft=true
+    head_sha=4444444444444444444444444444444444444444
+    [[ "${FAKE_GH_EXISTING_PR_CLOSED:-0}" != 1 ]] || state=closed
+    [[ "${FAKE_GH_EXISTING_PR_READY:-0}" != 1 ]] || draft=false
+    [[ "${FAKE_GH_EXISTING_PR_HEAD_MISMATCH:-0}" != 1 ]] ||
+      head_sha=5555555555555555555555555555555555555555
+    rollout_body='Owner-only OpenCode rollout pinned to central commit 0123456789abcdef0123456789abcdef01234567. No environment or secret value is included in this change.
+
+<!-- opencode-fleet-rollout central=0123456789abcdef0123456789abcdef01234567 base=1111111111111111111111111111111111111111 -->'
+    jq -cn \
+      --arg repository "Ayyitskevin/$repository" \
+      --arg state "$state" \
+      --arg body "$rollout_body" \
+      --arg sha "$head_sha" \
+      --argjson draft "$draft" '
+        [{
+          number: 99,
+          state: $state,
+          draft: $draft,
+          title: "chore: install pinned OpenCode fleet callers",
+          head: {
+            repo: {full_name: $repository},
+            ref: "opencode-fleet/rollout-0123456789ab",
+            sha: $sha
+          },
+          base: {
+            repo: {full_name: $repository},
+            ref: "main",
+            sha: "1111111111111111111111111111111111111111"
+          },
+          body: $body,
+          html_url: ("https://github.com/" + $repository + "/pull/99")
+        }]
+      '
+  else
+    printf '[]\n'
+  fi
+  exit 0
+fi
+
+if [[ "$endpoint" == repos/Ayyitskevin/*/pulls/99 ]]; then
+  repository="${endpoint#repos/Ayyitskevin/}"
+  repository="${repository%/pulls/99}"
+  state=open
+  draft=true
+  head_sha=4444444444444444444444444444444444444444
+  [[ "${FAKE_GH_EXISTING_PR_READY:-0}" != 1 ]] || draft=false
+  [[ "${FAKE_GH_PERSISTED_PR_MISMATCH:-0}" != 1 ]] ||
+    head_sha=5555555555555555555555555555555555555555
+  rollout_body='Owner-only OpenCode rollout pinned to central commit 0123456789abcdef0123456789abcdef01234567. No environment or secret value is included in this change.
+
+<!-- opencode-fleet-rollout central=0123456789abcdef0123456789abcdef01234567 base=1111111111111111111111111111111111111111 -->'
+  jq -cn \
+    --arg repository "Ayyitskevin/$repository" \
+    --arg state "$state" \
+    --arg body "$rollout_body" \
+    --argjson draft "$draft" \
+    --arg sha "$head_sha" '
+      {
+        number: 99,
+        state: $state,
+        draft: $draft,
+        title: "chore: install pinned OpenCode fleet callers",
+        head: {
+          repo: {full_name: $repository},
+          ref: "opencode-fleet/rollout-0123456789ab",
+          sha: $sha
+        },
+        base: {
+          repo: {full_name: $repository},
+          ref: "main",
+          sha: "1111111111111111111111111111111111111111"
+        },
+        body: $body,
+        html_url: ("https://github.com/" + $repository + "/pull/99")
+      }
+    '
+  exit 0
+fi
+
+case "$endpoint" in
+  repos/Ayyitskevin/opencode-fleet/commits/*)
+    sha="${endpoint##*/}"
+    printf '{"sha":"%s"}\n' "$sha"
+    ;;
+  repos/Ayyitskevin/opencode-fleet/contents/.github/workflows/review.yml?ref=*)
+    printf '{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n'
+    ;;
+  repos/Ayyitskevin/opencode-fleet/contents/.github/workflows/build.yml?ref=*)
+    printf '{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n'
+    ;;
+  repos/Ayyitskevin/*/environments/opencode-review/secrets)
+    if [[ "${FAKE_GH_MISSING_REVIEW_SECRET:-0}" == 1 || "$endpoint" == repos/Ayyitskevin/Vulcan/* ]]; then
+      printf '{"secrets":[]}\n'
+    else
+      printf '{"secrets":[{"name":"OPENCODE_API_KEY"}]}\n'
+    fi
+    ;;
+  repos/Ayyitskevin/*/environments/opencode-build/secrets)
+    if [[ "${FAKE_GH_MISSING_BUILD_SECRET:-0}" == 1 ]]; then
+      printf '{"secrets":[]}\n'
+    else
+      printf '{"secrets":[{"name":"OPENCODE_API_KEY"}]}\n'
+    fi
+    ;;
+  repos/Ayyitskevin/*/environments/opencode-review)
+    [[ "${FAKE_GH_MISSING_REVIEW_ENV:-0}" != 1 ]] || not_found
+    printf '{"name":"opencode-review","protection_rules":[]}\n'
+    ;;
+  repos/Ayyitskevin/*/environments/opencode-build)
+    [[ "${FAKE_GH_MISSING_BUILD_ENV:-0}" != 1 ]] || not_found
+    if [[ "${FAKE_GH_BAD_BUILD_REVIEWER:-0}" == 1 ]]; then
+      reviewer='{"id":42,"login":"someone-else"}'
+    else
+      reviewer='{"id":133295304,"login":"Ayyitskevin"}'
+    fi
+    reviewers="[{\"type\":\"User\",\"reviewer\":$reviewer}]"
+    if [[ "${FAKE_GH_EXTRA_BUILD_REVIEWER:-0}" == 1 ]]; then
+      reviewers="[{\"type\":\"User\",\"reviewer\":$reviewer},{\"type\":\"User\",\"reviewer\":{\"id\":42,\"login\":\"someone-else\"}}]"
+    fi
+    printf '{"name":"opencode-build","protection_rules":[{"type":"required_reviewers","reviewers":%s}],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}\n' "$reviewers"
+    ;;
+  repos/Ayyitskevin/*/environments/opencode-build/deployment-branch-policies)
+    repository="${endpoint#repos/Ayyitskevin/}"
+    repository="${repository%%/*}"
+    branch=main
+    [[ "$repository" != Chronos ]] || branch=feat/wheel-dashboard-mvp
+    [[ "${FAKE_GH_BAD_BUILD_BRANCH_POLICY:-0}" != 1 ]] || branch=wrong
+    printf '{"branch_policies":[{"name":"%s"}]}\n' "$branch"
+    ;;
+  repos/Ayyitskevin/*/branches/*/protection)
+    [[ "${FAKE_GH_UNPROTECTED:-0}" != 1 ]] || not_found
+    if [[ "${FAKE_GH_INADEQUATE_PROTECTION:-0}" == 1 ]]; then
+      printf '{"allow_force_pushes":{"enabled":false},"allow_deletions":{"enabled":false}}\n'
+    else
+      bypass_apps='[]'
+      if [[ "${FAKE_GH_PROTECTION_BYPASS:-0}" == 1 ]]; then
+        bypass_apps='[{"id":15368,"slug":"github-actions"}]'
+      fi
+      check_app_id=15368
+      [[ "${FAKE_GH_BAD_CHECK_APP:-0}" != 1 ]] || check_app_id=42
+      jq -cn --argjson apps "$bypass_apps" --argjson check_app_id "$check_app_id" '
+        {
+          required_status_checks: {
+            strict: true,
+            contexts: ["test"],
+            checks: [{context: "test", app_id: $check_app_id}]
+          },
+          enforce_admins: {enabled: true},
+          required_pull_request_reviews: {
+            dismiss_stale_reviews: true,
+            require_last_push_approval: true,
+            required_approving_review_count: 1,
+            bypass_pull_request_allowances: {
+              users: [],
+              teams: [],
+              apps: $apps
+            }
+          },
+          allow_force_pushes: {enabled: false},
+          allow_deletions: {enabled: false}
+        }
+      '
+    fi
+    ;;
+  repos/Ayyitskevin/*/git/trees/2222222222222222222222222222222222222222?recursive=1)
+    [[ "${FAKE_GH_TREE_FAILURE:-0}" != 1 ]] || {
+      printf 'gh: transient tree failure (HTTP 503)\n' >&2
+      exit 1
+    }
+    tree='[]'
+    if [[ "${FAKE_GH_NO_LEGACY:-0}" != 1 ]]; then
+      tree="$(jq -c '. + [{path: ".github/workflows/opencode.yml", mode: "100644", type: "blob", sha: "9999999999999999999999999999999999999999"}]' <<<"$tree")"
+    fi
+    if [[ "${FAKE_GH_STALE_BUILD:-0}" == 1 ]]; then
+      tree="$(jq -c '. + [{path: ".github/workflows/opencode-build.yml", mode: "100644", type: "blob", sha: "8888888888888888888888888888888888888888"}]' <<<"$tree")"
+    fi
+    if [[ "${FAKE_GH_CURRENT:-0}" == 1 ]]; then
+      [[ "${FAKE_GH_REVIEW_BLOB_SHA:-}" =~ ^[0-9a-f]{40}$ &&
+         "${FAKE_GH_POLICY_BLOB_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || {
+        printf 'fake-gh-rollout: current-tree blob hashes are missing\n' >&2
+        exit 2
+      }
+      tree="$(jq -c \
+        --arg review "$FAKE_GH_REVIEW_BLOB_SHA" \
+        --arg policy "$FAKE_GH_POLICY_BLOB_SHA" \
+        '. + [
+          {path: ".github/workflows/opencode-review.yml", mode: "100644", type: "blob", sha: $review},
+          {path: ".github/opencode-policy.json", mode: "100644", type: "blob", sha: $policy}
+        ]' <<<"$tree")"
+      if [[ -n "${FAKE_GH_BUILD_BLOB_SHA:-}" ]]; then
+        [[ "$FAKE_GH_BUILD_BLOB_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 2
+        tree="$(jq -c --arg build "$FAKE_GH_BUILD_BLOB_SHA" \
+          '. + [{path: ".github/workflows/opencode-build.yml", mode: "100644", type: "blob", sha: $build}]' <<<"$tree")"
+      fi
+    fi
+    jq -cn \
+      --argjson truncated "${FAKE_GH_TREE_TRUNCATED:-false}" \
+      --argjson tree "$tree" \
+      '{sha: "2222222222222222222222222222222222222222", truncated: $truncated, tree: $tree}'
+    ;;
+  repos/Ayyitskevin/*/git/trees/3333333333333333333333333333333333333333?recursive=1)
+    [[ "${FAKE_GH_REVIEW_BLOB_SHA:-}" =~ ^[0-9a-f]{40}$ &&
+       "${FAKE_GH_POLICY_BLOB_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || {
+      printf 'fake-gh-rollout: recovered-tree blob hashes are missing\n' >&2
+      exit 2
+    }
+    recovered_tree="$(jq -cn \
+      --arg review "$FAKE_GH_REVIEW_BLOB_SHA" \
+      --arg policy "$FAKE_GH_POLICY_BLOB_SHA" '
+        [
+          {path: ".github/opencode-policy.json", mode: "100644", type: "blob", sha: $policy},
+          {path: ".github/workflows/opencode-review.yml", mode: "100644", type: "blob", sha: $review}
+        ]
+      ')"
+    if [[ -n "${FAKE_GH_BUILD_BLOB_SHA:-}" ]]; then
+      [[ "$FAKE_GH_BUILD_BLOB_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 2
+      recovered_tree="$(jq -c --arg build "$FAKE_GH_BUILD_BLOB_SHA" \
+        '. + [{path: ".github/workflows/opencode-build.yml", mode: "100644", type: "blob", sha: $build}] | sort_by(.path)' \
+        <<<"$recovered_tree")"
+    fi
+    if [[ "${FAKE_GH_CREATED_TREE_MISMATCH:-0}" == 1 ]]; then
+      recovered_tree="$(jq -c \
+        'map(if .path == ".github/opencode-policy.json" then .sha = ("5" * 40) else . end)' \
+        <<<"$recovered_tree")"
+    fi
+    jq -cn --argjson tree "$recovered_tree" \
+      '{sha: "3333333333333333333333333333333333333333", truncated: false, tree: $tree}'
+    ;;
+  repos/Ayyitskevin/*/contents/.github/workflows/opencode.yml?ref=*)
+    [[ "$endpoint" != repos/Ayyitskevin/Vulcan/* ]] || not_found
+    printf '{"sha":"9999999999999999999999999999999999999999"}\n'
+    ;;
+  repos/Ayyitskevin/*/contents/.github/workflows/opencode-build.yml?ref=*)
+    not_found
+    ;;
+  repos/Ayyitskevin/*/git/matching-refs/heads/opencode-fleet%2Frollout-*)
+    [[ "${FAKE_GH_BRANCH_LOOKUP_FAILURE:-0}" != 1 ]] || {
+      printf 'gh: transient ref failure (HTTP 503)\n' >&2
+      exit 1
+    }
+    if [[ "${FAKE_GH_DELETED_ROLLOUT_BRANCH:-0}" == 1 ]]; then
+      printf '[]\n'
+    elif [[ "${FAKE_GH_EXACT_ROLLOUT_BRANCH:-0}" == 1 ]]; then
+      printf '[{"ref":"refs/heads/opencode-fleet/rollout-0123456789ab","object":{"type":"commit","sha":"4444444444444444444444444444444444444444"}}]\n'
+    elif [[ "${FAKE_GH_EXISTING_ROLLOUT_BRANCH:-0}" == 1 ]]; then
+      printf '[{"ref":"refs/heads/opencode-fleet/rollout-0123456789ab","object":{"type":"commit","sha":"5555555555555555555555555555555555555555"}}]\n'
+    else
+      printf '[]\n'
+    fi
+    ;;
+  repos/Ayyitskevin/*/git/ref/heads/opencode-fleet%2Frollout-*)
+    [[ "${FAKE_GH_DELETED_ROLLOUT_BRANCH:-0}" != 1 ]] || not_found
+    if [[ "${FAKE_GH_REF_FAILURE:-0}" == 1 ]]; then
+      not_found
+    fi
+    ref_exists=false
+    [[ "${FAKE_GH_EXACT_ROLLOUT_BRANCH:-0}" == 1 ]] && ref_exists=true
+    if [[ -n "${FAKE_GH_LOG:-}" ]] &&
+       grep -Fq $'POST\trepos/Ayyitskevin/' "$FAKE_GH_LOG" &&
+       grep -Fq '/git/refs' "$FAKE_GH_LOG"; then
+      ref_exists=true
+    fi
+    [[ "$ref_exists" == true ]] || not_found
+    ref_sha=4444444444444444444444444444444444444444
+    [[ "${FAKE_GH_REF_RACE:-0}" != 1 ]] ||
+      ref_sha=5555555555555555555555555555555555555555
+    printf '{"ref":"refs/heads/opencode-fleet/rollout-0123456789ab","object":{"type":"commit","sha":"%s"}}\n' "$ref_sha"
+    ;;
+  repos/Ayyitskevin/*/git/ref/heads/*)
+    ref_sha=1111111111111111111111111111111111111111
+    encoded_ref="${endpoint##*/git/ref/heads/}"
+    ref_name="${encoded_ref//%2F/\/}"
+    if [[ "${FAKE_GH_DEFAULT_ADVANCE:-0}" == 1 && -n "${FAKE_GH_LOG:-}" ]]; then
+      ref_reads="$(awk -F '\t' -v endpoint="$endpoint" \
+        '$1 == "GET" && $2 == endpoint {count++} END {print count + 0}' \
+        "$FAKE_GH_LOG")"
+      (( ref_reads <= 1 )) || ref_sha=6666666666666666666666666666666666666666
+    fi
+    printf '{"ref":"refs/heads/%s","object":{"type":"commit","sha":"%s"}}\n' \
+      "$ref_name" "$ref_sha"
+    ;;
+  repos/Ayyitskevin/*/git/commits/1111111111111111111111111111111111111111)
+    printf '{"sha":"1111111111111111111111111111111111111111","tree":{"sha":"2222222222222222222222222222222222222222"},"parents":[]}\n'
+    ;;
+  repos/Ayyitskevin/*/git/commits/4444444444444444444444444444444444444444)
+    printf '{"sha":"4444444444444444444444444444444444444444","tree":{"sha":"3333333333333333333333333333333333333333"},"parents":[{"sha":"1111111111111111111111111111111111111111"}]}\n'
+    ;;
+  repos/Ayyitskevin/*)
+    repository="${endpoint#repos/Ayyitskevin/}"
+    [[ "$repository" != */* ]] || not_found
+    default_branch=main
+    [[ "$repository" != Chronos ]] || default_branch=feat/wheel-dashboard-mvp
+    [[ "${FAKE_GH_DEFAULT_MISMATCH:-0}" != 1 ]] || default_branch=wrong
+    if [[ "${FAKE_GH_WRONG_OWNER:-0}" == 1 ]]; then
+      owner='{"id":42,"login":"someone-else"}'
+    else
+      owner='{"id":133295304,"login":"Ayyitskevin"}'
+    fi
+    printf '{"full_name":"Ayyitskevin/%s","default_branch":"%s","size":1,"owner":%s}\n' \
+      "$repository" "$default_branch" "$owner"
+    ;;
+  *) not_found ;;
+esac

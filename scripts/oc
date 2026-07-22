@@ -1,0 +1,826 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+manifest="${OPENCODE_FLEET_MANIFEST:-$fleet_root/config/repos.json}"
+config="${OPENCODE_FLEET_CONFIG:-$fleet_root/config/opencode.jsonc}"
+guard="${OPENCODE_FLEET_GUARD:-$fleet_root/config/runtime-guard.json}"
+routes="${OPENCODE_FLEET_ROUTES:-$fleet_root/config/model-routes.json}"
+versions="${OPENCODE_FLEET_VERSIONS:-$fleet_root/config/versions.json}"
+opencode_bin="${OPENCODE_FLEET_BIN:-$HOME/.opencode/bin/opencode}"
+state_root="${OPENCODE_FLEET_STATE_ROOT:-$HOME/.local/state/opencode-fleet}"
+cli_record="${OPENCODE_FLEET_CLI_RECORD:-$state_root/cli-install.json}"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  oc list
+  oc doctor [--strict]
+  oc <repository> [plan|build|review] [--ceiling | --cloud] [--dry-run]
+
+Examples:
+  oc Icarus plan
+  oc Icarus build
+  oc Icarus review --ceiling
+  OPENCODE_FLEET_CLOUD_MODEL=provider/model oc Icarus build --cloud
+
+Local modes use the pinned cost-efficient coder. --ceiling is the only route to
+the pinned local ceiling. Cloud use requires both an enabled cloud policy and
+an exact model allowlist entry in config/model-routes.json.
+USAGE
+}
+
+die() {
+  printf 'oc: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
+}
+
+validate_manifest() {
+  jq -e '
+    .schemaVersion == 1 and
+    (.owner | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9.-]*$")) and
+    (.workspaceRoot |
+      type == "string" and startswith("/") and
+      (test("[\\r\\n]") | not) and (contains("\u0000") | not)) and
+    (.repositories | type == "array" and length > 0) and
+    (.owner as $owner |
+      all(.repositories[];
+        (.name | type == "string" and
+          test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+        .fullName == ($owner + "/" + .name) and
+        (.state == "active" or .state == "placeholder") and
+        (.defaultBranch | type == "string" and length > 0 and
+          (test("[\\r\\n]") | not)) and
+        (.risk == "upstream" or .risk == "restricted" or
+          .risk == "standard" or .risk == "placeholder") and
+        (.githubMode == "manual" or .githubMode == "review" or
+          .githubMode == "manual-build" or .githubMode == "disabled") and
+        (if .state == "placeholder"
+          then .risk == "placeholder" and .githubMode == "disabled"
+          else .risk != "placeholder" and .githubMode != "disabled"
+          end)
+      )
+    ) and
+    ([.repositories[].name | ascii_downcase] | length == (unique | length)) and
+    ([.repositories[].fullName | ascii_downcase] |
+      length == (unique | length))
+  ' "$manifest" >/dev/null || die "repository manifest failed strict validation"
+}
+
+validate_routes() {
+  jq -e '
+    .schemaVersion == 1 and
+    .routes == {
+      plan: {agent: "fleet-plan", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
+      build: {agent: "fleet-build", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
+      review: {agent: "fleet-review", model: "ollama/qwen3-coder:30b", costClass: "local-mid"}
+    } and
+    .ceiling == {
+      model: "ollama/qwen3-coder-next:q8_0",
+      costClass: "local-ceiling"
+    } and
+    (.cloud.enabled | type == "boolean") and
+    (.cloud.allowlist | type == "array") and
+    all(.cloud.allowlist[];
+      type == "string" and
+      test("^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$") and
+      (startswith("ollama/") | not)
+    ) and
+    (.cloud.allowlist | length == (unique | length))
+  ' "$routes" >/dev/null || die "model routes failed strict validation"
+}
+
+validate_runtime_guard() {
+  jq -e '
+    (keys | sort) ==
+      ["agent", "autoupdate", "enabled_providers", "instructions", "mcp",
+       "permission", "plugin", "share", "skills"] and
+    .autoupdate == false and .share == "disabled" and
+    .enabled_providers == ["ollama"] and
+    .plugin == [] and .mcp == {} and .instructions == [] and
+    .skills == {paths: [], urls: []} and
+    (.permission | keys | sort) ==
+      ["*", "bash", "external_directory", "grep", "lsp", "read", "skill",
+       "task", "webfetch", "websearch"] and
+    .permission["*"] == "ask" and
+    .permission.external_directory == "deny" and
+    .permission.webfetch == "deny" and
+    .permission.websearch == "deny" and
+    .permission.task == "deny" and
+    .permission.skill == "deny" and
+    .permission.grep == "deny" and .permission.lsp == "deny" and
+    (.permission.read | to_entries | .[0] == {key: "*", value: "allow"}) and
+    all(.permission.read | to_entries[1:][]; .value == "deny") and
+    .permission.read[".env"] == "deny" and
+    .permission.read[".env.*"] == "deny" and
+    .permission.read["**/.env"] == "deny" and
+    .permission.read["**/.env.*"] == "deny" and
+    .permission.read[".git-credentials"] == "deny" and
+    .permission.read["**/.git-credentials"] == "deny" and
+    .permission.read["*.pem"] == "deny" and
+    .permission.read["**/*.pem"] == "deny" and
+    .permission.read["*.key"] == "deny" and
+    .permission.read["**/*.key"] == "deny" and
+    (.permission.bash | to_entries | .[0] == {key: "*", value: "ask"}) and
+    all(.permission.bash | to_entries[1:][]; .value == "deny") and
+    (.permission.bash | to_entries | .[-1] ==
+      {key: "*git*push*", value: "deny"}) and
+    .permission.bash["bash *"] == "deny" and
+    .permission.bash["*/bash *"] == "deny" and
+    .permission.bash["env *"] == "deny" and
+    .permission.bash["*/env *"] == "deny" and
+    .permission.bash["gh *"] == "deny" and
+    .permission.bash["*/gh *"] == "deny" and
+    (.agent | keys | sort) == ["fleet-build", "fleet-plan", "fleet-review"] and
+    (.agent["fleet-plan"] | keys | sort) == ["mode", "permission", "tools"] and
+    .agent["fleet-plan"].mode == "primary" and
+    (.agent["fleet-plan"].permission | keys | sort) ==
+      ["bash", "edit", "external_directory", "skill", "task", "webfetch",
+       "websearch"] and
+    all(.agent["fleet-plan"].permission | to_entries[]; .value == "deny") and
+    .agent["fleet-plan"].permission.edit == "deny" and
+    .agent["fleet-plan"].permission.bash == "deny" and
+    .agent["fleet-plan"].permission.skill == "deny" and
+    .agent["fleet-plan"].tools == {skill: false} and
+    (.agent["fleet-review"] | keys | sort) == ["mode", "permission", "tools"] and
+    .agent["fleet-review"].mode == "primary" and
+    (.agent["fleet-review"].permission | keys | sort) ==
+      ["bash", "edit", "external_directory", "skill", "task", "webfetch",
+       "websearch"] and
+    .agent["fleet-review"].permission.external_directory == "deny" and
+    .agent["fleet-review"].permission.webfetch == "deny" and
+    .agent["fleet-review"].permission.websearch == "deny" and
+    .agent["fleet-review"].permission.task == "deny" and
+    .agent["fleet-review"].permission.edit == "deny" and
+    .agent["fleet-review"].permission.skill == "deny" and
+    .agent["fleet-review"].tools == {skill: false} and
+    (.agent["fleet-review"].permission.bash | to_entries | .[0] ==
+      {key: "*", value: "ask"}) and
+    all(.agent["fleet-review"].permission.bash | to_entries[1:][];
+      .value == "deny") and
+    (.agent["fleet-review"].permission.bash | to_entries | .[-1] ==
+      {key: "*git*push*", value: "deny"}) and
+    (.agent["fleet-build"] | keys | sort) == ["mode", "permission", "tools"] and
+    .agent["fleet-build"].mode == "primary" and
+    (.agent["fleet-build"].permission | keys | sort) ==
+      ["bash", "edit", "external_directory", "skill", "task", "webfetch",
+       "websearch"] and
+    .agent["fleet-build"].permission.external_directory == "deny" and
+    .agent["fleet-build"].permission.webfetch == "deny" and
+    .agent["fleet-build"].permission.websearch == "deny" and
+    .agent["fleet-build"].permission.task == "deny" and
+    .agent["fleet-build"].permission.edit == "allow" and
+    .agent["fleet-build"].permission.skill == "deny" and
+    .agent["fleet-build"].tools == {skill: false} and
+    (.agent["fleet-build"].permission.bash | to_entries | .[0] ==
+      {key: "*", value: "ask"}) and
+    all(.agent["fleet-build"].permission.bash | to_entries[1:][];
+      if .key == "git commit*" then .value == "ask" else .value == "deny" end) and
+    (.agent["fleet-build"].permission.bash | to_entries | .[-1] ==
+      {key: "*git*push*", value: "deny"})
+  ' "$guard" >/dev/null || die "runtime guard failed strict semantic validation"
+}
+
+validate_staged_config() {
+  local config_json
+
+  config_json="$(sed '/^[[:space:]]*\/\//d' "$config")"
+  jq -e '
+    (keys | sort) ==
+      ["$schema", "agent", "autoupdate", "default_agent", "enabled_providers",
+       "instructions", "mcp", "model", "permission", "plugin", "provider",
+       "share", "skills", "small_model", "snapshot"] and
+    .model == "ollama/qwen3-coder:30b" and
+    .small_model == "ollama/gpt-oss:20b" and
+    .enabled_providers == ["ollama"] and
+    .default_agent == "fleet-plan" and
+    (.provider | keys) == ["ollama"] and
+    (.provider.ollama | keys | sort) == ["models", "name", "npm", "options"] and
+    .provider.ollama.npm == "@ai-sdk/openai-compatible" and
+    .provider.ollama.name == "Ollama (mickey loopback)" and
+    .provider.ollama.options == {baseURL: "http://127.0.0.1:11434/v1"} and
+    (.provider.ollama.models | type) == "object" and
+    (.provider.ollama.models | has("gpt-oss:20b")) and
+    (.provider.ollama.models | has("qwen3-coder:30b")) and
+    (.provider.ollama.models | has("qwen3-coder-next:q8_0")) and
+    .autoupdate == false and .share == "disabled" and
+    .plugin == [] and .mcp == {} and .instructions == [] and
+    .skills == {paths: [], urls: []} and
+    (.permission | keys | sort) ==
+      ["*", "bash", "edit", "external_directory", "glob", "grep", "lsp",
+       "read", "skill", "task", "webfetch", "websearch"] and
+    .permission["*"] == "ask" and
+    .permission.glob == "allow" and .permission.grep == "deny" and
+    .permission.lsp == "deny" and .permission.edit == "ask" and
+    .permission.external_directory == "deny" and
+    .permission.webfetch == "deny" and
+    .permission.websearch == "deny" and
+    .permission.task == "deny" and .permission.skill == "deny" and
+    (.permission.read | to_entries | .[0] == {key: "*", value: "allow"}) and
+    all(.permission.read | to_entries[1:][]; .value == "deny") and
+    (.permission.bash | to_entries | .[0] ==
+      {key: "*", value: "ask"}) and
+    all(.permission.bash | to_entries[1:][]; .value == "deny") and
+    (.permission.bash | to_entries | .[-1] ==
+      {key: "*git*push*", value: "deny"}) and
+    (.agent | keys | sort) == ["fleet-build", "fleet-plan", "fleet-review"] and
+    (.agent["fleet-plan"] | keys | sort) ==
+      ["description", "mode", "permission", "tools"] and
+    (.agent["fleet-plan"].permission | keys | sort) ==
+      ["bash", "edit", "external_directory", "skill", "task", "webfetch",
+       "websearch"] and
+    .agent["fleet-plan"].permission.bash == "deny" and
+    .agent["fleet-plan"].permission.external_directory == "deny" and
+    .agent["fleet-plan"].permission.webfetch == "deny" and
+    .agent["fleet-plan"].permission.websearch == "deny" and
+    .agent["fleet-plan"].permission.task == "deny" and
+    .agent["fleet-plan"].permission.skill == "deny" and
+    .agent["fleet-plan"].tools == {skill: false} and
+    (.agent["fleet-review"] | keys | sort) ==
+      ["description", "mode", "permission", "tools"] and
+    (.agent["fleet-review"].permission | keys | sort) ==
+      ["bash", "edit", "external_directory", "skill", "task", "webfetch",
+       "websearch"] and
+    .agent["fleet-review"].permission.edit == "deny" and
+    .agent["fleet-review"].permission.external_directory == "deny" and
+    .agent["fleet-review"].permission.webfetch == "deny" and
+    .agent["fleet-review"].permission.websearch == "deny" and
+    .agent["fleet-review"].permission.task == "deny" and
+    .agent["fleet-review"].permission.skill == "deny" and
+    .agent["fleet-review"].tools == {skill: false} and
+    (.agent["fleet-review"].permission.bash | to_entries | .[0] ==
+      {key: "*", value: "ask"}) and
+    all(.agent["fleet-review"].permission.bash | to_entries[1:][];
+      .value == "deny") and
+    (.agent["fleet-review"].permission.bash | to_entries | .[-1] ==
+      {key: "*git*push*", value: "deny"}) and
+    (.agent["fleet-build"] | keys | sort) ==
+      ["description", "mode", "permission", "tools"] and
+    (.agent["fleet-build"].permission | keys | sort) ==
+      ["bash", "edit", "external_directory", "skill", "task", "webfetch",
+       "websearch"] and
+    .agent["fleet-build"].permission.edit == "allow" and
+    .agent["fleet-build"].permission.external_directory == "deny" and
+    .agent["fleet-build"].permission.webfetch == "deny" and
+    .agent["fleet-build"].permission.websearch == "deny" and
+    .agent["fleet-build"].permission.task == "deny" and
+    .agent["fleet-build"].permission.skill == "deny" and
+    .agent["fleet-build"].tools == {skill: false} and
+    (.agent["fleet-build"].permission.bash | to_entries | .[0] ==
+      {key: "*", value: "ask"}) and
+    all(.agent["fleet-build"].permission.bash | to_entries[1:][];
+      if .key == "git commit*" then .value == "ask" else .value == "deny" end) and
+    (.agent["fleet-build"].permission.bash | to_entries | .[-1] ==
+      {key: "*git*push*", value: "deny"})
+  ' <<<"$config_json" >/dev/null || die "staged config failed strict semantic validation"
+}
+
+validate_versions() {
+  jq -e '
+    (keys == ["opencode"] or (keys | sort) == ["actionsCheckout", "opencode"]) and
+    (.opencode | keys | sort) ==
+      ["linuxX64Archive", "linuxX64Sha256", "version"] and
+    (.opencode.version | type == "string" and
+      test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+    (.opencode.linuxX64Archive | type == "string" and length > 0) and
+    (.opencode.linuxX64Sha256 | type == "string" and
+      test("^[0-9a-f]{64}$"))
+  ' "$versions" >/dev/null || die "OpenCode version pin failed strict validation"
+}
+
+validate_pinned_cli() {
+  local expected_version expected_archive_sha actual_version actual_binary_sha
+
+  expected_version="$(jq -r '.opencode.version' "$versions")"
+  expected_archive_sha="$(jq -r '.opencode.linuxX64Sha256' "$versions")"
+  [[ -f "$opencode_bin" && -x "$opencode_bin" && ! -L "$opencode_bin" ]] ||
+    die "OpenCode binary must be an executable regular file"
+  [[ "$(stat -c %u "$opencode_bin")" == "$(id -u)" ]] ||
+    die "OpenCode binary must be owned by the current user"
+  [[ -f "$cli_record" && ! -L "$cli_record" ]] ||
+    die "pinned OpenCode CLI install record is missing or unsafe"
+  jq -e \
+    --arg version "$expected_version" \
+    --arg archiveSha256 "$expected_archive_sha" \
+    --arg target "$opencode_bin" '
+      .schemaVersion == 1 and
+      (.status // "installed") == "installed" and
+      .version == $version and
+      .archiveSha256 == $archiveSha256 and
+      .target == $target and
+      (.binarySha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+      .installedType == "regular" and .mode == "700"
+    ' "$cli_record" >/dev/null || die "pinned OpenCode CLI install record is invalid"
+  actual_binary_sha="$(sha256sum "$opencode_bin" | cut -d' ' -f1)"
+  [[ "$actual_binary_sha" == "$(jq -r '.binarySha256' "$cli_record")" ]] ||
+    die "OpenCode binary digest does not match its verified install record"
+  actual_version="$("$opencode_bin" --version 2>/dev/null || true)"
+  [[ "$actual_version" == "$expected_version" ]] ||
+    die "OpenCode binary version does not match the pin"
+}
+
+normalize_github_remote() {
+  local remote="$1"
+  local slug
+
+  case "$remote" in
+    git@github.com:*)
+      slug="${remote#git@github.com:}"
+      ;;
+    ssh://git@github.com/*)
+      slug="${remote#ssh://git@github.com/}"
+      ;;
+    https://github.com/*)
+      slug="${remote#https://github.com/}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  [[ "$slug" != *'?'* && "$slug" != *'#'* && "$slug" != *'@'* ]] || return 1
+  slug="${slug%.git}"
+  [[ "$slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    return 1
+  printf '%s\n' "$slug"
+}
+
+validate_workspace_root() {
+  local root="$1"
+  local canonical
+
+  [[ "$root" == /* && -d "$root" && ! -L "$root" ]] ||
+    die "dedicated workspace root is missing or unsafe"
+  canonical="$(realpath -e -- "$root")" ||
+    die "dedicated workspace root cannot be resolved"
+  [[ "$canonical" == "$root" ]] ||
+    die "dedicated workspace root must be canonical and contain no symlink"
+}
+
+validate_independent_clone() {
+  local path="$1"
+  local expected="$2"
+  local top_level common_dir remote normalized
+  local -a origins push_urls
+
+  [[ -d "$path" && ! -L "$path" ]] ||
+    die "catalogued clone is missing or is a symlink"
+  [[ -d "$path/.git" && ! -L "$path/.git" ]] ||
+    die "catalogued clone must be an independent clone, not a linked worktree or submodule"
+
+  top_level="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)" ||
+    die "catalogued path is not a Git working tree"
+  top_level="$(realpath -e -- "$top_level")" ||
+    die "catalogued clone top level cannot be resolved"
+  [[ "$top_level" == "$path" ]] ||
+    die "catalogued path is not the clone top level"
+
+  common_dir="$(git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+    die "catalogued clone Git directory cannot be resolved"
+  common_dir="$(realpath -e -- "$common_dir")" ||
+    die "catalogued clone Git directory cannot be resolved"
+  [[ "$common_dir" == "$path/.git" ]] ||
+    die "catalogued clone shares Git state with another working tree"
+
+  mapfile -t origins < <(git -C "$path" config --get-all remote.origin.url || true)
+  [[ "${#origins[@]}" -eq 1 ]] ||
+    die "catalogued clone must have exactly one origin URL"
+  remote="${origins[0]}"
+  normalized="$(normalize_github_remote "$remote")" ||
+    die "origin URL must be a credential-free GitHub SSH or HTTPS URL"
+  [[ "${normalized,,}" == "${expected,,}" ]] ||
+    die "origin identity does not match the repository catalog"
+
+  mapfile -t push_urls < <(git -C "$path" config --get-all remote.origin.pushurl || true)
+  for remote in "${push_urls[@]}"; do
+    normalized="$(normalize_github_remote "$remote")" ||
+      die "origin push URL must be a credential-free GitHub SSH or HTTPS URL"
+    [[ "${normalized,,}" == "${expected,,}" ]] ||
+      die "origin push identity does not match the repository catalog"
+  done
+}
+
+ensure_private_directory() {
+  local path="$1"
+  local canonical
+
+  [[ "$path" == /* ]] || die "state root must be absolute"
+  [[ "$(realpath -m -- "$path")" == "$path" ]] ||
+    die "state path contains an existing symlink or is non-canonical"
+  if [[ -e "$path" ]]; then
+    [[ -d "$path" && ! -L "$path" ]] || die "state root is not a private directory"
+  else
+    install -d -m 700 -- "$path"
+  fi
+  chmod 700 -- "$path"
+  canonical="$(realpath -e -- "$path")" || die "state root cannot be resolved"
+  [[ "$canonical" == "$path" ]] || die "state root must be canonical and contain no symlink"
+}
+
+write_run_record() {
+  local status="$1"
+  local exit_code="${2:-}"
+  local ended_at="${3:-}"
+  local temporary
+
+  temporary="$(mktemp "$run_dir/.record.XXXXXX")"
+  if [[ -n "$exit_code" ]]; then
+    jq \
+      --arg status "$status" \
+      --argjson exitCode "$exit_code" \
+      --arg endedAt "$ended_at" \
+      '.status = $status | .exitCode = $exitCode | .endedAt = $endedAt' \
+      "$record_path" >"$temporary"
+  else
+    jq --arg status "$status" '.status = $status' "$record_path" >"$temporary"
+  fi
+  chmod 600 "$temporary"
+  mv -f -- "$temporary" "$record_path"
+}
+
+for dependency in jq git realpath flock install mktemp stat chmod mv date id \
+  sha256sum cut sed env; do
+  require_command "$dependency"
+done
+[[ "$(id -u)" -ne 0 ]] || die "refusing to run OpenCode as root"
+[[ -r "$manifest" ]] || die "repository manifest is not readable"
+[[ -r "$config" ]] || die "staged OpenCode config is not readable"
+[[ -r "$guard" ]] || die "runtime guard is not readable"
+[[ -r "$routes" ]] || die "model route policy is not readable"
+[[ -r "$versions" ]] || die "OpenCode version pin is not readable"
+validate_manifest
+validate_routes
+validate_runtime_guard
+validate_staged_config
+validate_versions
+
+command_name="${1:-}"
+case "$command_name" in
+  ""|-h|--help|help)
+    usage
+    exit 0
+    ;;
+  list)
+    jq -r '.repositories[] | [.name, .state, .risk, .githubMode] | @tsv' "$manifest"
+    exit 0
+    ;;
+  doctor)
+    shift
+    exec "$fleet_root/scripts/doctor" "$@"
+    ;;
+esac
+
+repository_query="$command_name"
+shift
+mode="plan"
+if [[ "${1:-}" =~ ^(plan|build|review)$ ]]; then
+  mode="$1"
+  shift
+fi
+
+use_ceiling=false
+use_cloud=false
+dry_run=false
+while (($#)); do
+  case "$1" in
+    --ceiling)
+      use_ceiling=true
+      ;;
+    --cloud)
+      use_cloud=true
+      ;;
+    --dry-run)
+      dry_run=true
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+  shift
+done
+
+[[ "$use_ceiling" != true || "$use_cloud" != true ]] ||
+  die "--ceiling and --cloud are mutually exclusive"
+
+matches="$(
+  jq -c --arg query "${repository_query,,}" '
+    [.repositories[] |
+      select((.name | ascii_downcase) == $query or
+             (.fullName | ascii_downcase) == $query)]
+  ' "$manifest"
+)"
+match_count="$(jq 'length' <<<"$matches")"
+if [[ "$match_count" -eq 0 ]]; then
+  die "repository is not catalogued"
+elif [[ "$match_count" -ne 1 ]]; then
+  die "repository query is ambiguous"
+fi
+
+entry="$(jq -c '.[0]' <<<"$matches")"
+repository_name="$(jq -r '.name' <<<"$entry")"
+repository_full_name="$(jq -r '.fullName' <<<"$entry")"
+repository_state="$(jq -r '.state' <<<"$entry")"
+repository_risk="$(jq -r '.risk' <<<"$entry")"
+default_branch="$(jq -r '.defaultBranch' <<<"$entry")"
+[[ "$repository_state" == "active" ]] ||
+  die "repository is a registered placeholder and has no clone"
+git check-ref-format "refs/heads/$default_branch" >/dev/null 2>&1 ||
+  die "catalogued default branch is not a valid Git branch"
+
+workspace_root="${OPENCODE_FLEET_WORKSPACE_ROOT:-$(jq -r '.workspaceRoot' "$manifest")}"
+validate_workspace_root "$workspace_root"
+repository_path="$workspace_root/$repository_name"
+[[ "$(realpath -m -- "$repository_path")" == "$repository_path" ]] ||
+  die "catalogued clone path is not canonical"
+validate_independent_clone "$repository_path" "$repository_full_name"
+
+agent="$(jq -r --arg mode "$mode" '.routes[$mode].agent' "$routes")"
+model="$(jq -r --arg mode "$mode" '.routes[$mode].model' "$routes")"
+cost_class="$(jq -r --arg mode "$mode" '.routes[$mode].costClass' "$routes")"
+if [[ "$use_ceiling" == true ]]; then
+  model="$(jq -r '.ceiling.model' "$routes")"
+  cost_class="$(jq -r '.ceiling.costClass' "$routes")"
+elif [[ "$use_cloud" == true ]]; then
+  [[ "$(jq -r '.cloud.enabled' "$routes")" == "true" ]] ||
+    die "cloud routing is disabled by policy"
+  model="${OPENCODE_FLEET_CLOUD_MODEL:-}"
+  [[ -n "$model" && "$model" != ollama/* ]] ||
+    die "--cloud requires a non-Ollama OPENCODE_FLEET_CLOUD_MODEL"
+  jq -e --arg model "$model" '.cloud.allowlist | index($model) != null' \
+    "$routes" >/dev/null ||
+    die "requested cloud model is not explicitly allowlisted"
+  cost_class="paid-cloud"
+fi
+
+dirty=false
+[[ -z "$(git -C "$repository_path" status --porcelain=v1 --untracked-files=all)" ]] ||
+  dirty=true
+current_branch="$(git -C "$repository_path" symbolic-ref --quiet --short HEAD || true)"
+base_commit="$(git -C "$repository_path" rev-parse --verify HEAD 2>/dev/null)" ||
+  die "catalogued clone has no valid HEAD"
+
+if [[ "$mode" == "build" ]]; then
+  [[ "$dirty" == false ]] ||
+    die "build requires a clean dedicated clone"
+  [[ "$current_branch" == "$default_branch" ]] ||
+    die "build requires the catalogued default branch"
+fi
+
+if [[ "$dry_run" == true ]]; then
+  jq -n \
+    --arg repository "$repository_name" \
+    --arg fullName "$repository_full_name" \
+    --arg path "$repository_path" \
+    --arg mode "$mode" \
+    --arg agent "$agent" \
+    --arg model "$model" \
+    --arg costClass "$cost_class" \
+    --arg risk "$repository_risk" \
+    --arg currentBranch "$current_branch" \
+    --arg defaultBranch "$default_branch" \
+    --arg baseCommit "$base_commit" \
+    --argjson dirty "$dirty" \
+    '{
+      repository: $repository,
+      fullName: $fullName,
+      sourcePath: $path,
+      executionPath: (if $mode == "build" then "private-run-worktree" else $path end),
+      mode: $mode,
+      agent: $agent,
+      model: $model,
+      costClass: $costClass,
+      risk: $risk,
+      currentBranch: $currentBranch,
+      defaultBranch: $defaultBranch,
+      baseCommit: $baseCommit,
+      dirty: $dirty
+    }'
+  exit 0
+fi
+
+if [[ "${OPENCODE_FLEET_TESTING:-0}" != "1" ]]; then
+  [[ -z "${OPENCODE_FLEET_BIN:-}" && -z "${OPENCODE_FLEET_CLI_RECORD:-}" &&
+     -z "${OPENCODE_FLEET_VERSIONS:-}" ]] ||
+    die "CLI binary, record, and version overrides are test-only"
+fi
+validate_pinned_cli
+
+ensure_private_directory "$state_root"
+ensure_private_directory "$state_root/runs"
+ensure_private_directory "$state_root/worktrees"
+lock_path="$state_root/session.lock"
+[[ ! -L "$lock_path" ]] || die "global session lock must not be a symlink"
+exec 9>"$lock_path"
+chmod 600 "$lock_path"
+flock -n 9 || die "another OpenCode fleet session owns the local lane"
+
+run_id="${OPENCODE_FLEET_RUN_ID:-}"
+if [[ -n "$run_id" && "${OPENCODE_FLEET_TESTING:-0}" != "1" ]]; then
+  die "fixed run IDs are allowed only in test mode"
+fi
+if [[ -z "$run_id" ]]; then
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)-$BASHPID-$RANDOM"
+fi
+[[ "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+  die "run ID contains unsafe characters"
+
+run_dir="$state_root/runs/$run_id"
+record_path="$run_dir/record.json"
+[[ ! -e "$run_dir" && ! -L "$run_dir" ]] || die "run ID already exists"
+install -d -m 700 "$run_dir"
+
+execution_path="$repository_path"
+worktree_path=""
+run_branch=""
+if [[ "$mode" == "build" ]]; then
+  worktree_parent="$state_root/worktrees/${repository_name,,}"
+  ensure_private_directory "$worktree_parent"
+  worktree_path="$worktree_parent/$run_id"
+  [[ ! -e "$worktree_path" && ! -L "$worktree_path" ]] ||
+    die "private run worktree already exists"
+  run_branch="opencode/build/$run_id"
+  git check-ref-format "refs/heads/$run_branch" >/dev/null 2>&1 ||
+    die "generated run branch is invalid"
+  execution_path="$worktree_path"
+fi
+
+created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+jq -n \
+  --arg runId "$run_id" \
+  --arg repository "$repository_name" \
+  --arg fullName "$repository_full_name" \
+  --arg mode "$mode" \
+  --arg agent "$agent" \
+  --arg model "$model" \
+  --arg costClass "$cost_class" \
+  --arg sourcePath "$repository_path" \
+  --arg executionPath "$execution_path" \
+  --arg worktreePath "$worktree_path" \
+  --arg baseCommit "$base_commit" \
+  --arg baseBranch "$current_branch" \
+  --arg runBranch "$run_branch" \
+  --arg createdAt "$created_at" \
+  '{
+    schemaVersion: 1,
+    runId: $runId,
+    repository: $repository,
+    fullName: $fullName,
+    mode: $mode,
+    agent: $agent,
+    model: $model,
+    costClass: $costClass,
+    sourcePath: $sourcePath,
+    executionPath: $executionPath,
+    worktreePath: $worktreePath,
+    baseCommit: $baseCommit,
+    baseBranch: $baseBranch,
+    runBranch: $runBranch,
+    createdAt: $createdAt,
+    status: "provisioning"
+  }' >"$record_path"
+chmod 600 "$record_path"
+
+if [[ "$mode" == "build" ]]; then
+  if ! git -C "$repository_path" worktree add --quiet \
+    -b "$run_branch" "$worktree_path" "$base_commit"; then
+    write_run_record "provision-failed"
+    die "private run worktree provisioning failed"
+  fi
+fi
+write_run_record "active"
+
+runtime_home="$run_dir/runtime-home"
+runtime_config_dir="$runtime_home/.config/opencode"
+install -d -m 700 "$runtime_home" "$runtime_home/.config" \
+  "$runtime_home/.cache" "$runtime_home/.local/share" \
+  "$runtime_home/.local/state" "$runtime_config_dir"
+provider_env_sanitizers=()
+if [[ "$use_cloud" == true ]]; then
+  cloud_provider="${model%%/*}"
+  [[ "$cloud_provider" =~ ^[A-Za-z0-9._-]+$ ]] ||
+    die "allowlisted cloud model has an invalid provider identifier"
+  guard_content="$(jq -c --arg provider "$cloud_provider" \
+    '.enabled_providers = [$provider]' "$guard")"
+else
+  guard_content="$(jq -c '.enabled_providers = ["ollama"]' "$guard")"
+  provider_env_sanitizers=(
+    -u AI21_API_KEY
+    -u ANTHROPIC_API_KEY
+    -u AWS_ACCESS_KEY_ID
+    -u AWS_CONFIG_FILE
+    -u AWS_CONTAINER_CREDENTIALS_FULL_URI
+    -u AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
+    -u AWS_DEFAULT_PROFILE
+    -u AWS_PROFILE
+    -u AWS_SECRET_ACCESS_KEY
+    -u AWS_SESSION_TOKEN
+    -u AWS_SHARED_CREDENTIALS_FILE
+    -u AWS_WEB_IDENTITY_TOKEN_FILE
+    -u AZURE_API_KEY
+    -u AZURE_CLIENT_ID
+    -u AZURE_CLIENT_SECRET
+    -u AZURE_OPENAI_API_KEY
+    -u AZURE_OPENAI_ENDPOINT
+    -u AZURE_TENANT_ID
+    -u BEDROCK_API_KEY
+    -u CEREBRAS_API_KEY
+    -u COHERE_API_KEY
+    -u DATABRICKS_TOKEN
+    -u DEEPSEEK_API_KEY
+    -u FIREWORKS_API_KEY
+    -u GEMINI_API_KEY
+    -u GOOGLE_API_KEY
+    -u GOOGLE_APPLICATION_CREDENTIALS
+    -u GOOGLE_GENERATIVE_AI_API_KEY
+    -u GROQ_API_KEY
+    -u HF_TOKEN
+    -u HUGGINGFACE_API_KEY
+    -u MISTRAL_API_KEY
+    -u OPENAI_API_KEY
+    -u OPENAI_BASE_URL
+    -u OPENAI_ORG_ID
+    -u OPENAI_PROJECT
+    -u OPENCODE_API_KEY
+    -u OPENROUTER_API_KEY
+    -u PERPLEXITY_API_KEY
+    -u REPLICATE_API_TOKEN
+    -u TOGETHER_API_KEY
+    -u XAI_API_KEY
+  )
+fi
+
+printf 'run:        %s\n' "$run_id"
+printf 'repository: %s (%s)\n' "$repository_name" "$repository_risk"
+printf 'mode:       %s\n' "$mode"
+printf 'model:      %s\n' "$model"
+printf 'cost:       %s\n' "$cost_class"
+printf 'source:     %s\n' "$repository_path"
+printf 'execution:  %s\n' "$execution_path"
+printf 'record:     %s\n' "$record_path"
+
+set +e
+env \
+  "${provider_env_sanitizers[@]}" \
+  -u OPENCODE_PERMISSION \
+  -u OPENCODE_PLUGIN_META_FILE \
+  -u SSH_AUTH_SOCK \
+  -u GH_TOKEN \
+  -u GITHUB_TOKEN \
+  -u GH_ENTERPRISE_TOKEN \
+  -u GITHUB_ENTERPRISE_TOKEN \
+  -u GITLAB_TOKEN \
+  -u GITLAB_ACCESS_TOKEN \
+  HOME="$runtime_home" \
+  XDG_CONFIG_HOME="$runtime_home/.config" \
+  XDG_CACHE_HOME="$runtime_home/.cache" \
+  XDG_DATA_HOME="$runtime_home/.local/share" \
+  XDG_STATE_HOME="$runtime_home/.local/state" \
+  OPENCODE_CONFIG="$config" \
+  OPENCODE_CONFIG_DIR="$runtime_config_dir" \
+  OPENCODE_CONFIG_CONTENT="$guard_content" \
+  OPENCODE_PURE=1 \
+  OPENCODE_DISABLE_PROJECT_CONFIG=1 \
+  OPENCODE_DISABLE_EXTERNAL_SKILLS=1 \
+  OPENCODE_DISABLE_CLAUDE_CODE=1 \
+  OPENCODE_DISABLE_DEFAULT_PLUGINS=1 \
+  OPENCODE_DISABLE_AUTOUPDATE=1 \
+  OPENCODE_DISABLE_MODELS_FETCH=1 \
+  GIT_TERMINAL_PROMPT=0 \
+  GCM_INTERACTIVE=never \
+  GIT_ASKPASS=/bin/false \
+  SSH_ASKPASS=/bin/false \
+  GIT_SSH=/bin/false \
+  GIT_SSH_COMMAND=/bin/false \
+  GIT_CONFIG_NOSYSTEM=1 \
+  GIT_CONFIG_GLOBAL=/dev/null \
+  GIT_CONFIG_COUNT=4 \
+  GIT_CONFIG_KEY_0=credential.helper \
+  GIT_CONFIG_VALUE_0= \
+  GIT_CONFIG_KEY_1=credential.interactive \
+  GIT_CONFIG_VALUE_1=never \
+  GIT_CONFIG_KEY_2=core.askPass \
+  GIT_CONFIG_VALUE_2=/bin/false \
+  GIT_CONFIG_KEY_3=remote.origin.pushurl \
+  GIT_CONFIG_VALUE_3=disabled://opencode-fleet-local \
+  "$opencode_bin" --pure "$execution_path" --agent "$agent" --model "$model"
+exit_code=$?
+set -e
+
+ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [[ "$exit_code" -eq 0 ]]; then
+  write_run_record "completed" "$exit_code" "$ended_at"
+else
+  write_run_record "failed" "$exit_code" "$ended_at"
+fi
+exit "$exit_code"

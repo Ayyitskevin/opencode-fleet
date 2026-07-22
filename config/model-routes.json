@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "routes": {
+    "plan": {
+      "agent": "fleet-plan",
+      "model": "ollama/qwen3-coder:30b",
+      "costClass": "local-mid"
+    },
+    "build": {
+      "agent": "fleet-build",
+      "model": "ollama/qwen3-coder:30b",
+      "costClass": "local-mid"
+    },
+    "review": {
+      "agent": "fleet-review",
+      "model": "ollama/qwen3-coder:30b",
+      "costClass": "local-mid"
+    }
+  },
+  "ceiling": {
+    "model": "ollama/qwen3-coder-next:q8_0",
+    "costClass": "local-ceiling"
+  },
+  "cloud": {
+    "enabled": false,
+    "allowlist": []
+  }
+}
