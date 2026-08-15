@@ -80,6 +80,13 @@ acquire_global_lock() {
   exec 9>"$lock_path"
   chmod 600 "$lock_path"
   flock -n 9 || die "another OpenCode fleet operation owns the local lane"
+  # Every caller re-proves its preconditions after this returns. The hook holds
+  # the lock open so the suite can mutate the state in between and observe that
+  # the recheck, not the preflight, is what authorizes the mutation.
+  if [[ "${OPENCODE_FLEET_TESTING:-0}" == 1 &&
+        -n "${OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK:-}" ]]; then
+    sleep "$OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK"
+  fi
 }
 
 validate_state() {
@@ -111,7 +118,7 @@ restore_install_target() {
 
 rollback_install_kind() {
   local kind="$1"
-  local record target_home_expected backup_root
+  local record target_home_expected backup_root record_sha256
   local config_path config_backup launcher_path launcher_backup
   local target backup record_backup expected_record recovery_label
 
@@ -129,6 +136,11 @@ rollback_install_kind() {
     expected_record="$state_root/cli-install.json"
   fi
   [[ -f "$record" && ! -L "$record" ]] || die "install record is missing or unsafe"
+  # Every restore parameter below is parsed from these bytes before the lock is
+  # held. The digest anchors that read: the same bytes are re-hashed under the
+  # lock, so a record replaced in between fails closed instead of silently
+  # redirecting the restore.
+  record_sha256="$(sha256sum "$record" | cut -d' ' -f1)"
 
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)-$BASHPID"
   recovery_dir="$state_root/recovery/$kind-$timestamp"
@@ -235,6 +247,10 @@ rollback_install_kind() {
       die "previous install record backup is invalid"
   fi
   acquire_global_lock
+  [[ -f "$record" && ! -L "$record" ]] ||
+    die "install record changed during preflight"
+  [[ "$(sha256sum "$record" | cut -d' ' -f1)" == "$record_sha256" ]] ||
+    die "install record changed during preflight"
   if [[ "$kind" == "install" ]]; then
     validate_backup_object "$config_backup" "$backup_root" "config"
     validate_backup_object "$launcher_backup" "$backup_root" "launcher"
@@ -369,6 +385,23 @@ rollback_run() {
   validate_path_chain "$state_root" "$recovery_dir" "run recovery"
   acquire_global_lock
   validate_path_chain "$state_root" "$worktree_path" "private run worktree"
+  # Verify-then-use: the identity, HEAD, and branch checks above ran before the
+  # lock was held, so a session, another rollback, or the operator could have
+  # committed, renamed the branch, or re-pointed the worktree in between. The
+  # restore below is destructive, so nothing is written until the same
+  # preconditions are re-proved with the lock held.
+  [[ -d "$worktree_path" && ! -L "$worktree_path" && -f "$worktree_path/.git" ]] ||
+    die "private run worktree changed during preflight"
+  common="$(git -C "$worktree_path" rev-parse --path-format=absolute --git-common-dir)"
+  common="$(realpath -e "$common")"
+  [[ "$common" == "$source_path/.git" ]] ||
+    die "private worktree Git common directory changed during preflight"
+  head="$(git -C "$worktree_path" rev-parse --verify HEAD)"
+  [[ "$head" == "$base_commit" ]] ||
+    die "rollback refuses committed changes; the worktree HEAD changed during preflight"
+  current_run_branch="$(git -C "$worktree_path" symbolic-ref --quiet --short HEAD || true)"
+  [[ "$current_run_branch" == "$run_branch" ]] ||
+    die "private worktree branch changed during preflight"
   install -d -m 700 "$state_root/recovery" "$state_root/recovery/$run_id" \
     "$recovery_dir" "$recovery_dir/untracked"
   git -C "$worktree_path" diff --binary --no-ext-diff >"$recovery_dir/unstaged.patch"
@@ -420,7 +453,8 @@ rollback_run() {
   printf 'rolled back run %s; recovery: %s\n' "$run_id" "$recovery_dir"
 }
 
-for command_name in jq git realpath flock install mktemp cp mv chmod dirname date sort id; do
+for command_name in jq git realpath flock install mktemp cp mv chmod dirname \
+  date sort id sha256sum cut; do
   command -v "$command_name" >/dev/null 2>&1 ||
     die "required command is missing: $command_name"
 done
