@@ -86,6 +86,26 @@ Run the same task across models, then compare with `oc diff` and `oc stats`.
 Trim the list to taste: the two models pinned to the daily routes are rejected
 from it, so an experiment can never quietly become the default.
 
+Every catalogued model advertises tool calling, which an agent lane requires.
+Where to start, by what each is actually built for:
+
+| Model | Reach for it when |
+| --- | --- |
+| `muse-glimmer` | agentic work — purpose-built for tool loops, recovers from failed calls, reads screenshots |
+| `qwen3.8:27b` | agentic coding with a very long context; also reads images |
+| `glm-4.7-flash` | agentic coding at speed (MoE, ~3B active) |
+| `nemotron-3.5-lightning:30b` | long-running agent execution: many fast tool calls |
+| `gemma4:26b` | a second opinion from a different family |
+| `nemotron3:33b` | documents, screenshots, and transcripts rather than code |
+| `command-r:35b` | long-context chat and retrieval; the oldest of the set |
+| `gpt-oss:120b`, `qwen3.5:122b`, `qwen3-next:80b` | when you want the largest local answer and can wait |
+| `gpt-oss:20b` | quick, cheap iterations |
+
+Models that are pulled but deliberately not catalogued cannot drive an agent
+lane at all: embeddings (`qwen3-embedding`, `bge-m3`, `nomic-embed-text`),
+safety classifiers (`gpt-oss-safeguard`, `shieldgemma`), and single-domain
+models (`translategemma`, `medgemma`).
+
 ## 9. Throwaway practice
 
 Practising should not require a catalogued GitHub repository:
