@@ -2,6 +2,13 @@
 
 set -euo pipefail
 
+# Ambient and host Git configuration must not reach the suite: insteadOf
+# rewrites, commit.gpgsign, and hooks all change observable Git behaviour.
+unset "${!GIT_CONFIG@}"
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+
 test_path="$(readlink -f "${BASH_SOURCE[0]}")"
 fleet_root="$(cd "$(dirname "$test_path")/.." && pwd)"
 manifest="$fleet_root/tests/fixtures/fleet-rollout-repos.json"
@@ -213,8 +220,92 @@ jq -e '.ready == true and .fullName == "Ayyitskevin/ExampleRestricted"' \
   <<<"$public_central_plan" >/dev/null
 grep -Fq $'GET\trepos/Ayyitskevin/opencode-fleet' "$public_central_log"
 
-# GitHub omits head_commit when the pinned commit is the exact branch head.
-# Exact equality is still an authorized lineage and must remain read-only.
+# The compare endpoint returns a commit-comparison object, which has no
+# head_commit property at all: head identity belongs to the live default-branch
+# ref read, not the comparison body. Pin the fixture's payload shape so a
+# fabricated field can never again authorize a lineage the real API would not.
+comparison_shape_keys='[
+  "ahead_by",
+  "base_commit",
+  "behind_by",
+  "commits",
+  "merge_base_commit",
+  "status",
+  "total_commits"
+]'
+ahead_comparison="$(
+  env "${common_env[@]}" gh api \
+    "repos/Ayyitskevin/opencode-fleet/compare/$central_sha...$central_head_sha"
+)"
+identical_comparison="$(
+  env "${common_env[@]}" gh api \
+    "repos/Ayyitskevin/opencode-fleet/compare/$central_head_sha...$central_head_sha"
+)"
+for pinned_comparison in "$ahead_comparison" "$identical_comparison"; do
+  if ! jq -e --argjson keys "$comparison_shape_keys" '
+         (keys | sort) == $keys and (has("head_commit") | not)
+       ' <<<"$pinned_comparison" >/dev/null; then
+    printf 'comparison fixture drifted from the real commit-comparison shape\n' >&2
+    exit 1
+  fi
+done
+jq -e --arg base "$central_sha" '
+  .status == "ahead" and .ahead_by > 0 and
+  .base_commit.sha == $base and .merge_base_commit.sha == $base
+' <<<"$ahead_comparison" >/dev/null
+jq -e --arg head "$central_head_sha" '
+  .status == "identical" and .ahead_by == 0 and
+  .base_commit.sha == $head and .merge_base_commit.sha == $head
+' <<<"$identical_comparison" >/dev/null
+
+# A true ancestor of the live central default-branch head is an authorized
+# lineage and plans read-only from exactly that comparison.
+ancestor_log="$temp_root/ancestor-lineage.log"
+ancestor_plan="$(
+  env "${common_env[@]}" \
+    FAKE_GH_LOG="$ancestor_log" \
+    FAKE_GH_CENTRAL_HEAD="$central_head_sha" \
+    "$fleet_root/scripts/github-rollout" \
+    ExampleRestricted --central-sha "$central_sha"
+)"
+jq -e --arg sha "$central_sha" '
+  .ready == true and .centralSha == $sha and
+  .fullName == "Ayyitskevin/ExampleRestricted"
+' <<<"$ancestor_plan" >/dev/null
+grep -Fq \
+  $'GET\t'"repos/Ayyitskevin/opencode-fleet/compare/$central_sha...$central_head_sha" \
+  "$ancestor_log"
+if grep -Eq '^(POST|PUT|PATCH|DELETE)' "$ancestor_log"; then
+  printf 'ancestor lineage plan attempted a GitHub write\n' >&2
+  exit 1
+fi
+
+# Anything the comparison does not prove to be an ancestor is refused before the
+# first consumer-repository read.
+for lineage_status in diverged behind; do
+  lineage_log="$temp_root/lineage-$lineage_status.log"
+  set +e
+  lineage_output="$(
+    env "${common_env[@]}" \
+      FAKE_GH_LOG="$lineage_log" \
+      FAKE_GH_CENTRAL_COMPARE_STATUS="$lineage_status" \
+      "$fleet_root/scripts/github-rollout" \
+      ExampleRestricted --central-sha "$central_sha" 2>&1
+  )"
+  lineage_result=$?
+  set -e
+  [[ "$lineage_result" -ne 0 ]]
+  grep -Fq 'authorized default-branch lineage' <<<"$lineage_output"
+  if grep -Eq $'^GET\trepos/Ayyitskevin/ExampleRestricted|^(POST|PUT|PATCH|DELETE)' \
+     "$lineage_log"; then
+    printf '%s central lineage reached consumer state or mutation\n' \
+      "$lineage_status" >&2
+    exit 1
+  fi
+done
+
+# The pinned commit being the exact live branch head is also an authorized
+# lineage, reported as an identical comparison, and must remain read-only.
 exact_head_log="$temp_root/exact-head.log"
 exact_head_plan="$(
   env "${common_env[@]}" \
@@ -294,6 +385,12 @@ if grep -Eq '^(POST|PUT|PATCH|DELETE)' "$restricted_log"; then
   exit 1
 fi
 grep -Fq $'GET\trepos/Ayyitskevin/ExampleRestricted/git/trees/2222222222222222222222222222222222222222?recursive=1' \
+  "$restricted_log"
+# Collection reads are explicitly bounded to one page so a full page can be
+# recognized as possibly truncated instead of silently trusted.
+grep -Fq $'GET\trepos/Ayyitskevin/ExampleRestricted/environments/opencode-review/secrets?per_page=100' \
+  "$restricted_log"
+grep -Fq $'GET\trepos/Ayyitskevin/ExampleRestricted/git/matching-refs/heads/opencode-fleet%2Frollout-0123456789ab?per_page=100' \
   "$restricted_log"
 if grep -Fq $'GET\trepos/Ayyitskevin/ExampleRestricted/contents/.github/workflows/opencode.yml' \
    "$restricted_log"; then
@@ -460,6 +557,8 @@ readiness_cases=(
   'ExampleRestricted|FAKE_GH_TREE_FAILURE|exact default-branch tree'
   'ExampleRestricted|FAKE_GH_TREE_TRUNCATED|exact default-branch tree'
   'ExampleRestricted|FAKE_GH_BRANCH_LOOKUP_FAILURE|rollout branch state is unavailable'
+  'ExampleRestricted|FAKE_GH_TRUNCATED_REFS|rollout branch state is unavailable'
+  'ExampleRestricted|FAKE_GH_TRUNCATED_SECRETS|missing OPENCODE_API_KEY in opencode-review'
   'ExampleRestricted|FAKE_GH_WRONG_OWNER|fixed fleet owner'
   'Chronos|FAKE_GH_DEFAULT_MISMATCH|live default branch differs'
 )
@@ -486,6 +585,25 @@ for readiness_case in "${readiness_cases[@]}"; do
     exit 1
   fi
 done
+
+# GitHub reports `size` as an asynchronously computed pack size in KB, so a
+# freshly pushed repository with real commits reports 0. Emptiness is proved by
+# the exact ref, commit, and non-truncated tree reads instead.
+zero_size_log="$temp_root/zero-size.log"
+zero_size_plan="$(
+  env "${common_env[@]}" \
+    FAKE_GH_LOG="$zero_size_log" \
+    FAKE_GH_ZERO_SIZE=1 \
+    "$fleet_root/scripts/github-rollout" \
+    ExampleRestricted --central-sha "$central_sha"
+)"
+jq -e '
+  .ready == true and
+  .baseCommit == "1111111111111111111111111111111111111111" and
+  (.operations.write | length) == 2
+' <<<"$zero_size_plan" >/dev/null
+grep -Fq $'GET\trepos/Ayyitskevin/ExampleRestricted/git/trees/2222222222222222222222222222222222222222?recursive=1' \
+  "$zero_size_log"
 
 # An exact no-op is reported as non-ready and cannot create a pointless branch
 # or pull request.
@@ -525,6 +643,31 @@ jq -e '
 ' <<<"$noop_plan" >/dev/null
 if grep -Eq '^(POST|PUT|PATCH|DELETE)' "$noop_log"; then
   printf 'no-op rollout attempted a GitHub write\n' >&2
+  exit 1
+fi
+
+# The same content under a different file mode is not the same tree entry. The
+# expected leaf tree demands mode 100644, so a 100755 copy must plan as a write
+# rather than be skipped into a tree expectation the apply could never satisfy.
+mode_drift_log="$temp_root/mode-drift.log"
+mode_drift_plan="$(
+  env "${common_env[@]}" \
+    "${generated_tree_env[@]}" \
+    FAKE_GH_LOG="$mode_drift_log" \
+    FAKE_GH_NO_LEGACY=1 \
+    FAKE_GH_CURRENT=1 \
+    FAKE_GH_EXECUTABLE_REVIEW=1 \
+    "$fleet_root/scripts/github-rollout" \
+    ExampleStandard --central-sha "$central_sha"
+)"
+jq -e '
+  .ready == true and
+  .operations.write == [".github/workflows/opencode-review.yml"] and
+  .operations.delete == [] and
+  .operations.createBranch == true
+' <<<"$mode_drift_plan" >/dev/null
+if grep -Eq '^(POST|PUT|PATCH|DELETE)' "$mode_drift_log"; then
+  printf 'mode-drift plan attempted a GitHub write\n' >&2
   exit 1
 fi
 
@@ -880,6 +1023,27 @@ jq -e '
   any(.tree[]; .path == ".github/workflows/opencode.yml" and .sha == null)
 ' "$tree_capture" >/dev/null
 jq -e '.draft == true and .base == "main"' "$pr_capture" >/dev/null
+
+# The apply-time recheck authorizes lineage from the same live ref read, so an
+# ancestor central commit — the normal case once the central branch has moved —
+# publishes end to end instead of dying between the plan and the first write.
+ancestor_apply_log="$temp_root/ancestor-apply.log"
+ancestor_apply="$(
+  env "${common_env[@]}" \
+    "${generated_tree_env[@]}" \
+    FAKE_GH_CENTRAL_HEAD="$central_head_sha" \
+    FAKE_GH_LOG="$ancestor_apply_log" \
+    "$fleet_root/scripts/github-rollout" \
+    ExampleStandard --central-sha "$central_sha" --apply
+)"
+jq -e '
+  .applied == true and
+  .idempotent == false and
+  .commit == "4444444444444444444444444444444444444444" and
+  .pullRequest == "https://github.com/Ayyitskevin/ExampleStandard/pull/99"
+' <<<"$ancestor_apply" >/dev/null
+ancestor_compare_request=$'GET\t'"repos/Ayyitskevin/opencode-fleet/compare/$central_sha...$central_head_sha"
+[[ "$(grep -Fc "$ancestor_compare_request" "$ancestor_apply_log")" == 2 ]]
 
 # A pull-request outage leaves an explicit, recoverable branch instead of
 # retrying a non-idempotent POST or hiding the partial external state.

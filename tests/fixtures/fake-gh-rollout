@@ -57,6 +57,19 @@ not_found() {
   exit 1
 }
 
+# A full page is the API's way of saying "there may be more"; the rollout has to
+# treat it as an unusable read even when the wanted secret is on this page.
+emit_secrets() {
+  if [[ "${FAKE_GH_TRUNCATED_SECRETS:-0}" == 1 ]]; then
+    jq -cn '{
+      secrets: ([range(99) | {name: ("FILLER_" + (. | tostring))}] +
+        [{name: "OPENCODE_API_KEY"}])
+    }'
+    return
+  fi
+  printf '{"secrets":[{"name":"OPENCODE_API_KEY"}]}\n'
+}
+
 emit_central_file() {
   local relative_path="$1"
   local source_root="${FAKE_GH_CENTRAL_ROOT:?FAKE_GH_CENTRAL_ROOT is required}"
@@ -196,6 +209,10 @@ case "$endpoint" in
     exit 0
     ;;
   repos/Ayyitskevin/opencode-fleet/compare/*)
+    # GitHub's commit-comparison object has exactly these properties (plus the
+    # URL/diff/patch/files fields this fixture omits). There is deliberately no
+    # `head_commit` key: fabricating one hides lineage-authorization bugs, so
+    # tests/rollout.test.sh pins this payload's shape.
     comparison="${endpoint##*/compare/}"
     base="${comparison%%...*}"
     head="${comparison##*...}"
@@ -203,23 +220,52 @@ case "$endpoint" in
     [[ "${FAKE_GH_UNAUTHORIZED_CENTRAL_SHA:-0}" != 1 ]] ||
       merge_base=8888888888888888888888888888888888888888
     if [[ "$base" == "$head" || "${FAKE_GH_FALSE_IDENTICAL:-0}" == 1 ]]; then
-      jq -cn --arg base "$base" --arg merge "$merge_base" '
-        {
-          status: "identical",
-          base_commit: {sha: $base},
-          merge_base_commit: {sha: $merge}
-        }
-      '
+      compare_status=identical
+      ahead_by=0
+      behind_by=0
     else
-      jq -cn --arg base "$base" --arg head "$head" --arg merge "$merge_base" '
+      compare_status=ahead
+      ahead_by=2
+      behind_by=0
+    fi
+    case "${FAKE_GH_CENTRAL_COMPARE_STATUS:-}" in
+      "") ;;
+      diverged)
+        # The candidate and the live head share only an older ancestor.
+        compare_status=diverged
+        merge_base=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        ahead_by=2
+        behind_by=3
+        ;;
+      behind)
+        # The candidate is a descendant of the live head: never authorized.
+        compare_status=behind
+        merge_base="$head"
+        ahead_by=0
+        behind_by=2
+        ;;
+      *)
+        printf 'fake-gh-rollout: unsupported comparison status: %s\n' \
+          "$FAKE_GH_CENTRAL_COMPARE_STATUS" >&2
+        exit 2
+        ;;
+    esac
+    jq -cn \
+      --arg status "$compare_status" \
+      --arg base "$base" \
+      --arg merge "$merge_base" \
+      --argjson ahead_by "$ahead_by" \
+      --argjson behind_by "$behind_by" '
         {
-          status: "ahead",
+          status: $status,
+          ahead_by: $ahead_by,
+          behind_by: $behind_by,
+          total_commits: $ahead_by,
           base_commit: {sha: $base},
           merge_base_commit: {sha: $merge},
-          head_commit: {sha: $head}
+          commits: [range($ahead_by) | {sha: ((. + 1) | tostring | . * 40 | .[0:40])}]
         }
       '
-    fi
     exit 0
     ;;
   repos/Ayyitskevin/opencode-fleet/contents/*?ref=*)
@@ -330,18 +376,18 @@ case "$endpoint" in
   repos/Ayyitskevin/opencode-fleet/contents/.github/workflows/build.yml?ref=*)
     printf '{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}\n'
     ;;
-  repos/Ayyitskevin/*/environments/opencode-review/secrets)
+  repos/Ayyitskevin/*/environments/opencode-review/secrets?per_page=100)
     if [[ "${FAKE_GH_MISSING_REVIEW_SECRET:-0}" == 1 || "$endpoint" == repos/Ayyitskevin/Vulcan/* ]]; then
       printf '{"secrets":[]}\n'
     else
-      printf '{"secrets":[{"name":"OPENCODE_API_KEY"}]}\n'
+      emit_secrets
     fi
     ;;
-  repos/Ayyitskevin/*/environments/opencode-build/secrets)
+  repos/Ayyitskevin/*/environments/opencode-build/secrets?per_page=100)
     if [[ "${FAKE_GH_MISSING_BUILD_SECRET:-0}" == 1 ]]; then
       printf '{"secrets":[]}\n'
     else
-      printf '{"secrets":[{"name":"OPENCODE_API_KEY"}]}\n'
+      emit_secrets
     fi
     ;;
   repos/Ayyitskevin/*/environments/opencode-review)
@@ -422,11 +468,15 @@ case "$endpoint" in
         printf 'fake-gh-rollout: current-tree blob hashes are missing\n' >&2
         exit 2
       }
+      # Same content, executable mode: identical blob ID, different tree entry.
+      review_mode=100644
+      [[ "${FAKE_GH_EXECUTABLE_REVIEW:-0}" != 1 ]] || review_mode=100755
       tree="$(jq -c \
         --arg review "$FAKE_GH_REVIEW_BLOB_SHA" \
+        --arg review_mode "$review_mode" \
         --arg policy "$FAKE_GH_POLICY_BLOB_SHA" \
         '. + [
-          {path: ".github/workflows/opencode-review.yml", mode: "100644", type: "blob", sha: $review},
+          {path: ".github/workflows/opencode-review.yml", mode: $review_mode, type: "blob", sha: $review},
           {path: ".github/opencode-policy.json", mode: "100644", type: "blob", sha: $policy}
         ]' <<<"$tree")"
       if [[ -n "${FAKE_GH_BUILD_BLOB_SHA:-}" ]]; then
@@ -480,7 +530,12 @@ case "$endpoint" in
       printf 'gh: transient ref failure (HTTP 503)\n' >&2
       exit 1
     }
-    if [[ "${FAKE_GH_DELETED_ROLLOUT_BRANCH:-0}" == 1 ]]; then
+    if [[ "${FAKE_GH_TRUNCATED_REFS:-0}" == 1 ]]; then
+      jq -cn '[range(100) | {
+        ref: ("refs/heads/opencode-fleet/rollout-filler-" + (. | tostring)),
+        object: {type: "commit", sha: "4444444444444444444444444444444444444444"}
+      }]'
+    elif [[ "${FAKE_GH_DELETED_ROLLOUT_BRANCH:-0}" == 1 ]]; then
       printf '[]\n'
     elif [[ "${FAKE_GH_EXACT_ROLLOUT_BRANCH:-0}" == 1 ]]; then
       printf '[{"ref":"refs/heads/opencode-fleet/rollout-0123456789ab","object":{"type":"commit","sha":"4444444444444444444444444444444444444444"}}]\n'
@@ -538,8 +593,12 @@ case "$endpoint" in
     else
       owner='{"id":133295304,"login":"Ayyitskevin"}'
     fi
-    printf '{"full_name":"Ayyitskevin/%s","default_branch":"%s","size":1,"owner":%s}\n' \
-      "$repository" "$default_branch" "$owner"
+    # GitHub computes `size` asynchronously in KB, so a small repository with
+    # real commits reports 0 for a while after its first push.
+    size=1
+    [[ "${FAKE_GH_ZERO_SIZE:-0}" != 1 ]] || size=0
+    printf '{"full_name":"Ayyitskevin/%s","default_branch":"%s","size":%s,"owner":%s}\n' \
+      "$repository" "$default_branch" "$size" "$owner"
     ;;
   *) not_found ;;
 esac

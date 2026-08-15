@@ -78,18 +78,24 @@ fetch_api() {
   gh api "$endpoint" >"$destination" 2>/dev/null
 }
 
+# GitHub's commit-comparison object has no head_commit property, so head
+# identity cannot come from the comparison body. It comes from the live
+# default-branch ref this script reads immediately before requesting the
+# comparison, which is also the head half of the requested basehead. The
+# candidate is authorized only when the comparison proves it is that exact live
+# head (identical) or a strict ancestor of it: base_commit and merge_base_commit
+# both being the candidate means the candidate is the merge base, and "ahead"
+# means the live head moved past it. Anything else fails closed.
 central_lineage_is_authorized() {
   local comparison_file="$1"
-  local base="$2"
-  local head="$3"
+  local candidate="$2"
+  local live_head="$3"
 
-  jq -e --arg base "$base" --arg head "$head" '
-    .base_commit.sha == $base and .merge_base_commit.sha == $base and
+  jq -e --arg candidate "$candidate" --arg head "$live_head" '
+    .base_commit.sha == $candidate and .merge_base_commit.sha == $candidate and
     (
-      (.status == "ahead" and $base != $head and
-        .head_commit.sha == $head) or
-      (.status == "identical" and $base == $head and
-        .head_commit == null)
+      (.status == "ahead" and $candidate != $head) or
+      (.status == "identical" and $candidate == $head)
     )
   ' "$comparison_file" >/dev/null
 }
@@ -343,7 +349,6 @@ encoded_default_branch="$(urlencode "$manifest_default_branch")"
 if fetch_api "repos/$repository_full_name" "$repo_json"; then
   live_full_name="$(jq -r '.full_name // empty' "$repo_json")"
   live_default_branch="$(jq -r '.default_branch // empty' "$repo_json")"
-  repo_size="$(jq -r '.size // 0' "$repo_json")"
   [[ "$live_full_name" == "$repository_full_name" ]] || \
     add_blocker "GitHub canonical identity differs from the manifest"
   jq -e --arg owner "$owner_login" --argjson owner_id "$owner_id" '
@@ -351,8 +356,10 @@ if fetch_api "repos/$repository_full_name" "$repo_json"; then
   ' "$repo_json" >/dev/null || add_blocker "GitHub owner identity differs from the fixed fleet owner"
   [[ "$live_default_branch" == "$manifest_default_branch" ]] || \
     add_blocker "live default branch differs from manifest: expected $manifest_default_branch"
-  [[ "$repo_size" =~ ^[0-9]+$ && "$repo_size" -gt 0 ]] || \
-    add_blocker "GitHub repository has no committed content"
+  # `size` is an asynchronously computed pack size in KB and is routinely 0 for
+  # a freshly pushed small repository, so it cannot prove emptiness. The exact
+  # ref, commit, and non-truncated recursive tree reads below are the
+  # authoritative, fail-closed emptiness gate.
 else
   add_blocker "GitHub repository metadata is unavailable"
 fi
@@ -425,10 +432,16 @@ check_environment_secret() {
     add_blocker "missing $environment_name environment"
     return 1
   fi
+  # One explicitly bounded page. A full page means the listing may be
+  # truncated, so the read cannot vouch for the environment and fails closed
+  # instead of pretending the first hundred entries are the whole set.
   if ! fetch_api \
-    "repos/$repository_full_name/environments/$environment_name/secrets" \
+    "repos/$repository_full_name/environments/$environment_name/secrets?per_page=100" \
     "$secrets_json" ||
-     ! jq -e 'any(.secrets[]?; .name == "OPENCODE_API_KEY")' "$secrets_json" >/dev/null; then
+     ! jq -e '
+       (.secrets | type) == "array" and (.secrets | length) < 100 and
+       any(.secrets[]; .name == "OPENCODE_API_KEY")
+     ' "$secrets_json" >/dev/null; then
     add_blocker "missing OPENCODE_API_KEY in $environment_name environment"
     return 1
   fi
@@ -532,13 +545,18 @@ while IFS= read -r relative_path; do
       '. + [{path: $path, mode: "100644", type: "blob", sha: $sha}]' \
       <<<"$rendered_blob_entries"
   )"
-  existing_blob="$(
-    jq -r --arg path "$relative_path" '
-      [.tree[]? | select(.path == $path and .type == "blob") | .sha] |
-      if length == 1 then .[0] else "" end
-    ' "$base_tree_json" 2>/dev/null || true
-  )"
-  if [[ "$existing_blob" != "$rendered_blob" ]]; then
+  # The expected leaf tree demands the exact (mode, type, sha) triple, so write
+  # detection must use the same identity. Selecting on the path alone and
+  # comparing the whole triple keeps a same-content entry that differs only in
+  # mode or type — an executable 100755 copy of the caller, say — planned as a
+  # write instead of silently skipped into an unsatisfiable tree expectation.
+  if ! jq -e \
+       --arg path "$relative_path" \
+       --arg sha "$rendered_blob" '
+         [.tree[]? | select(.path == $path)] |
+         length == 1 and
+         (.[0] | .mode == "100644" and .type == "blob" and .sha == $sha)
+       ' "$base_tree_json" >/dev/null 2>&1; then
     writes+=("$relative_path")
   fi
 done < <(jq -r '.files[]' "$render_metadata")
@@ -636,10 +654,10 @@ rollout_ref_present=false
 prevent_branch_recreation=false
 existing_rollout_refs="$temp_root/existing-rollout-refs.json"
 if ! fetch_api \
-  "repos/$repository_full_name/git/matching-refs/heads/$encoded_rollout_branch" \
+  "repos/$repository_full_name/git/matching-refs/heads/$encoded_rollout_branch?per_page=100" \
   "$existing_rollout_refs" ||
    ! jq -e '
-     type == "array" and length <= 100 and
+     type == "array" and length < 100 and
      all(.[];
        (.ref | type == "string") and
        .object.type == "commit" and
