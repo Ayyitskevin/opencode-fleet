@@ -73,7 +73,7 @@ Examples:
     oc Icarus
     oc Icarus build
     oc Icarus review --ceiling
-    oc Icarus plan --experiment ollama/qwen3.6:35b
+    oc Icarus plan --experiment ollama/qwen3.8:27b
     OPENCODE_FLEET_CLOUD_MODEL=provider/model oc Icarus review --cloud
 
 All ordinary modes use the pinned cost-efficient
@@ -87,10 +87,15 @@ in `localExperiments` in config/model-routes.json, requires that model to exist
 in the staged provider catalog, may not shadow a pinned route, and is mutually
 exclusive with `--ceiling` and `--cloud`. Like every other escalation it is a
 command-line request, never an environment override, and never a fallback.
-The allowlist carries the nine staged local models that are not already pinned
-to a route; the two pinned models are rejected from it so an experiment can
-never quietly shadow the daily lane. Trim the list to taste — an entry that is
-not in the staged provider catalog, or is not pulled in Ollama, fails closed.
+The allowlist carries the staged local models that are not already pinned to a
+route; the two pinned models are rejected from it so an experiment can never
+quietly shadow the daily lane. Trim the list to taste — an entry that is not
+in the staged provider catalog, or is not pulled in Ollama, fails closed, and
+`scripts/doctor --local-models` reports the difference.
+
+The staged catalog deliberately holds only models that can drive an agent.
+Embedding models, safety classifiers, and single-domain models are left out
+because they cannot run a coding lane, not because they are unwelcome.
 
 `oc sandbox` is the throwaway practice lane. A sandbox is a private repository
 under the mode-700 fleet state directory with **no remote at all**, so it

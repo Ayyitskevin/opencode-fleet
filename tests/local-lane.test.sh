@@ -212,7 +212,7 @@ for install_filter in \
   fi
 done
 bad_install_routes="$temp_root/bad-install-routes.json"
-jq '.routes.build.model = "ollama/qwen3.6:35b"' \
+jq '.routes.build.model = "ollama/qwen3.8:27b"' \
   "$fleet_root/config/model-routes.json" >"$bad_install_routes"
 if env "${install_env[@]}" OPENCODE_FLEET_ROUTES="$bad_install_routes" \
   "$fleet_root/scripts/install-local" >/dev/null 2>&1; then

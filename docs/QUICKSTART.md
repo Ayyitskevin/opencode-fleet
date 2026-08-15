@@ -76,11 +76,11 @@ untouched.
 
 ## 8. Practising with other local models
 
-`localExperiments` in `config/model-routes.json` already lists the nine staged
-models that are not pinned to a route. Confirm they are pulled
+`localExperiments` in `config/model-routes.json` already lists the staged models
+that are not pinned to a route. Confirm they are pulled
 (`scripts/doctor --local-models`), then:
 
-    oc Icarus plan --experiment ollama/qwen3.6:35b
+    oc Icarus plan --experiment ollama/qwen3.8:27b
 
 Run the same task across models, then compare with `oc diff` and `oc stats`.
 Trim the list to taste: the two models pinned to the daily routes are rejected
@@ -94,7 +94,7 @@ Practising should not require a catalogued GitHub repository:
     oc sandbox list
     oc sandbox scratch                    # plan
     oc sandbox scratch build              # private worktree, as usual
-    oc sandbox scratch plan --experiment ollama/qwen3.6:35b
+    oc sandbox scratch plan --experiment ollama/qwen3.8:27b
     oc diff <run-id>
 
 A sandbox has no remote, so nothing in it can be published. Build still needs
