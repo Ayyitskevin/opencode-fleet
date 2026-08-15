@@ -57,6 +57,9 @@ tool's credential-path exclusions; path-only enumeration remains available.
 
     oc list
     oc doctor [--strict] [--local-models]
+    oc sandbox new <name>
+    oc sandbox list
+    oc sandbox <name> [plan|build|review]
     oc runs [repository]
     oc show <run-id>
     oc diff <run-id>
@@ -83,9 +86,20 @@ practice and comparison. It accepts only exact `ollama/<model>` entries listed
 in `localExperiments` in config/model-routes.json, requires that model to exist
 in the staged provider catalog, may not shadow a pinned route, and is mutually
 exclusive with `--ceiling` and `--cloud`. Like every other escalation it is a
-command-line request, never an environment override, and never a fallback. The
-shipped default list is empty, so the daily routes stay deterministic until an
-experiment is deliberately declared.
+command-line request, never an environment override, and never a fallback.
+The allowlist carries the nine staged local models that are not already pinned
+to a route; the two pinned models are rejected from it so an experiment can
+never quietly shadow the daily lane. Trim the list to taste — an entry that is
+not in the staged provider catalog, or is not pulled in Ollama, fails closed.
+
+`oc sandbox` is the throwaway practice lane. A sandbox is a private repository
+under the mode-700 fleet state directory with **no remote at all**, so it
+carries strictly less authority than any catalogued clone: there is nothing to
+push to and no GitHub identity to act as. Otherwise it is an ordinary run —
+same guard, same lock, same run records, same private build worktree, and the
+same `oc diff` and rollback. A sandbox that acquires a remote stops being a
+sandbox and is refused. Sandboxes are never deleted automatically; remove one
+by hand when you are done with it.
 
 The installed provider map is closed: it contains only `ollama`, uses
 `@ai-sdk/openai-compatible`, and points to

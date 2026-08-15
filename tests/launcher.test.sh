@@ -227,10 +227,18 @@ assert_refusal_early() {
     { printf 'refusal for %s gave the wrong reason: %s\n' "$label" "$output" >&2
       exit 1; }
 }
-assert_refusal_early "experiment with the shipped empty allowlist" \
+jq '.localExperiments = []' "$fleet_root/config/model-routes.json" \
+  >"$experiment_routes"
+assert_refusal_early "experiment against an empty allowlist" \
+  "not in the local experiment allowlist" \
+  env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
+  "$fleet_root/scripts/oc" Example --experiment ollama/qwen3.6:35b --dry-run
+# The shipped allowlist is not a blanket permit: a model outside it is refused
+# even though other models are allowed.
+assert_refusal_early "experiment outside the shipped allowlist" \
   "not in the local experiment allowlist" \
   env "${common_env[@]}" "$fleet_root/scripts/oc" Example \
-  --experiment ollama/qwen3.6:35b --dry-run
+  --experiment ollama/not-allowlisted:1b --dry-run
 
 jq '.localExperiments = ["ollama/qwen3.6:35b"]' \
   "$fleet_root/config/model-routes.json" >"$experiment_routes"
@@ -824,5 +832,105 @@ for unsafe_run in '../escape' 'no-such-run'; do
   fi
 done
 
+# The sandbox lane exists so practice does not require a catalogued GitHub
+# repository. It must carry strictly less authority than a catalogued clone:
+# no remote at all, therefore nothing to publish to.
+sandbox_env=("${common_env[@]}")
+env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox new scratch >/dev/null
+sandbox_path="$state_root/sandboxes/scratch"
+[[ -d "$sandbox_path/.git" && ! -L "$sandbox_path/.git" ]] ||
+  { printf 'sandbox was not initialized as a repository\n' >&2; exit 1; }
+[[ "$(stat -c %a "$sandbox_path")" == "700" ]] ||
+  { printf 'sandbox is not private\n' >&2; exit 1; }
+[[ -z "$(git -C "$sandbox_path" remote)" ]] ||
+  { printf 'a new sandbox has a remote\n' >&2; exit 1; }
+grep -qx 'scratch' <<<"$(env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox list)" ||
+  { printf 'oc sandbox list did not report the sandbox\n' >&2; exit 1; }
+if env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox new scratch \
+  >/dev/null 2>&1; then
+  printf 'sandbox creation overwrote an existing sandbox\n' >&2
+  exit 1
+fi
+for unsafe_sandbox in '../escape' 'has space' '.hidden'; do
+  if env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox new "$unsafe_sandbox" \
+    >/dev/null 2>&1; then
+    printf 'sandbox accepted an unsafe name: %s\n' "$unsafe_sandbox" >&2
+    exit 1
+  fi
+done
+
+git -C "$sandbox_path" config user.name "Fleet Test"
+git -C "$sandbox_path" config user.email "fleet@example.invalid"
+printf 'scratch\n' >"$sandbox_path/tracked.txt"
+git -C "$sandbox_path" add tracked.txt
+git -C "$sandbox_path" commit -qm "sandbox base"
+
+sandbox_plan="$(env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox scratch --dry-run)"
+jq -e '
+  .repository == "scratch" and .fullName == "sandbox/scratch" and
+  .sandbox == true and .risk == "sandbox" and
+  .model == "ollama/qwen3-coder:30b"
+' <<<"$sandbox_plan" >/dev/null ||
+  { printf 'sandbox plan did not resolve to lane-owned state\n' >&2; exit 1; }
+
+# A sandbox that acquires a remote stops being a sandbox.
+git -C "$sandbox_path" remote add origin git@github.com:Ayyitskevin/Example.git
+assert_refusal_early "sandbox with a remote" "must have no remote" \
+  env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox scratch --dry-run
+git -C "$sandbox_path" remote remove origin
+assert_refusal_early "missing sandbox" "no such sandbox" \
+  env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox absent --dry-run
+
+# A sandbox build is a real run: private worktree, run record, rollback.
+env "${sandbox_env[@]}" FAKE_MUTATE=1 OPENCODE_FLEET_RUN_ID=sandbox-build \
+  "$fleet_root/scripts/oc" sandbox scratch build >/dev/null
+sandbox_record="$state_root/runs/sandbox-build/record.json"
+jq -e '
+  .status == "completed" and .sandbox == true and
+  .fullName == "sandbox/scratch" and
+  (.worktreePath | startswith("'"$state_root"'/sandbox-worktrees/scratch/")) and
+  .diffstat.files == 1
+' "$sandbox_record" >/dev/null ||
+  { printf 'sandbox build did not record a lane-owned run\n' >&2
+    jq . "$sandbox_record" >&2; exit 1; }
+[[ -z "$(git -C "$sandbox_path" status --porcelain)" ]] ||
+  { printf 'sandbox build mutated the sandbox instead of its worktree\n' >&2
+    exit 1; }
+env "${sandbox_env[@]}" "$fleet_root/scripts/oc" diff sandbox-build |
+  grep -q '^+changed$' ||
+  { printf 'oc diff did not work for a sandbox run\n' >&2; exit 1; }
+env "${sandbox_env[@]}" "$fleet_root/scripts/rollback" run sandbox-build --apply \
+  >/dev/null ||
+  { printf 'rollback refused a sandbox run\n' >&2; exit 1; }
+jq -e '.status == "rolled-back"' "$sandbox_record" >/dev/null ||
+  { printf 'sandbox run was not marked rolled back\n' >&2; exit 1; }
+
+# A record claiming to be a sandbox cannot point rollback at some other path:
+# the sandbox lane is trusted only inside its own root.
+env "${sandbox_env[@]}" FAKE_MUTATE=1 OPENCODE_FLEET_RUN_ID=sandbox-forged \
+  "$fleet_root/scripts/oc" sandbox scratch build >/dev/null
+forged_record="$state_root/runs/sandbox-forged/record.json"
+cp "$forged_record" "$temp_root/sandbox-forged.good.json"
+for forged_filter in \
+  '.sourcePath = "'"$workspace"'/Example"' \
+  '.worktreePath = .worktreePath + "-elsewhere"' \
+  '.fullName = "Ayyitskevin/Example"'; do
+  jq "$forged_filter" "$temp_root/sandbox-forged.good.json" >"$forged_record"
+  if env "${sandbox_env[@]}" "$fleet_root/scripts/rollback" run sandbox-forged \
+    --apply >/dev/null 2>&1; then
+    printf 'rollback accepted a forged sandbox record: %s\n' "$forged_filter" >&2
+    exit 1
+  fi
+done
+cp "$temp_root/sandbox-forged.good.json" "$forged_record"
+
+# A dirty sandbox refuses a build for the same reason a dirty clone does.
+printf 'uncommitted\n' >>"$sandbox_path/tracked.txt"
+assert_refusal_early "dirty sandbox build" "requires a clean sandbox" \
+  env "${sandbox_env[@]}" OPENCODE_FLEET_RUN_ID=sandbox-dirty \
+  "$fleet_root/scripts/oc" sandbox scratch build
+git -C "$sandbox_path" checkout -- tracked.txt
+
 printf 'launcher tests passed\n'
+
 

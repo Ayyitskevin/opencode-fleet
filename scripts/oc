@@ -21,6 +21,9 @@ usage() {
 Usage:
   oc list
   oc doctor [--strict] [--local-models]
+  oc sandbox new <name>
+  oc sandbox list
+  oc sandbox <name> [plan|build|review] [--experiment ollama/<model>]
   oc runs [repository]
   oc show <run-id>
   oc diff <run-id>
@@ -435,6 +438,36 @@ validate_independent_clone() {
   done
 }
 
+# A sandbox is deliberately weaker than a catalogued clone: it has no origin at
+# all, so there is nothing for a model to push to and no GitHub identity to
+# impersonate. That is the whole justification for letting one exist outside the
+# catalog, so the absence of every remote is verified, not assumed.
+validate_sandbox_clone() {
+  local path="$1"
+  local top_level common_dir
+  local -a remotes
+
+  [[ -d "$path" && ! -L "$path" ]] ||
+    die "sandbox is missing or is a symlink"
+  [[ -d "$path/.git" && ! -L "$path/.git" ]] ||
+    die "sandbox must be an independent repository, not a linked worktree"
+  top_level="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)" ||
+    die "sandbox is not a Git working tree"
+  top_level="$(realpath -e -- "$top_level")" ||
+    die "sandbox top level cannot be resolved"
+  [[ "$top_level" == "$path" ]] || die "sandbox path is not its top level"
+  common_dir="$(git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+    die "sandbox Git directory cannot be resolved"
+  common_dir="$(realpath -e -- "$common_dir")" ||
+    die "sandbox Git directory cannot be resolved"
+  [[ "$common_dir" == "$path/.git" ]] ||
+    die "sandbox shares Git state with another working tree"
+
+  mapfile -t remotes < <(git -C "$path" remote)
+  [[ "${#remotes[@]}" -eq 0 ]] ||
+    die "a sandbox must have no remote; publication belongs to a catalogued clone"
+}
+
 ensure_private_directory() {
   local path="$1"
   local canonical
@@ -727,6 +760,58 @@ case "$command_name" in
     ;;
 esac
 
+sandbox_root="$state_root/sandboxes"
+is_sandbox=false
+sandbox_name=""
+
+validate_sandbox_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    die "sandbox name may contain only letters, digits, dot, dash, underscore"
+}
+
+if [[ "$command_name" == "sandbox" ]]; then
+  shift
+  case "${1:-}" in
+    "")
+      die "sandbox requires a name, or the new/list action"
+      ;;
+    new)
+      shift
+      sandbox_name="${1:-}"
+      [[ -n "$sandbox_name" ]] || die "sandbox new requires a name"
+      validate_sandbox_name "$sandbox_name"
+      (($# <= 1)) || die "unknown argument: $2"
+      ensure_private_directory "$state_root"
+      ensure_private_directory "$sandbox_root"
+      sandbox_path="$sandbox_root/$sandbox_name"
+      [[ ! -e "$sandbox_path" && ! -L "$sandbox_path" ]] ||
+        die "sandbox already exists: $sandbox_name"
+      install -d -m 700 "$sandbox_path"
+      git -C "$sandbox_path" init -q -b main
+      # No remote is configured, and none may be added: the launcher refuses a
+      # sandbox that has one.
+      printf 'sandbox: %s\n' "$sandbox_path"
+      exit 0
+      ;;
+    list)
+      shift
+      (($# == 0)) || die "unknown argument: $1"
+      [[ -d "$sandbox_root" ]] || exit 0
+      for sandbox_path in "$sandbox_root"/*/; do
+        [[ -d "$sandbox_path" ]] || continue
+        sandbox_path="${sandbox_path%/}"
+        printf '%s\n' "$(basename "$sandbox_path")"
+      done
+      exit 0
+      ;;
+    *)
+      sandbox_name="$1"
+      validate_sandbox_name "$sandbox_name"
+      is_sandbox=true
+      ;;
+  esac
+fi
+
 repository_query="$command_name"
 shift
 mode="plan"
@@ -776,37 +861,55 @@ selected_routes=0
 [[ "$selected_routes" -le 1 ]] ||
   die "--ceiling, --cloud, and --experiment are mutually exclusive"
 
-matches="$(
-  jq -c --arg query "${repository_query,,}" '
-    [.repositories[] |
-      select((.name | ascii_downcase) == $query or
-             (.fullName | ascii_downcase) == $query)]
-  ' "$manifest"
-)"
-match_count="$(jq 'length' <<<"$matches")"
-if [[ "$match_count" -eq 0 ]]; then
-  die "repository is not catalogued"
-elif [[ "$match_count" -ne 1 ]]; then
-  die "repository query is ambiguous"
+if [[ "$is_sandbox" == true ]]; then
+  # A sandbox resolves inside lane-owned private state instead of the catalog.
+  # It carries no GitHub identity, so nothing downstream can mistake it for a
+  # catalogued repository.
+  repository_name="$sandbox_name"
+  repository_full_name="sandbox/$sandbox_name"
+  repository_risk="sandbox"
+  default_branch=""
+  ensure_private_directory "$state_root"
+  ensure_private_directory "$sandbox_root"
+  repository_path="$sandbox_root/$repository_name"
+  [[ "$(realpath -m -- "$repository_path")" == "$repository_path" ]] ||
+    die "sandbox path is not canonical"
+  [[ -d "$repository_path" ]] ||
+    die "no such sandbox: $sandbox_name (create it with 'oc sandbox new')"
+  validate_sandbox_clone "$repository_path"
+else
+  matches="$(
+    jq -c --arg query "${repository_query,,}" '
+      [.repositories[] |
+        select((.name | ascii_downcase) == $query or
+               (.fullName | ascii_downcase) == $query)]
+    ' "$manifest"
+  )"
+  match_count="$(jq 'length' <<<"$matches")"
+  if [[ "$match_count" -eq 0 ]]; then
+    die "repository is not catalogued"
+  elif [[ "$match_count" -ne 1 ]]; then
+    die "repository query is ambiguous"
+  fi
+
+  entry="$(jq -c '.[0]' <<<"$matches")"
+  repository_name="$(jq -r '.name' <<<"$entry")"
+  repository_full_name="$(jq -r '.fullName' <<<"$entry")"
+  repository_state="$(jq -r '.state' <<<"$entry")"
+  repository_risk="$(jq -r '.risk' <<<"$entry")"
+  default_branch="$(jq -r '.defaultBranch' <<<"$entry")"
+  [[ "$repository_state" == "active" ]] ||
+    die "repository is a registered placeholder and has no clone"
+  git check-ref-format "refs/heads/$default_branch" >/dev/null 2>&1 ||
+    die "catalogued default branch is not a valid Git branch"
+
+  workspace_root="${OPENCODE_FLEET_WORKSPACE_ROOT:-$(jq -r '.workspaceRoot' "$manifest")}"
+  validate_workspace_root "$workspace_root"
+  repository_path="$workspace_root/$repository_name"
+  [[ "$(realpath -m -- "$repository_path")" == "$repository_path" ]] ||
+    die "catalogued clone path is not canonical"
+  validate_independent_clone "$repository_path" "$repository_full_name"
 fi
-
-entry="$(jq -c '.[0]' <<<"$matches")"
-repository_name="$(jq -r '.name' <<<"$entry")"
-repository_full_name="$(jq -r '.fullName' <<<"$entry")"
-repository_state="$(jq -r '.state' <<<"$entry")"
-repository_risk="$(jq -r '.risk' <<<"$entry")"
-default_branch="$(jq -r '.defaultBranch' <<<"$entry")"
-[[ "$repository_state" == "active" ]] ||
-  die "repository is a registered placeholder and has no clone"
-git check-ref-format "refs/heads/$default_branch" >/dev/null 2>&1 ||
-  die "catalogued default branch is not a valid Git branch"
-
-workspace_root="${OPENCODE_FLEET_WORKSPACE_ROOT:-$(jq -r '.workspaceRoot' "$manifest")}"
-validate_workspace_root "$workspace_root"
-repository_path="$workspace_root/$repository_name"
-[[ "$(realpath -m -- "$repository_path")" == "$repository_path" ]] ||
-  die "catalogued clone path is not canonical"
-validate_independent_clone "$repository_path" "$repository_full_name"
 
 agent="$(jq -r --arg mode "$mode" '.routes[$mode].agent' "$routes")"
 model="$(jq -r --arg mode "$mode" '.routes[$mode].model' "$routes")"
@@ -848,10 +951,15 @@ base_commit="$(git -C "$repository_path" rev-parse --verify HEAD 2>/dev/null)" |
   die "catalogued clone has no valid HEAD"
 
 if [[ "$mode" == "build" ]]; then
-  [[ "$dirty" == false ]] ||
-    die "build requires a clean dedicated clone"
-  [[ "$current_branch" == "$default_branch" ]] ||
-    die "build requires the catalogued default branch"
+  if [[ "$is_sandbox" == true ]]; then
+    [[ "$dirty" == false ]] ||
+      die "build requires a clean sandbox; commit or discard your scratch work"
+  else
+    [[ "$dirty" == false ]] ||
+      die "build requires a clean dedicated clone"
+    [[ "$current_branch" == "$default_branch" ]] ||
+      die "build requires the catalogued default branch"
+  fi
 fi
 
 if [[ "$dry_run" == true ]]; then
@@ -868,9 +976,11 @@ if [[ "$dry_run" == true ]]; then
     --arg defaultBranch "$default_branch" \
     --arg baseCommit "$base_commit" \
     --argjson dirty "$dirty" \
+    --argjson sandbox "$is_sandbox" \
     '{
       repository: $repository,
       fullName: $fullName,
+      sandbox: $sandbox,
       sourcePath: $path,
       executionPath: (if $mode == "build" then "private-run-worktree" else $path end),
       mode: $mode,
@@ -916,7 +1026,12 @@ execution_path="$repository_path"
 worktree_path=""
 run_branch=""
 if [[ "$mode" == "build" ]]; then
-  worktree_parent="$state_root/worktrees/${repository_name,,}"
+  if [[ "$is_sandbox" == true ]]; then
+    worktree_parent="$state_root/sandbox-worktrees/${repository_name,,}"
+    ensure_private_directory "$state_root/sandbox-worktrees"
+  else
+    worktree_parent="$state_root/worktrees/${repository_name,,}"
+  fi
   ensure_private_directory "$worktree_parent"
   worktree_path="$worktree_parent/$run_id"
   run_branch="opencode/build/$run_id"
@@ -940,8 +1055,10 @@ jq -n \
   --arg baseBranch "$current_branch" \
   --arg runBranch "$run_branch" \
   --arg createdAt "$created_at" \
+  --argjson sandbox "$is_sandbox" \
   '{
     schemaVersion: 1,
+    sandbox: $sandbox,
     runId: $runId,
     repository: $repository,
     fullName: $fullName,

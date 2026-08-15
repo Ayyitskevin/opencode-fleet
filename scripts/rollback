@@ -299,6 +299,7 @@ rollback_run() {
   local run_id="$1"
   local run_dir record repository full_name source_path worktree_path
   local base_commit run_branch expected_source expected_worktree common head
+  local source_root=""
   local dirty=false
   local untracked=false
   local -a matches
@@ -315,7 +316,8 @@ rollback_run() {
     (.sourcePath | type == "string") and
     (.worktreePath | type == "string" and length > 0) and
     (.baseCommit | test("^[0-9a-f]{40,64}$")) and
-    (.runBranch | type == "string" and length > 0)
+    (.runBranch | type == "string" and length > 0) and
+    ((.sandbox // false) | type == "boolean")
   ' "$record" >/dev/null || die "run record is invalid or is not a build"
 
   repository="$(jq -r '.repository' "$record")"
@@ -325,22 +327,41 @@ rollback_run() {
   base_commit="$(jq -r '.baseCommit' "$record")"
   run_branch="$(jq -r '.runBranch' "$record")"
 
-  workspace_root="${OPENCODE_FLEET_WORKSPACE_ROOT:-$(jq -r '.workspaceRoot' "$manifest")}"
-  mapfile -t matches < <(jq -r \
-    --arg repository "$repository" --arg fullName "$full_name" \
-    '.repositories[] |
-      select(.name == $repository and .fullName == $fullName and .state == "active") |
-      .name' "$manifest")
-  [[ "${#matches[@]}" -eq 1 ]] || die "run repository is not an active exact catalog entry"
+  # A sandbox run is lane-owned state with no catalog entry and no remote, so
+  # it is anchored to the sandbox root instead of the workspace. Everything
+  # after this point -- the preserved evidence, the post-lock rechecks, the
+  # refusal to touch committed work -- is identical for both lanes.
+  if [[ "$(jq -r '.sandbox // false' "$record")" == "true" ]]; then
+    [[ "$full_name" == "sandbox/$repository" ]] ||
+      die "sandbox run record identity is inconsistent"
+    source_root="$state_root/sandboxes"
+    expected_source="$source_root/$repository"
+    expected_worktree="$state_root/sandbox-worktrees/${repository,,}/$run_id"
+    [[ "$source_path" == "$expected_source" &&
+       "$worktree_path" == "$expected_worktree" ]] ||
+      die "run record paths do not match lane-owned locations"
+    [[ -z "$(git -C "$source_path" remote 2>/dev/null)" ]] ||
+      die "sandbox source has acquired a remote and is no longer a sandbox"
+  else
+    workspace_root="${OPENCODE_FLEET_WORKSPACE_ROOT:-$(jq -r '.workspaceRoot' "$manifest")}"
+    mapfile -t matches < <(jq -r \
+      --arg repository "$repository" --arg fullName "$full_name" \
+      '.repositories[] |
+        select(.name == $repository and .fullName == $fullName and .state == "active") |
+        .name' "$manifest")
+    [[ "${#matches[@]}" -eq 1 ]] ||
+      die "run repository is not an active exact catalog entry"
 
-  expected_source="$workspace_root/$repository"
-  expected_worktree="$state_root/worktrees/${repository,,}/$run_id"
-  [[ "$source_path" == "$expected_source" &&
-     "$worktree_path" == "$expected_worktree" ]] ||
-    die "run record paths do not match lane-owned locations"
-  [[ -d "$workspace_root" && ! -L "$workspace_root" &&
-     "$(realpath -e -- "$workspace_root")" == "$workspace_root" ]] ||
-    die "workspace root is missing or non-canonical"
+    source_root="$workspace_root"
+    expected_source="$source_root/$repository"
+    expected_worktree="$state_root/worktrees/${repository,,}/$run_id"
+    [[ "$source_path" == "$expected_source" &&
+       "$worktree_path" == "$expected_worktree" ]] ||
+      die "run record paths do not match lane-owned locations"
+    [[ -d "$workspace_root" && ! -L "$workspace_root" &&
+       "$(realpath -e -- "$workspace_root")" == "$workspace_root" ]] ||
+      die "workspace root is missing or non-canonical"
+  fi
   [[ -d "$source_path/.git" && ! -L "$source_path" && ! -L "$source_path/.git" ]] ||
     die "source clone is missing or not independent"
   [[ -d "$worktree_path" && ! -L "$worktree_path" && -f "$worktree_path/.git" ]] ||
@@ -348,7 +369,7 @@ rollback_run() {
   [[ "$(realpath -e -- "$source_path")" == "$source_path" &&
      "$(realpath -e -- "$worktree_path")" == "$worktree_path" ]] ||
     die "run paths must be canonical and contain no symlink"
-  validate_path_chain "$workspace_root" "$source_path" "run source clone"
+  validate_path_chain "$source_root" "$source_path" "run source clone"
   validate_path_chain "$state_root" "$worktree_path" "private run worktree"
 
   common="$(git -C "$worktree_path" rev-parse --path-format=absolute --git-common-dir)"

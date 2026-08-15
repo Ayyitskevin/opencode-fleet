@@ -76,17 +76,34 @@ untouched.
 
 ## 8. Practising with other local models
 
-Add exact `ollama/<model>` entries to `localExperiments` in
-`config/model-routes.json`, confirm each is in the staged provider catalog in
-`config/opencode.jsonc` and pulled in Ollama, then:
+`localExperiments` in `config/model-routes.json` already lists the nine staged
+models that are not pinned to a route. Confirm they are pulled
+(`scripts/doctor --local-models`), then:
 
     oc Icarus plan --experiment ollama/qwen3.6:35b
 
 Run the same task across models, then compare with `oc diff` and `oc stats`.
-The allowlist ships empty on purpose: the daily routes stay deterministic until
-an experiment is deliberately declared.
+Trim the list to taste: the two models pinned to the daily routes are rejected
+from it, so an experiment can never quietly become the default.
 
-## 9. Publishing work
+## 9. Throwaway practice
+
+Practising should not require a catalogued GitHub repository:
+
+    oc sandbox new scratch
+    oc sandbox list
+    oc sandbox scratch                    # plan
+    oc sandbox scratch build              # private worktree, as usual
+    oc sandbox scratch plan --experiment ollama/qwen3.6:35b
+    oc diff <run-id>
+
+A sandbox has no remote, so nothing in it can be published. Build still needs
+a clean tree — commit your scratch work first — and the model works in a
+private worktree, which is what makes the same task comparable across
+several models. Delete a sandbox by hand when you are done;
+nothing removes one for you.
+
+## 10. Publishing work
 
 There is no automated push. Review a finished build with `oc diff <run-id>`,
 then publish its branch yourself from the dedicated clone. See

@@ -152,3 +152,29 @@ exact order, and the launcher, doctor, and installer all assert against it.
 Order is part of the contract because OpenCode resolves permissions by pattern
 order. Diagnosis now accepts exactly what the launcher accepts, so doctor can
 no longer report a healthy fleet that `oc` refuses to run.
+
+## D16 — A sandbox is less authority, not more
+
+AGENTS.md says local execution opens exactly one catalogued repository at a
+time. That invariant exists to stop a model reaching Kevin's real repositories
+and credentials — not to make scratch work impossible. In practice it did the
+latter: trying a model on a throwaway idea required creating a GitHub
+repository, editing the catalog, and provisioning a dedicated clone, which is
+precisely the friction that sends practice back to other tools.
+
+`oc sandbox` opens a repository under the mode-700 fleet state directory that
+has no remote at all. The launcher verifies the absence of every remote before
+execution and refuses a sandbox that has acquired one. That is the whole
+justification: a sandbox grants strictly less authority than any catalogued
+clone, because there is nothing to push to and no GitHub identity to act as.
+
+Everything else is unchanged — same runtime guard, same global lock, same
+mode-600 run records, same private build worktree, same rollback. Sandbox
+worktrees live under their own root so a sandbox can never collide with a
+catalogued repository of the same name, and rollback anchors a sandbox run to
+the sandbox root rather than the workspace, refusing a record that claims to be
+a sandbox while pointing anywhere else.
+
+Sandboxes are never deleted automatically, consistent with the rest of the
+retention doctrine: a scratch repository is still evidence until a human
+decides otherwise.
