@@ -83,9 +83,18 @@ acquire_global_lock() {
   # Every caller re-proves its preconditions after this returns. The hook holds
   # the lock open so the suite can mutate the state in between and observe that
   # the recheck, not the preflight, is what authorizes the mutation.
+  # Test rendezvous, not a timed sleep: the harness must be able to observe this
+  # process holding the lock and mutate state underneath it. A fixed sleep makes
+  # that a race -- on a loaded machine the parent can be descheduled through the
+  # whole window and never see the lock held -- so the variable names a hold file
+  # that this process creates a marker for and then waits to be released.
   if [[ "${OPENCODE_FLEET_TESTING:-0}" == 1 &&
         -n "${OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK:-}" ]]; then
-    sleep "$OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK"
+    : >"${OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK}.acquired"
+    for ((pause_attempt = 0; pause_attempt < 2400; pause_attempt++)); do
+      [[ -e "$OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK" ]] || break
+      sleep 0.05
+    done
   fi
 }
 

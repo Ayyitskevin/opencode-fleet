@@ -38,13 +38,31 @@ capture_failure() {
 
 # Post-lock rechecks are only observable while the tested process holds the
 # lock, so the harness waits for that instead of guessing with a sleep.
+# The child creates a durable marker once it holds the lock and then waits to be
+# released, so observing it is not a race against a fixed sleep window. A child
+# that exits without ever locking is a different failure from a slow one, and
+# both report the child's own stderr rather than a bare timeout.
 wait_for_lock_held() {
+  local hold="$1"
+  local pid="$2"
+  local error_file="$3"
+  local label="$4"
   local attempt
-  for ((attempt = 0; attempt < 400; attempt++)); do
-    flock -n "$state_root/session.lock" true 2>/dev/null || return 0
+  for ((attempt = 0; attempt < 2400; attempt++)); do
+    [[ ! -e "$hold.acquired" ]] || return 0
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      fail "$label exited without taking the session lock: $(
+        [[ -r "$error_file" ]] && cat "$error_file")"
+    fi
     sleep 0.05
   done
-  return 1
+  fail "$label never took the session lock: $(
+    [[ -r "$error_file" ]] && cat "$error_file")"
+}
+
+release_lock_hold() {
+  rm -f "$1"
 }
 
 wait_for_stopped() {
@@ -574,14 +592,18 @@ env "${launcher_env[@]}" OPENCODE_FLEET_RUN_ID=preflight-run \
   "$fleet_root/scripts/oc" Example build >/dev/null
 preflight_record="$state_root/runs/preflight-run/record.json"
 preflight_worktree="$(jq -r '.worktreePath' "$preflight_record")"
+hold_preflight="$temp_root/hold_preflight"
+: >"$hold_preflight"
 env "${provision_env[@]}" OPENCODE_FLEET_TESTING=1 \
-  OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK=5 \
+  OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK="${hold_preflight}" \
   "$fleet_root/scripts/rollback" run preflight-run --apply \
   >/dev/null 2>"$temp_root/rollback-preflight.err" &
 preflight_pid=$!
-wait_for_lock_held || fail 'paused run rollback never took the session lock'
+wait_for_lock_held "${hold_preflight}" "$preflight_pid" "$temp_root/rollback-preflight.err" \
+  "paused run rollback"
 git -C "$preflight_worktree" add -A
 git -C "$preflight_worktree" commit -qm "committed while rollback held the lock"
+release_lock_hold "$hold_preflight"
 preflight_status=0
 wait "$preflight_pid" || preflight_status=$?
 [[ "$preflight_status" -ne 0 ]] ||
@@ -603,14 +625,18 @@ tampered_config="$temp_root/tampered-config.jsonc"
 sed '/^[[:space:]]*\/\//d' "$fleet_root/config/opencode.jsonc" |
   jq '.provider.ollama.options.baseURL = "https://example.invalid/v1"' \
   >"$tampered_config"
+hold_anchor="$temp_root/hold_anchor"
+: >"$hold_anchor"
 env "${install_env[@]}" OPENCODE_FLEET_TESTING=1 \
   OPENCODE_FLEET_CONFIG="$anchor_config" \
-  OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK=5 \
+  OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK="${hold_anchor}" \
   "$fleet_root/scripts/install-local" --apply \
   >/dev/null 2>"$temp_root/install-anchor.err" &
 anchor_pid=$!
-wait_for_lock_held || fail 'paused local installer never took the session lock'
+wait_for_lock_held "${hold_anchor}" "$anchor_pid" "$temp_root/install-anchor.err" \
+  "paused local installer"
 cp "$tampered_config" "$anchor_config"
+release_lock_hold "$hold_anchor"
 anchor_status=0
 wait "$anchor_pid" || anchor_status=$?
 [[ "$anchor_status" -ne 0 ]] ||
@@ -682,15 +708,19 @@ jq -e '.status == "installed"' "$state_root/install.json" >/dev/null ||
 
 # Verify-then-use: every restore parameter is parsed from the record before the
 # lock, so the record bytes must be re-proved unchanged before restoration.
+hold_record="$temp_root/hold_record"
+: >"$hold_record"
 env "${install_env[@]}" OPENCODE_FLEET_TESTING=1 \
-  OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK=5 \
+  OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK="${hold_record}" \
   "$fleet_root/scripts/rollback" install --apply \
   >/dev/null 2>"$temp_root/rollback-record.err" &
 record_swap_pid=$!
-wait_for_lock_held || fail 'paused install rollback never took the session lock'
+wait_for_lock_held "${hold_record}" "$record_swap_pid" "$temp_root/rollback-record.err" \
+  "paused install rollback"
 jq '.config.backup = "" | .launcher.backup = ""' "$state_root/install.json" \
   >"$temp_root/swapped-install.json"
 cp "$temp_root/swapped-install.json" "$state_root/install.json"
+release_lock_hold "$hold_record"
 record_swap_status=0
 wait "$record_swap_pid" || record_swap_status=$?
 [[ "$record_swap_status" -ne 0 ]] ||
@@ -718,12 +748,16 @@ CLI
 chmod 700 "$tampered_archive_dir/opencode"
 tampered_archive="$temp_root/opencode-tampered.tar.gz"
 tar -C "$tampered_archive_dir" -czf "$tampered_archive" opencode
-env "${cli_env[@]}" OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK=5 \
+hold_cli="$temp_root/hold_cli"
+: >"$hold_cli"
+env "${cli_env[@]}" OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK="${hold_cli}" \
   "$fleet_root/scripts/install-opencode-cli" --archive "$swap_archive" --apply \
   >/dev/null 2>"$temp_root/cli-anchor.err" &
 cli_anchor_pid=$!
-wait_for_lock_held || fail 'paused CLI installer never took the session lock'
+wait_for_lock_held "${hold_cli}" "$cli_anchor_pid" "$temp_root/cli-anchor.err" \
+  "paused CLI installer"
 cp "$tampered_archive" "$swap_archive"
+release_lock_hold "$hold_cli"
 cli_anchor_status=0
 wait "$cli_anchor_pid" || cli_anchor_status=$?
 [[ "$cli_anchor_status" -ne 0 ]] ||
