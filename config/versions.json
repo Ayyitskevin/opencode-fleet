@@ -2,7 +2,8 @@
   "opencode": {
     "version": "1.18.4",
     "linuxX64Archive": "opencode-linux-x64.tar.gz",
-    "linuxX64Sha256": "bab463c3fb3224d388bb7cfad63f38703df9cf0be2cfd2ce8cb49d886b53a174"
+    "linuxX64Sha256": "bab463c3fb3224d388bb7cfad63f38703df9cf0be2cfd2ce8cb49d886b53a174",
+    "linuxX64Size": "59265621"
   },
   "actionsCheckout": {
     "version": "v6",

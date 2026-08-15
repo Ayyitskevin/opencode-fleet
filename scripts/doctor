@@ -309,9 +309,13 @@ fi
 
 versions_valid=false
 if jq -e '
-  (keys == ["opencode"] or (keys | sort) == ["actionsCheckout", "opencode"]) and
+  (keys | sort) == ["actionsCheckout", "opencode"] and
   (.opencode | keys | sort) ==
-    ["linuxX64Archive", "linuxX64Sha256", "version"] and
+    ["linuxX64Archive", "linuxX64Sha256", "linuxX64Size", "version"] and
+  (.opencode.linuxX64Size | type == "string" and test("^[1-9][0-9]*$")) and
+  (.actionsCheckout | keys | sort) == ["sha", "version"] and
+  (.actionsCheckout.version | type == "string" and test("^v[0-9]+$")) and
+  (.actionsCheckout.sha | type == "string" and test("^[0-9a-f]{40}$")) and
   (.opencode.version | type == "string" and
     test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
   (.opencode.linuxX64Archive | type == "string" and length > 0) and

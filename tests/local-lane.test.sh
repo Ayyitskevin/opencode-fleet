@@ -284,11 +284,17 @@ chmod 700 "$archive_dir/opencode"
 tar -C "$archive_dir" -czf "$archive" opencode
 archive_sha="$(sha256sum "$archive" | cut -d' ' -f1)"
 versions="$temp_root/versions.json"
-jq -n --arg sha "$archive_sha" '{
+archive_size="$(stat -c %s "$archive")"
+jq -n --arg sha "$archive_sha" --arg size "$archive_size" '{
   opencode: {
     version: "9.9.9",
     linuxX64Archive: "opencode-test.tar.gz",
-    linuxX64Sha256: $sha
+    linuxX64Sha256: $sha,
+    linuxX64Size: $size
+  },
+  actionsCheckout: {
+    version: "v6",
+    sha: "d23441a48e516b6c34aea4fa41551a30e30af803"
   }
 }' >"$versions"
 printf '#!/usr/bin/env bash\nprintf old-cli\n' >"$home_root/.opencode/bin/opencode"
