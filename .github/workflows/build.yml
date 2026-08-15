@@ -48,6 +48,13 @@ jobs:
 
           readonly expected_owner="Ayyitskevin"
           readonly expected_owner_id="133295304"
+          # D7: the remote draft-PR lane is documentation-and-test-only. The
+          # writable set is central authority, not a consumer choice, so the
+          # fetched policy's path allowlist is pinned to the shipped standard
+          # risk-class template (templates/policies/standard.json.tpl). Only
+          # the numeric bounds below remain narrowable by a repository.
+          readonly central_allowed_exact='["README.md"]'
+          readonly central_allowed_prefixes='["docs/","tests/"]'
           readonly event_path="${EVENT_PATH:?EVENT_PATH is required}"
           readonly output_path="${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
           readonly policy_path="${RUNNER_TEMP}/opencode-policy.json"
@@ -125,6 +132,14 @@ jobs:
               (.max_patch_bytes == (.max_patch_bytes | floor)) and
               (.max_patch_bytes >= 1 and .max_patch_bytes <= 204800)
             ' "$policy_path" >/dev/null || fail "policy schema or bounds are invalid"
+
+            jq -e \
+              --argjson allowed_exact "$central_allowed_exact" \
+              --argjson allowed_prefixes "$central_allowed_prefixes" '
+                .allowed_exact == $allowed_exact and
+                .allowed_prefixes == $allowed_prefixes
+              ' "$policy_path" >/dev/null ||
+              fail "policy path allowlist does not match the central risk-class template"
 
             while IFS= read -r value; do
               safe_policy_path "$value" exact || fail "unsafe allowed_exact path"
@@ -292,7 +307,7 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           OPENCODE_AUTO_SHARE: "false"
           OPENCODE_CONFIG_CONTENT: >-
-            {"default_agent":"build","permission":{"*":"deny","read":{"*":"allow",".env":"deny",".env.*":"deny","**/.env":"deny","**/.env.*":"deny",".netrc":"deny","**/.netrc":"deny",".npmrc":"deny","**/.npmrc":"deny",".pypirc":"deny","**/.pypirc":"deny",".git-credentials":"deny","**/.git-credentials":"deny","credentials.json":"deny","**/credentials.json":"deny","secrets.json":"deny","**/secrets.json":"deny","secrets.yaml":"deny","**/secrets.yaml":"deny","secrets.yml":"deny","**/secrets.yml":"deny","*.pem":"deny","**/*.pem":"deny","*.key":"deny","**/*.key":"deny","*credentials*":"deny","**/*credentials*":"deny","id_rsa":"deny","**/id_rsa":"deny","id_ed25519":"deny","**/id_ed25519":"deny"},"glob":"allow","grep":"deny","lsp":"deny","list":"allow","edit":{"*":"allow",".git/**":"deny",".github/**":"deny",".opencode/**":"deny",".gitattributes":"deny","**/.gitattributes":"deny","**/AGENTS.md":"deny","opencode.json":"deny","opencode.jsonc":"deny"},"external_directory":"deny"},"agent":{"build":{"permission":{"*":"deny","read":{"*":"allow",".env":"deny",".env.*":"deny","**/.env":"deny","**/.env.*":"deny",".netrc":"deny","**/.netrc":"deny",".npmrc":"deny","**/.npmrc":"deny",".pypirc":"deny","**/.pypirc":"deny",".git-credentials":"deny","**/.git-credentials":"deny","credentials.json":"deny","**/credentials.json":"deny","secrets.json":"deny","**/secrets.json":"deny","secrets.yaml":"deny","**/secrets.yaml":"deny","secrets.yml":"deny","**/secrets.yml":"deny","*.pem":"deny","**/*.pem":"deny","*.key":"deny","**/*.key":"deny","*credentials*":"deny","**/*credentials*":"deny","id_rsa":"deny","**/id_rsa":"deny","id_ed25519":"deny","**/id_ed25519":"deny"},"glob":"allow","grep":"deny","lsp":"deny","list":"allow","edit":{"*":"allow",".git/**":"deny",".github/**":"deny",".opencode/**":"deny",".gitattributes":"deny","**/.gitattributes":"deny","**/AGENTS.md":"deny","opencode.json":"deny","opencode.jsonc":"deny"},"external_directory":"deny"}}}}
+            {"default_agent":"build","permission":{"*":"deny","read":{"*":"allow",".env":"deny",".env.*":"deny","**/.env":"deny","**/.env.*":"deny",".envrc":"deny","**/.envrc":"deny",".netrc":"deny","**/.netrc":"deny",".npmrc":"deny","**/.npmrc":"deny",".pypirc":"deny","**/.pypirc":"deny",".git-credentials":"deny","**/.git-credentials":"deny","credentials.json":"deny","**/credentials.json":"deny","secrets.json":"deny","**/secrets.json":"deny","secrets.yaml":"deny","**/secrets.yaml":"deny","secrets.yml":"deny","**/secrets.yml":"deny","secrets.toml":"deny","**/secrets.toml":"deny","*.pem":"deny","**/*.pem":"deny","*.key":"deny","**/*.key":"deny","*.p12":"deny","**/*.p12":"deny","*.pfx":"deny","**/*.pfx":"deny","*.ppk":"deny","**/*.ppk":"deny","*credentials*":"deny","**/*credentials*":"deny","id_rsa":"deny","**/id_rsa":"deny","id_dsa":"deny","**/id_dsa":"deny","id_ecdsa":"deny","**/id_ecdsa":"deny","id_ecdsa_sk":"deny","**/id_ecdsa_sk":"deny","id_ed25519":"deny","**/id_ed25519":"deny","id_ed25519_sk":"deny","**/id_ed25519_sk":"deny"},"glob":"allow","grep":"deny","lsp":"deny","list":"allow","edit":{"*":"allow",".git/**":"deny",".github/**":"deny",".opencode/**":"deny",".gitattributes":"deny","**/.gitattributes":"deny","**/AGENTS.md":"deny","opencode.json":"deny","opencode.jsonc":"deny"},"external_directory":"deny"},"agent":{"build":{"permission":{"*":"deny","read":{"*":"allow",".env":"deny",".env.*":"deny","**/.env":"deny","**/.env.*":"deny",".envrc":"deny","**/.envrc":"deny",".netrc":"deny","**/.netrc":"deny",".npmrc":"deny","**/.npmrc":"deny",".pypirc":"deny","**/.pypirc":"deny",".git-credentials":"deny","**/.git-credentials":"deny","credentials.json":"deny","**/credentials.json":"deny","secrets.json":"deny","**/secrets.json":"deny","secrets.yaml":"deny","**/secrets.yaml":"deny","secrets.yml":"deny","**/secrets.yml":"deny","secrets.toml":"deny","**/secrets.toml":"deny","*.pem":"deny","**/*.pem":"deny","*.key":"deny","**/*.key":"deny","*.p12":"deny","**/*.p12":"deny","*.pfx":"deny","**/*.pfx":"deny","*.ppk":"deny","**/*.ppk":"deny","*credentials*":"deny","**/*credentials*":"deny","id_rsa":"deny","**/id_rsa":"deny","id_dsa":"deny","**/id_dsa":"deny","id_ecdsa":"deny","**/id_ecdsa":"deny","id_ecdsa_sk":"deny","**/id_ecdsa_sk":"deny","id_ed25519":"deny","**/id_ed25519":"deny","id_ed25519_sk":"deny","**/id_ed25519_sk":"deny"},"glob":"allow","grep":"deny","lsp":"deny","list":"allow","edit":{"*":"allow",".git/**":"deny",".github/**":"deny",".opencode/**":"deny",".gitattributes":"deny","**/.gitattributes":"deny","**/AGENTS.md":"deny","opencode.json":"deny","opencode.jsonc":"deny"},"external_directory":"deny"}}}}
           OPENCODE_DISABLE_AUTOUPDATE: "true"
           OPENCODE_DISABLE_CLAUDE_CODE: "true"
           OPENCODE_DISABLE_DEFAULT_PLUGINS: "true"
@@ -422,6 +437,11 @@ jobs:
           safe_changed_path() {
             local value="$1"
             local segment
+            # `read` below stops at the first newline, so a path carrying one
+            # would be split and inspected only up to that byte. Reject every
+            # line-terminating control byte before the split so the per-segment
+            # checks cannot be bypassed by the remainder of the path.
+            [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *$'\t'* ]] || return 1
             [[ -n "$value" && "$(printf '%s' "$value" | wc -c)" -le 256 ]] || return 1
             [[ "$value" != /* && "$value" != *\\* && "$value" != *//* && "$value" != */ ]] || return 1
             IFS='/' read -r -a segments <<<"$value"
@@ -544,6 +564,11 @@ jobs:
           safe_changed_path() {
             local value="$1"
             local segment
+            # `read` below stops at the first newline, so a path carrying one
+            # would be split and inspected only up to that byte. Reject every
+            # line-terminating control byte before the split so the per-segment
+            # checks cannot be bypassed by the remainder of the path.
+            [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *$'\t'* ]] || return 1
             [[ -n "$value" && "$(printf '%s' "$value" | wc -c)" -le 256 ]] || return 1
             [[ "$value" != /* && "$value" != *\\* && "$value" != *//* && "$value" != */ ]] || return 1
             IFS='/' read -r -a segments <<<"$value"
