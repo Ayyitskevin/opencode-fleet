@@ -48,11 +48,10 @@ web access, nested tasks, and direct pushes. Destructive Git operations,
 recursive deletion, and privilege escalation are deny-listed across their
 common spellings rather than proven impossible; every command that is not
 explicitly denied still requires an operator prompt, and no Bash command has
-an automatic allow rule. No Bash command has an automatic allow rule. Planning
-denies Bash entirely; review/build commands require an explicit prompt unless
-denied outright. Content-returning grep and LSP tools are denied because their
-permission checks do not inherit the read tool's credential-path exclusions;
-path-only enumeration remains available.
+an automatic allow rule. Planning denies Bash entirely; review/build commands
+require an explicit prompt unless denied outright. Content-returning grep and
+LSP tools are denied because their permission checks do not inherit the read
+tool's credential-path exclusions; path-only enumeration remains available.
 
 ## Routes and interface
 
@@ -93,9 +92,11 @@ The installed provider map is closed: it contains only `ollama`, uses
 `http://127.0.0.1:11434/v1`; `enabled_providers` is exactly `["ollama"]`.
 The launcher and installer reject extra providers, remote base URLs, alternate
 adapters, enabled-provider drift, and substituted local model routes before
-model execution or installation. Normal local and ceiling sessions also remove
-common paid-provider credentials and cloud credential-file pointers from the
-model process environment.
+model execution or installation. Every session removes paid-provider
+credentials and cloud credential-file pointers from the model process
+environment: both an explicit list of known provider variables and a sweep of
+any credential-shaped variable name present, so a provider that did not exist
+when the list was written is stripped too.
 
 Cloud requires all three conditions:
 
@@ -106,8 +107,10 @@ Cloud requires all three conditions:
 An empty allowlist is the shipped default. OpenCode is invoked once; a cloud
 error is returned as-is without a local or second-cloud retry. The explicit
 `--cloud` lane enables only the provider named by the allowlisted model and
-preserves its provider environment for that one run; this exception is never
-active for ordinary local or ceiling execution.
+preserves only that provider's credentials for that one run; every other
+provider's credentials are removed exactly as they are locally. A model whose
+provider has no declared credential mapping is refused rather than run with an
+unscrubbed environment.
 
 ## Installation
 
@@ -153,11 +156,16 @@ After installation and clone provisioning:
 
     scripts/doctor
     scripts/doctor --strict
+    scripts/doctor --local-models
 
-Doctor never prints raw remote URLs. It validates the pinned CLI install record,
-target, version, archive pin, and installed binary digest with the same
-acceptance contract as the launcher. Strict mode also treats incomplete rollout
-warnings as failure.
+Doctor never prints raw remote URLs. `--local-models` is the one check that
+reaches outside this repository: it is opt-in, read-only, and queries only the
+pinned loopback endpoint to confirm the daemon is up and every routed and
+allowlisted model is pulled. It is never part of the launch path.
+
+Doctor validates the pinned CLI install record, target, version, archive pin,
+and installed binary digest with the same acceptance contract as the launcher.
+Strict mode also treats incomplete rollout warnings as failure.
 
 ## Verification
 

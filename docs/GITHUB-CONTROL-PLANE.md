@@ -52,8 +52,8 @@ comment with the exact target SHA and workflow-run link.
 
 Both global and agent-level read policies explicitly deny common credential
 files at root and nested paths, including environment files, netrc/npm/pypi
-credentials, Git credentials, secret JSON/YAML, private keys, and SSH identity
-files. Grep and LSP are separately denied at both scopes because those
+credentials, Git credentials, secret JSON/YAML/TOML, private keys, and SSH
+identity files. Grep and LSP are separately denied at both scopes because those
 content-returning tools do not inherit the read tool's path exclusions.
 Unknown tools inherit the global deny; the remaining glob/list permissions
 enumerate paths without returning file contents.
