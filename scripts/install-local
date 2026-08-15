@@ -5,6 +5,8 @@ umask 077
 
 script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+# shellcheck source=scripts/lib/fleet-contracts.sh
+. "$fleet_root/scripts/lib/fleet-contracts.sh"
 source_config="${OPENCODE_FLEET_CONFIG:-$fleet_root/config/opencode.jsonc}"
 source_guard="${OPENCODE_FLEET_GUARD:-$fleet_root/config/runtime-guard.json}"
 source_routes="${OPENCODE_FLEET_ROUTES:-$fleet_root/config/model-routes.json}"
@@ -84,6 +86,41 @@ restore_transaction_target() {
   fi
 }
 
+# A failed transaction must leave its evidence in one place. Staged temporaries
+# live in the operator's real config and bin directories, so a failure that
+# leaves them behind litters live directories with half-installed state that
+# nothing owns and nothing cleans up. They are relocated into the transaction's
+# backup root instead, beside the rest of the preserved failed state.
+relocate_staged_temporary() {
+  local source="$1"
+  local destination="$backup_root/$2"
+
+  [[ -n "$source" && ( -e "$source" || -L "$source" ) ]] || return 0
+  [[ -d "$backup_root" && ! -L "$backup_root" ]] || return 1
+  [[ ! -e "$destination" && ! -L "$destination" ]] || return 1
+  mv -- "$source" "$destination"
+}
+
+preserve_staged_temporaries() {
+  local failed=false
+
+  relocate_staged_temporary "${config_temporary:-}" \
+    opencode.jsonc.failed-staged || failed=true
+  relocate_staged_temporary "${launcher_temporary:-}" \
+    oc.failed-staged || failed=true
+  [[ "$failed" == false ]]
+}
+
+# Installed before the transaction becomes active: a die between staging and
+# the durable record has no targets to restore, but it still owns temporaries.
+reconcile_staged_failure() {
+  local original_status="$1"
+
+  [[ "$original_status" -ne 0 ]] || return 0
+  preserve_staged_temporaries ||
+    printf 'install-local: staged temporary files could not be relocated into %s; inspect and remove them before rerunning\n' "$backup_root" >&2
+}
+
 reconcile_install_failure() {
   local original_status="$1"
   local reconciliation_failed=false
@@ -92,6 +129,7 @@ reconcile_install_failure() {
 
   [[ "${transaction_active:-false}" == true ]] || return 0
   set +e
+  preserve_staged_temporaries || reconciliation_failed=true
   restore_transaction_target "$target_config" "$config_backup" config ||
     reconciliation_failed=true
   restore_transaction_target "$target_launcher" "$launcher_backup" launcher ||
@@ -152,7 +190,16 @@ done
    ! -L "$fleet_root/scripts/oc" ]] ||
   die "canonical launcher source is not an executable regular file"
 
+# Verify-then-use: the policy gate below reads the source config, but the bytes
+# that reach the target come from a later, independent copy. The digest of the
+# exact bytes policy accepted is captured here and carried to the staging
+# comparison under the lock; comparing the staged copy against the source at
+# copy time would only prove copy fidelity, not that the source is still the
+# validated file.
+validated_config_sha256="$(sha256sum "$source_config" | cut -d' ' -f1)"
 config_json="$(sed '/^[[:space:]]*\/\//d' "$source_config")"
+[[ "$(sha256sum "$source_config" | cut -d' ' -f1)" == "$validated_config_sha256" ]] ||
+  die "staged config changed while it was being read for validation"
 jq -e '
   (keys | sort) ==
     ["$schema", "agent", "autoupdate", "default_agent", "enabled_providers",
@@ -237,6 +284,8 @@ jq -e '
     {key: "*git*push*", value: "deny"})
 ' <<<"$config_json" >/dev/null ||
   die "staged OpenCode config failed install policy"
+fleet_assert_permission_contract <<<"$config_json" ||
+  die "staged OpenCode config failed the canonical credential and shell contract"
 jq -e '
   (keys | sort) ==
     ["agent", "autoupdate", "enabled_providers", "instructions", "mcp",
@@ -303,6 +352,8 @@ jq -e '
     {key: "*git*push*", value: "deny"})
 ' "$source_guard" >/dev/null ||
   die "runtime guard failed install policy"
+fleet_assert_permission_contract <"$source_guard" ||
+  die "runtime guard failed the canonical credential and shell contract"
 jq -e '
   .schemaVersion == 1 and
   .routes == {
@@ -385,6 +436,33 @@ flock -n 9 || die "another OpenCode fleet session owns the local lane"
 for target in "$target_config" "$target_launcher" "$install_record"; do
   [[ ! -d "$target" ]] || die "installation target became a directory"
 done
+
+# D9 makes install intent durable so a power loss leaves a recoverable prepared
+# record instead of an unrecorded partial install. Rerunning the installer over
+# that record would back the prepared transaction up as this transaction's
+# "previous" state and then overwrite it, laundering crash-mixed targets into
+# the new backup set and destroying the recovery path. Recovery comes first and
+# there is no override.
+if [[ -f "$install_record" && ! -L "$install_record" ]] &&
+   [[ "$(jq -r 'if type == "object" then (.status // "") else "" end' \
+        "$install_record" 2>/dev/null || printf '')" == "prepared" ]]; then
+  die "existing install record is a prepared transaction; recover it with 'scripts/rollback install' before rerunning the installer"
+fi
+
+# Test rendezvous, not a timed sleep: the harness must be able to observe this
+# process holding the lock and mutate state underneath it. A fixed sleep makes
+# that a race -- on a loaded machine the parent can be descheduled through the
+# whole window and never see the lock held -- so the variable names a hold file
+# that this process creates a marker for and then waits to be released.
+if [[ "${OPENCODE_FLEET_TESTING:-0}" == 1 &&
+      -n "${OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK:-}" ]]; then
+  : >"${OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK}.acquired"
+  for ((pause_attempt = 0; pause_attempt < 2400; pause_attempt++)); do
+    [[ -e "$OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK" ]] || break
+    sleep 0.05
+  done
+fi
+
 install -d -m 700 "$config_dir" "$launcher_dir" \
   "$state_root/install-backups" "$backup_root"
 validate_target_parent "$target_home" "$target_config" "config target"
@@ -396,6 +474,8 @@ chmod 700 "$config_dir" "$state_root" "$state_root/install-backups" "$backup_roo
 config_backup=""
 launcher_backup=""
 record_backup=""
+config_temporary=""
+launcher_temporary=""
 if [[ -e "$target_config" || -L "$target_config" ]]; then
   config_backup="$backup_root/opencode.jsonc.previous"
   cp -a -- "$target_config" "$config_backup"
@@ -411,12 +491,12 @@ fi
 chmod -R go-rwx "$backup_root"
 
 config_temporary="$(mktemp "$config_dir/.opencode.jsonc.XXXXXX")"
+trap 'status=$?; reconcile_staged_failure "$status"; exit "$status"' EXIT
 cp -- "$source_config" "$config_temporary"
 chmod 600 "$config_temporary"
-source_config_hash="$(sha256sum "$source_config" | cut -d' ' -f1)"
 temporary_config_hash="$(sha256sum "$config_temporary" | cut -d' ' -f1)"
-[[ "$source_config_hash" == "$temporary_config_hash" ]] ||
-  die "staged config copy hash mismatch"
+[[ "$temporary_config_hash" == "$validated_config_sha256" ]] ||
+  die "staged config copy does not match the validated source bytes"
 
 launcher_temporary="$launcher_dir/.oc.$timestamp"
 [[ ! -e "$launcher_temporary" && ! -L "$launcher_temporary" ]] ||
@@ -471,6 +551,14 @@ sync -f "$install_record" "$state_root"
 if [[ "${OPENCODE_FLEET_TESTING:-0}" == 1 &&
       "${OPENCODE_FLEET_TEST_FAIL_AFTER_RECORD:-0}" == 1 ]]; then
   die "injected failure after durable install record"
+fi
+
+# Trapped failures are the easy half of D9. This hook lets the suite stop the
+# process here so it can be killed uncatchably — no trap, no reconciliation —
+# which is the power-loss window the durable prepared record exists for.
+if [[ "${OPENCODE_FLEET_TESTING:-0}" == 1 &&
+      "${OPENCODE_FLEET_TEST_STOP_AFTER_RECORD:-0}" == 1 ]]; then
+  kill -s STOP -- "$BASHPID"
 fi
 
 mv -fT -- "$config_temporary" "$target_config"

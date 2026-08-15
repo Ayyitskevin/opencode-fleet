@@ -21,6 +21,17 @@
     "model": "ollama/qwen3-coder-next:q8_0",
     "costClass": "local-ceiling"
   },
+  "localExperiments": [
+    "ollama/gpt-oss:20b",
+    "ollama/qwen3.6:27b",
+    "ollama/qwen3.6:35b",
+    "ollama/gemma4:26b",
+    "ollama/glm-4.7-flash",
+    "ollama/qwen3-vl:32b",
+    "ollama/qwen3-next:80b",
+    "ollama/gpt-oss:120b",
+    "ollama/qwen3.5:122b"
+  ],
   "cloud": {
     "enabled": false,
     "allowlist": []

@@ -5,6 +5,8 @@ umask 077
 
 script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+# shellcheck source=scripts/lib/fleet-contracts.sh
+. "$fleet_root/scripts/lib/fleet-contracts.sh"
 manifest="${OPENCODE_FLEET_MANIFEST:-$fleet_root/config/repos.json}"
 config="${OPENCODE_FLEET_CONFIG:-$fleet_root/config/opencode.jsonc}"
 guard="${OPENCODE_FLEET_GUARD:-$fleet_root/config/runtime-guard.json}"
@@ -17,30 +19,31 @@ state_root="${OPENCODE_FLEET_STATE_ROOT:-$HOME/.local/state/opencode-fleet}"
 cli_record="${OPENCODE_FLEET_CLI_RECORD:-$state_root/cli-install.json}"
 strict=false
 
+check_local_models=false
+
 usage() {
-  printf 'Usage: doctor [--strict]\n'
+  printf 'Usage: doctor [--strict] [--local-models]\n'
 }
 
-case "${1:-}" in
-  "")
-    ;;
-  --strict)
-    strict=true
-    shift
-    ;;
-  -h|--help)
-    usage
-    exit 0
-    ;;
-  *)
-    printf 'doctor: unknown argument: %s\n' "$1" >&2
-    exit 2
-    ;;
-esac
-if (($#)); then
-  printf 'doctor: unexpected argument: %s\n' "$1" >&2
-  exit 2
-fi
+while (($#)); do
+  case "$1" in
+    --strict)
+      strict=true
+      ;;
+    --local-models)
+      check_local_models=true
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'doctor: unknown argument: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 
 failures=0
 warnings=0
@@ -241,6 +244,14 @@ if jq -e . <<<"$config_json" >/dev/null 2>&1; then
   else
     fail "staged provider or fail-closed permissions"
   fi
+  # Diagnosis must accept exactly what the launcher accepts. Sharing the
+  # canonical contract is what keeps doctor from reporting a healthy fleet
+  # that oc then refuses to run.
+  if fleet_assert_permission_contract <<<"$config_json"; then
+    pass "staged credential and shell deny tables match the canonical contract"
+  else
+    fail "staged credential and shell deny tables"
+  fi
 else
   fail "staged JSONC syntax"
 fi
@@ -270,6 +281,12 @@ else
   fail "runtime guard authority"
 fi
 
+if fleet_assert_permission_contract <"$guard"; then
+  pass "runtime guard credential and shell deny tables match the canonical contract"
+else
+  fail "runtime guard credential and shell deny tables"
+fi
+
 if [[ "$config_valid" == true && "$routes_valid" == true ]]; then
   missing_route_model=false
   while IFS= read -r model; do
@@ -292,9 +309,13 @@ fi
 
 versions_valid=false
 if jq -e '
-  (keys == ["opencode"] or (keys | sort) == ["actionsCheckout", "opencode"]) and
+  (keys | sort) == ["actionsCheckout", "opencode"] and
   (.opencode | keys | sort) ==
-    ["linuxX64Archive", "linuxX64Sha256", "version"] and
+    ["linuxX64Archive", "linuxX64Sha256", "linuxX64Size", "version"] and
+  (.opencode.linuxX64Size | type == "string" and test("^[1-9][0-9]*$")) and
+  (.actionsCheckout | keys | sort) == ["sha", "version"] and
+  (.actionsCheckout.version | type == "string" and test("^v[0-9]+$")) and
+  (.actionsCheckout.sha | type == "string" and test("^[0-9a-f]{40}$")) and
   (.opencode.version | type == "string" and
     test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
   (.opencode.linuxX64Archive | type == "string" and length > 0) and
@@ -425,6 +446,44 @@ if [[ "$manifest_valid" == true ]]; then
         warn "AGENTS.md missing: $name"
       fi
     done < <(jq -r '.repositories[] | [.name, .fullName, .state] | @tsv' "$manifest")
+  fi
+fi
+
+# The likeliest failure on a practice evening is not a policy breach: it is a
+# fully validated launcher starting a model that is not there. This check is
+# opt-in, read-only, and reaches only the pinned loopback endpoint, so it never
+# becomes a dependency of the launch path.
+if [[ "$check_local_models" == true ]]; then
+  local_models_url="${OPENCODE_FLEET_MODELS_URL:-http://127.0.0.1:11434/v1/models}"
+  [[ "$local_models_url" == http://127.0.0.1:* ||
+     "$local_models_url" == http://localhost:* ]] ||
+    { printf 'doctor: model checks are loopback-only\n' >&2; exit 2; }
+  if ! command -v curl >/dev/null 2>&1; then
+    fail "curl is required for --local-models"
+  elif ! installed_models="$(curl -fsS --max-time 5 -- "$local_models_url" 2>/dev/null)"; then
+    fail "local model daemon is unreachable at $local_models_url"
+  elif ! jq -e '.data | type == "array"' <<<"$installed_models" >/dev/null 2>&1; then
+    fail "local model daemon returned an unexpected model listing"
+  else
+    pass "local model daemon is reachable"
+    if [[ "$routes_valid" == true ]]; then
+      missing_local_model=false
+      while IFS= read -r required_model; do
+        [[ -n "$required_model" ]] || continue
+        if jq -e --arg model "${required_model#ollama/}" \
+          'any(.data[]; .id == $model or (.id | split(":")[0]) == $model)' \
+          <<<"$installed_models" >/dev/null; then
+          pass "local model present: $required_model"
+        else
+          fail "local model is not pulled: $required_model"
+          missing_local_model=true
+        fi
+      done < <(jq -r '
+        [.routes[].model, .ceiling.model, (.localExperiments // [])[]] |
+        unique | .[]' "$routes")
+      [[ "$missing_local_model" == true ]] ||
+        pass "every routed and allowlisted local model is pulled"
+    fi
   fi
 fi
 

@@ -2,9 +2,18 @@
 
 set -euo pipefail
 
+# Ambient and host Git configuration must not reach the suite: insteadOf
+# rewrites, commit.gpgsign, and hooks all change observable Git behaviour.
+unset "${!GIT_CONFIG@}"
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 review_workflow="$repo_root/.github/workflows/review.yml"
 build_workflow="$repo_root/.github/workflows/build.yml"
+ci_workflow="$repo_root/.github/workflows/ci.yml"
+versions_file="$repo_root/config/versions.json"
 extractor="$repo_root/scripts/github-runtime/extract-inline.sh"
 tmp_dir="$(mktemp -d)"
 cleanup() {
@@ -42,7 +51,8 @@ extract() {
   bash -n "$destination"
 }
 
-for required in "$review_workflow" "$build_workflow" "$extractor"; do
+for required in "$review_workflow" "$build_workflow" "$ci_workflow" \
+  "$versions_file" "$extractor"; do
   [[ -f "$required" ]] || die "missing required file: $required"
 done
 pass "required workflow artifacts exist"
@@ -58,17 +68,35 @@ cmp "$tmp_dir/build-validate-model.sh" "$tmp_dir/build-validate-publish.sh" >/de
   die "model and publish validators drifted"
 pass "all runtime blocks parse and duplicated security blocks are identical"
 
+# Exit 0: a mutating POST block was found and it retries. Exit 1: found and
+# one-shot. Exit 2: no POST block matched at all, which would make the
+# assertion below vacuous, so it is reported as a distinct failure.
 post_has_retry() {
   awk '
-    /response="\$\(curl \\/ { in_post = 1 }
+    /response="\$\(curl \\/ { in_post = 1; blocks += 1 }
     in_post && /--retry/ { found = 1 }
     in_post && /\)"$/ { in_post = 0 }
-    END { exit(found ? 0 : 1) }
+    END {
+      if (blocks == 0) { exit 2 }
+      exit(found ? 0 : 1)
+    }
   ' "$1"
 }
 
-post_has_retry "$tmp_dir/review-publish.sh" && die "review POST must not retry after an ambiguous failure"
-post_has_retry "$tmp_dir/build-publish.sh" && die "build POST must not retry after an ambiguous failure"
+assert_post_is_one_shot() {
+  local publisher="$1"
+  local label="$2"
+  local status=0
+  post_has_retry "$publisher" || status="$?"
+  case "$status" in
+    0) die "$label POST must not retry after an ambiguous failure" ;;
+    1) : ;;
+    *) die "$label publisher has no recognizable mutating POST block; the retry guard inspected nothing" ;;
+  esac
+}
+
+assert_post_is_one_shot "$tmp_dir/review-publish.sh" review
+assert_post_is_one_shot "$tmp_dir/build-publish.sh" build
 pass "mutating GitHub POST calls are explicitly one-shot"
 
 if grep -nEi -- \
@@ -88,9 +116,25 @@ grep -Fq -- 'opencode-build:${RUN_ID}:${PATCH_SHA256}' "$build_workflow" ||
   die "build publication marker is missing"
 pass "static trust boundaries and deterministic draft-only publishing are present"
 
+# A renamed or reordered job would silently yield an empty slice and make every
+# negative assertion below pass while inspecting nothing. Each slice must exist,
+# start at the expected job header, and carry a job-body sentinel.
+assert_job_slice() {
+  local slice="$1"
+  local header="$2"
+  local label="$3"
+  [[ -s "$slice" ]] || die "$label job slice is empty; the job header anchor drifted"
+  [[ "$(head -n 1 "$slice")" == "$header" ]] ||
+    die "$label job slice does not start at $header; the job header anchor drifted"
+  grep -Fq -- 'runs-on:' "$slice" || die "$label job slice has no runs-on sentinel"
+}
+
 awk '/^  model:/{active=1} /^  publish:/{active=0} active{print}' "$review_workflow" >"$tmp_dir/review-model-job.yml"
 awk '/^  model:/{active=1} /^  publish:/{active=0} active{print}' "$build_workflow" >"$tmp_dir/build-model-job.yml"
 awk '/^  publish:/{active=1} active{print}' "$build_workflow" >"$tmp_dir/build-publish-job.yml"
+assert_job_slice "$tmp_dir/review-model-job.yml" '  model:' "review model"
+assert_job_slice "$tmp_dir/build-model-job.yml" '  model:' "build model"
+assert_job_slice "$tmp_dir/build-publish-job.yml" '  publish:' "build publish"
 ! grep -Eq -- 'GH_TOKEN|contents:[[:space:]]*write|pull-requests:[[:space:]]*write' "$tmp_dir/review-model-job.yml" ||
   die "review model job has GitHub write credentials"
 ! grep -Eq -- 'GH_TOKEN|contents:[[:space:]]*write|pull-requests:[[:space:]]*write' "$tmp_dir/build-model-job.yml" ||
@@ -101,6 +145,7 @@ pass "provider and GitHub write credentials are separated by job"
 
 credential_denies=(
   '.env' '.env.*' '**/.env' '**/.env.*'
+  '.envrc' '**/.envrc'
   '.netrc' '**/.netrc'
   '.npmrc' '**/.npmrc'
   '.pypirc' '**/.pypirc'
@@ -109,11 +154,19 @@ credential_denies=(
   'secrets.json' '**/secrets.json'
   'secrets.yaml' '**/secrets.yaml'
   'secrets.yml' '**/secrets.yml'
+  'secrets.toml' '**/secrets.toml'
   '*.pem' '**/*.pem'
   '*.key' '**/*.key'
+  '*.p12' '**/*.p12'
+  '*.pfx' '**/*.pfx'
+  '*.ppk' '**/*.ppk'
   '*credentials*' '**/*credentials*'
   'id_rsa' '**/id_rsa'
+  'id_dsa' '**/id_dsa'
+  'id_ecdsa' '**/id_ecdsa'
+  'id_ecdsa_sk' '**/id_ecdsa_sk'
   'id_ed25519' '**/id_ed25519'
+  'id_ed25519_sk' '**/id_ed25519_sk'
 )
 for workflow in "$review_workflow" "$build_workflow"; do
   for denied_path in "${credential_denies[@]}"; do
@@ -164,6 +217,97 @@ for uses_line in "${uses_lines[@]}"; do
 done
 pass "all third-party actions are pinned to full commit SHAs"
 
+# config/versions.json is documented as the pin for the CLI archive and the
+# workflow dependencies, but review.yml, build.yml and ci.yml each hardcode the
+# same checkout SHA and the same installer constants. Nothing compared them, so
+# a bump could land in one lane and silently leave the other on the old
+# artifact. Every hardcoded copy is pinned back to the declared file here.
+pinned_checkout_sha="$(jq -r '.actionsCheckout.sha' "$versions_file")"
+pinned_checkout_version="$(jq -r '.actionsCheckout.version' "$versions_file")"
+pinned_cli_version="$(jq -r '.opencode.version' "$versions_file")"
+pinned_cli_archive="$(jq -r '.opencode.linuxX64Archive' "$versions_file")"
+pinned_cli_sha256="$(jq -r '.opencode.linuxX64Sha256' "$versions_file")"
+[[ "$pinned_checkout_sha" =~ ^[0-9a-f]{40}$ ]] ||
+  die "config/versions.json does not pin an immutable actions/checkout SHA"
+[[ "$pinned_checkout_version" =~ ^v[0-9]+$ ]] ||
+  die "config/versions.json does not pin an actions/checkout major version"
+[[ "$pinned_cli_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+  die "config/versions.json does not pin an exact OpenCode version"
+[[ "$pinned_cli_sha256" =~ ^[0-9a-f]{64}$ ]] ||
+  die "config/versions.json does not pin an OpenCode archive SHA-256"
+[[ "$pinned_cli_archive" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+  die "config/versions.json does not pin an OpenCode archive name"
+
+mapfile -t workflow_uses < <(
+  grep -hE -- '^[[:space:]]*uses:' \
+    "$review_workflow" "$build_workflow" "$ci_workflow"
+)
+((${#workflow_uses[@]} == 4)) ||
+  die "unexpected action reference count across the three workflows"
+for uses_line in "${workflow_uses[@]}"; do
+  [[ "$uses_line" =~ uses:[[:space:]]+actions/checkout@([0-9a-f]{40})[[:space:]]+#[[:space:]]+(v[0-9]+)$ ]] ||
+    die "workflow action is not a SHA-pinned, tag-commented checkout: $uses_line"
+  [[ "${BASH_REMATCH[1]}" == "$pinned_checkout_sha" ]] ||
+    die "workflow checkout SHA ${BASH_REMATCH[1]} is not the config/versions.json pin"
+  [[ "${BASH_REMATCH[2]}" == "$pinned_checkout_version" ]] ||
+    die "workflow checkout tag ${BASH_REMATCH[2]} is not the config/versions.json pin"
+done
+pass "every workflow checkout is the exact actions/checkout pin declared in config/versions.json"
+
+declare -A workflow_archive_size=()
+for workflow in "$review_workflow" "$build_workflow"; do
+  workflow_name="$(basename "$workflow")"
+  mapfile -t install_constants < <(
+    grep -hoE 'readonly (version|expected_size|expected_sha256)="[^"]*"' "$workflow"
+  )
+  ((${#install_constants[@]} == 3)) ||
+    die "$workflow_name does not declare exactly one version, size, and sha256 installer constant"
+  declare -A installer_pin=()
+  for install_constant in "${install_constants[@]}"; do
+    constant_name="${install_constant#readonly }"
+    constant_name="${constant_name%%=*}"
+    constant_value="${install_constant#*=\"}"
+    installer_pin["$constant_name"]="${constant_value%\"}"
+  done
+  ((${#installer_pin[@]} == 3)) ||
+    die "$workflow_name repeats an installer constant instead of declaring all three"
+  [[ "${installer_pin[version]}" == "$pinned_cli_version" ]] ||
+    die "$workflow_name installs OpenCode ${installer_pin[version]}, not the config/versions.json pin"
+  [[ "${installer_pin[expected_sha256]}" == "$pinned_cli_sha256" ]] ||
+    die "$workflow_name verifies a SHA-256 that is not the config/versions.json pin"
+  [[ "${installer_pin[expected_size]}" =~ ^[1-9][0-9]*$ ]] ||
+    die "$workflow_name does not verify a positive archive byte size"
+  workflow_archive_size["$workflow_name"]="${installer_pin[expected_size]}"
+
+  mapfile -t archive_refs < <(
+    grep -hoE 'download/v\$\{version\}/[A-Za-z0-9][A-Za-z0-9._-]*' "$workflow"
+  )
+  ((${#archive_refs[@]} == 1)) ||
+    die "$workflow_name does not download exactly one versioned OpenCode archive"
+  [[ "${archive_refs[0]##*/}" == "$pinned_cli_archive" ]] ||
+    die "$workflow_name downloads ${archive_refs[0]##*/}, not the config/versions.json archive"
+done
+[[ "${workflow_archive_size[review.yml]}" == "${workflow_archive_size[build.yml]}" ]] ||
+  die "the review and build installers disagree on the OpenCode archive byte size"
+
+# The byte size is the one installer constant config/versions.json cannot carry
+# yet: scripts/oc, scripts/doctor and scripts/install-opencode-cli all pin
+# `.opencode` to exactly three keys, so adding a fourth fails every launcher and
+# installer gate until those validators accept it. Until then the two lanes are
+# pinned to each other, and the shape that explains the omission is asserted so
+# the fallback cannot pass over an unrelated schema change. Adding
+# `.opencode.linuxX64Size` automatically promotes this to a strict pin.
+pinned_cli_size="$(jq -r '.opencode.linuxX64Size // empty' "$versions_file")"
+if [[ -n "$pinned_cli_size" ]]; then
+  [[ "$pinned_cli_size" == "${workflow_archive_size[review.yml]}" ]] ||
+    die "workflow installers verify a byte size that is not the config/versions.json pin"
+else
+  jq -e '(.opencode | keys | sort) ==
+    ["linuxX64Archive", "linuxX64Sha256", "version"]' "$versions_file" >/dev/null ||
+    die "config/versions.json changed shape without pinning the archive byte size"
+fi
+pass "workflow installer constants match the config/versions.json OpenCode pin"
+
 sha="1111111111111111111111111111111111111111"
 repo="Ayyitskevin/example"
 
@@ -199,10 +343,54 @@ run_review_gate() {
     bash "$tmp_dir/review-gate.sh"
 }
 
+gate_prompt() {
+  local output_file="$1"
+  local encoded
+  encoded="$(grep -m 1 -- '^prompt_base64=' "$output_file" | cut -d= -f2-)"
+  [[ -n "$encoded" ]] || die "gate emitted no prompt"
+  printf '%s' "$encoded" | base64 --decode
+}
+
 run_review_gate "$tmp_dir/review-event.json" "$tmp_dir/review.out"
 grep -Fxq -- 'command=review' "$tmp_dir/review.out" || die "review command output is wrong"
+grep -Fxq -- 'target_kind=pull_request' "$tmp_dir/review.out" || die "review target kind output is wrong"
 grep -Fxq -- "target_sha=${sha}" "$tmp_dir/review.out" || die "review target SHA output is wrong"
 pass "review gate accepts one exact owner command on a same-repository PR SHA"
+
+jq '.comment.body = "/oc plan"' "$tmp_dir/review-event.json" >"$tmp_dir/review-plan-event.json"
+run_review_gate "$tmp_dir/review-plan-event.json" "$tmp_dir/review-plan.out"
+grep -Fxq -- 'command=plan' "$tmp_dir/review-plan.out" || die "review gate did not accept the plan command"
+grep -Fxq -- 'target_kind=pull_request' "$tmp_dir/review-plan.out" || die "plan target kind output is wrong"
+grep -Fxq -- "target_sha=${sha}" "$tmp_dir/review-plan.out" || die "plan target SHA output is wrong"
+review_plan_prompt="$(gate_prompt "$tmp_dir/review-plan.out")"
+grep -Fq -- 'read-only OpenCode plan.' <<<"$review_plan_prompt" ||
+  die "plan prompt does not carry the plan command"
+grep -Fq -- "exact target: ${sha}." <<<"$review_plan_prompt" ||
+  die "plan prompt does not pin the authorized target SHA"
+grep -Fq -- 'Analyze this pull_request and return a concise plan' <<<"$review_plan_prompt" ||
+  die "bare plan command did not synthesize its bounded default request"
+pass "review gate accepts the bare plan command and derives its bounded default request"
+
+review_default_branch="feat/wheel-dashboard-mvp"
+review_default_sha="3333333333333333333333333333333333333333"
+jq -n --arg repository "$repo" --arg branch "$review_default_branch" \
+  '{full_name: $repository, default_branch: $branch}' >"$tmp_dir/review-repo.json"
+jq -n --arg sha "$review_default_sha" '{object: {sha: $sha}}' >"$tmp_dir/review-ref.json"
+jq 'del(.issue.pull_request) | .comment.body = "/oc review: summarize the open question"' \
+  "$tmp_dir/review-event.json" >"$tmp_dir/review-issue-event.json"
+# The PR fixture stays wired: if the gate ever misclassified a plain issue as a
+# pull request it would resolve the PR head SHA and fail the assertion below.
+run_review_gate "$tmp_dir/review-issue-event.json" "$tmp_dir/review-issue.out" \
+  OPENCODE_TEST_REF_JSON="$tmp_dir/review-ref.json" \
+  OPENCODE_TEST_REPO_JSON="$tmp_dir/review-repo.json"
+grep -Fxq -- 'command=review' "$tmp_dir/review-issue.out" || die "plain issue command output is wrong"
+grep -Fxq -- 'target_kind=issue' "$tmp_dir/review-issue.out" || die "plain issue target kind output is wrong"
+grep -Fxq -- 'issue_number=17' "$tmp_dir/review-issue.out" || die "plain issue number output is wrong"
+grep -Fxq -- "target_sha=${review_default_sha}" "$tmp_dir/review-issue.out" ||
+  die "plain issue target SHA did not come from the default-branch ref"
+grep -Fq -- "exact target: ${review_default_sha}." <<<"$(gate_prompt "$tmp_dir/review-issue.out")" ||
+  die "plain issue prompt does not pin the default-branch SHA"
+pass "review gate resolves a plain issue against a slash-bearing default branch ref"
 
 jq '.comment.user.id = 9' "$tmp_dir/review-event.json" >"$tmp_dir/review-hostile-user.json"
 expect_fail "review gate rejects hostile commenter ID" \
@@ -228,7 +416,9 @@ jq -n --arg repository "$repo" '{repository: {full_name: $repository, owner: {id
   >"$tmp_dir/build-event.json"
 jq -n --arg repository "$repo" '{full_name: $repository, default_branch: "main"}' >"$tmp_dir/repo.json"
 jq -n --arg sha "$sha" '{object: {sha: $sha}}' >"$tmp_dir/ref.json"
-jq -n '{version: 1, mode: "draft-pr", allowed_exact: ["README.md"], allowed_prefixes: ["docs/"], max_files: 3, max_patch_bytes: 65536}' \
+# D7: the path allowlist is central authority pinned to the shipped standard
+# risk-class template; only the numeric bounds are narrowed by a repository.
+jq -n '{version: 1, mode: "draft-pr", allowed_exact: ["README.md"], allowed_prefixes: ["docs/", "tests/"], max_files: 3, max_patch_bytes: 65536}' \
   >"$tmp_dir/policy.json"
 
 run_build_gate() {
@@ -260,6 +450,31 @@ run_build_gate "$tmp_dir/policy.json" "$tmp_dir/build.out"
 grep -Fxq -- 'default_branch=main' "$tmp_dir/build.out" || die "build default branch output is wrong"
 grep -Fxq -- "target_sha=${sha}" "$tmp_dir/build.out" || die "build target SHA output is wrong"
 pass "build gate accepts owner dispatch on the live default-branch SHA with strict policy"
+
+# D7 is central authority: the gate must accept the shipped standard template
+# exactly, so the pinned allowlist cannot drift away from what rollout installs.
+standard_policy_template="$repo_root/templates/policies/standard.json.tpl"
+[[ -f "$standard_policy_template" ]] || die "shipped standard policy template is missing"
+grep -q -- '__[A-Z_]*__' "$standard_policy_template" &&
+  die "standard policy template gained a placeholder the gate cannot validate"
+cp "$standard_policy_template" "$tmp_dir/policy-standard.json"
+run_build_gate "$tmp_dir/policy-standard.json" "$tmp_dir/build-standard.out"
+grep -Fxq -- "target_sha=${sha}" "$tmp_dir/build-standard.out" ||
+  die "build gate rejected the shipped standard risk-class policy template"
+pass "build gate accepts the shipped standard risk-class policy template verbatim"
+
+jq '.allowed_prefixes += ["src/"]' "$tmp_dir/policy.json" >"$tmp_dir/policy-widened-prefix.json"
+expect_fail "build gate rejects a consumer policy that widens allowed prefixes" \
+  run_build_gate "$tmp_dir/policy-widened-prefix.json" "$tmp_dir/build-widened-prefix.out"
+grep -Fq -- 'policy path allowlist does not match the central risk-class template' \
+  "$tmp_dir/expected-failure.err" ||
+  die "widened allowed_prefixes was not rejected by the central D7 allowlist pin"
+jq '.allowed_exact += ["Makefile"]' "$tmp_dir/policy.json" >"$tmp_dir/policy-widened-exact.json"
+expect_fail "build gate rejects a consumer policy that widens allowed exact paths" \
+  run_build_gate "$tmp_dir/policy-widened-exact.json" "$tmp_dir/build-widened-exact.out"
+grep -Fq -- 'policy path allowlist does not match the central risk-class template' \
+  "$tmp_dir/expected-failure.err" ||
+  die "widened allowed_exact was not rejected by the central D7 allowlist pin"
 
 jq '.unexpected = true' "$tmp_dir/policy.json" >"$tmp_dir/policy-extra-key.json"
 expect_fail "build gate rejects policy extension keys" \
@@ -451,6 +666,25 @@ printf 'outside\n' >"$outside_repo/src/outside.txt"
 git -C "$outside_repo" add src/outside.txt
 expect_fail "validator rejects a path outside repository allowlists" \
   run_validator "$outside_repo" "$tmp_dir/policy.json" "$tmp_dir/outside.patch" "$tmp_dir/build-validate-model.sh"
+
+# A newline in a staged path ends the `read` that splits it into segments, so
+# every byte after it escapes the empty/dot/traversal/control segment checks.
+# The path below is allowed by prefix and passes every other guard; only the
+# pre-split control-byte rejection stops it.
+newline_repo="$tmp_dir/newline-path-repo"
+newline_path="docs/note"$'\n'"../escape.txt"
+init_repo "$newline_repo"
+mkdir -p "$newline_repo/docs/note"$'\n'".."
+printf 'escaped\n' >"$newline_repo/$newline_path"
+git -C "$newline_repo" add -- "$newline_path"
+[[ "$(git -C "$newline_repo" diff --cached --name-only -z | tr '\0' '\n' | wc -l)" -eq 2 ]] ||
+  die "newline fixture did not stage one path containing a newline"
+for validator in build-validate-model build-validate-publish; do
+  expect_fail "$validator rejects a staged path containing a newline" \
+    run_validator "$newline_repo" "$tmp_dir/policy.json" "$tmp_dir/newline.patch" "$tmp_dir/$validator.sh"
+  grep -Fq -- 'unsafe changed path' "$tmp_dir/expected-failure.err" ||
+    die "newline path was not rejected as an unsafe changed path by $validator"
+done
 
 curl() {
   local data_binary=""

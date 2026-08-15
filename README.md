@@ -34,25 +34,46 @@ private worktree and branch under the mode-700 fleet state directory, leaving
 the dedicated clone clean. Every real session gets a mode-600 run record.
 Worktrees remain available for review or reversible rollback.
 
+Every finished run records its duration and, for builds, a diffstat of the work
+it produced. `oc runs`, `oc show`, `oc diff`, and `oc stats` read that evidence
+back; `oc note` annotates a finished run with what actually happened, so
+practice with different local models accumulates instead of evaporating. All of
+these are read-only over lane-owned state except `note`, which appends to one
+record. An interrupted session — Ctrl-C is the normal way to leave a TUI —
+finalizes its own record as `interrupted` rather than claiming to be active
+forever.
+
 The runtime guard disables sharing, auto-update, external-directory access,
-web access, nested tasks, direct pushes, destructive Git operations, recursive
-deletion, and sudo. No Bash command has an automatic allow rule. Planning
-denies Bash entirely; review/build commands require an explicit prompt unless
-denied outright. Content-returning grep and LSP tools are denied because their
-permission checks do not inherit the read tool's credential-path exclusions;
-path-only enumeration remains available.
+web access, nested tasks, and direct pushes. Destructive Git operations,
+recursive deletion, and privilege escalation are deny-listed across their
+common spellings rather than proven impossible; every command that is not
+explicitly denied still requires an operator prompt, and no Bash command has
+an automatic allow rule. Planning denies Bash entirely; review/build commands
+require an explicit prompt unless denied outright. Content-returning grep and
+LSP tools are denied because their permission checks do not inherit the read
+tool's credential-path exclusions; path-only enumeration remains available.
 
 ## Routes and interface
 
     oc list
-    oc doctor [--strict]
-    oc <repository> [plan|build|review] [--ceiling | --cloud] [--dry-run]
+    oc doctor [--strict] [--local-models]
+    oc sandbox new <name>
+    oc sandbox list
+    oc sandbox <name> [plan|build|review]
+    oc runs [repository]
+    oc show <run-id>
+    oc diff <run-id>
+    oc note <run-id> <text>
+    oc stats [--model | --repo]
+    oc <repository> [plan|build|review]
+       [--ceiling | --cloud | --experiment ollama/<model>] [--dry-run]
 
 Examples:
 
     oc Icarus
     oc Icarus build
     oc Icarus review --ceiling
+    oc Icarus plan --experiment ollama/qwen3.6:35b
     OPENCODE_FLEET_CLOUD_MODEL=provider/model oc Icarus review --cloud
 
 All ordinary modes use the pinned cost-efficient
@@ -60,14 +81,36 @@ ollama/qwen3-coder:30b. --ceiling is the only route to
 ollama/qwen3-coder-next:q8_0. These local selections are deterministic and
 cannot be changed with environment model overrides.
 
+`--experiment` is the one sanctioned way to run a different local model, for
+practice and comparison. It accepts only exact `ollama/<model>` entries listed
+in `localExperiments` in config/model-routes.json, requires that model to exist
+in the staged provider catalog, may not shadow a pinned route, and is mutually
+exclusive with `--ceiling` and `--cloud`. Like every other escalation it is a
+command-line request, never an environment override, and never a fallback.
+The allowlist carries the nine staged local models that are not already pinned
+to a route; the two pinned models are rejected from it so an experiment can
+never quietly shadow the daily lane. Trim the list to taste — an entry that is
+not in the staged provider catalog, or is not pulled in Ollama, fails closed.
+
+`oc sandbox` is the throwaway practice lane. A sandbox is a private repository
+under the mode-700 fleet state directory with **no remote at all**, so it
+carries strictly less authority than any catalogued clone: there is nothing to
+push to and no GitHub identity to act as. Otherwise it is an ordinary run —
+same guard, same lock, same run records, same private build worktree, and the
+same `oc diff` and rollback. A sandbox that acquires a remote stops being a
+sandbox and is refused. Sandboxes are never deleted automatically; remove one
+by hand when you are done with it.
+
 The installed provider map is closed: it contains only `ollama`, uses
 `@ai-sdk/openai-compatible`, and points to
 `http://127.0.0.1:11434/v1`; `enabled_providers` is exactly `["ollama"]`.
 The launcher and installer reject extra providers, remote base URLs, alternate
 adapters, enabled-provider drift, and substituted local model routes before
-model execution or installation. Normal local and ceiling sessions also remove
-common paid-provider credentials and cloud credential-file pointers from the
-model process environment.
+model execution or installation. Every session removes paid-provider
+credentials and cloud credential-file pointers from the model process
+environment: both an explicit list of known provider variables and a sweep of
+any credential-shaped variable name present, so a provider that did not exist
+when the list was written is stripped too.
 
 Cloud requires all three conditions:
 
@@ -78,10 +121,16 @@ Cloud requires all three conditions:
 An empty allowlist is the shipped default. OpenCode is invoked once; a cloud
 error is returned as-is without a local or second-cloud retry. The explicit
 `--cloud` lane enables only the provider named by the allowlisted model and
-preserves its provider environment for that one run; this exception is never
-active for ordinary local or ceiling execution.
+preserves only that provider's credentials for that one run; every other
+provider's credentials are removed exactly as they are locally. A model whose
+provider has no declared credential mapping is refused rather than run with an
+unscrubbed environment.
 
 ## Installation
+
+See [docs/QUICKSTART.md](docs/QUICKSTART.md) for the ordered path from a fresh
+clone to a first session. This section is the authoritative reference for what
+each installer guarantees.
 
 Both installers preview by default. They do not download anything.
 
@@ -121,13 +170,25 @@ After installation and clone provisioning:
 
     scripts/doctor
     scripts/doctor --strict
+    scripts/doctor --local-models
 
-Doctor never prints raw remote URLs. It validates the pinned CLI install record,
-target, version, archive pin, and installed binary digest with the same
-acceptance contract as the launcher. Strict mode also treats incomplete rollout
-warnings as failure.
+Doctor never prints raw remote URLs. `--local-models` is the one check that
+reaches outside this repository: it is opt-in, read-only, and queries only the
+pinned loopback endpoint to confirm the daemon is up and every routed and
+allowlisted model is pulled. It is never part of the launch path.
+
+Doctor validates the pinned CLI install record, target, version, archive pin,
+and installed binary digest with the same acceptance contract as the launcher.
+Strict mode also treats incomplete rollout warnings as failure.
 
 ## Verification
+
+Run the gate as a non-root user; the launcher refuses to run as root and the
+gate fails fast rather than dying mid-suite. The suites neutralize ambient and
+host Git configuration, so `insteadOf` rewrites or a signing requirement in a
+personal `~/.gitconfig` cannot change their results.
+
+    scripts/check
 
     tests/manifest.test.sh
     tests/launcher.test.sh
@@ -169,9 +230,13 @@ exact recovery contract.
 - config/repos.json — repository inventory and authority class.
 - config/opencode.jsonc — staged loopback Ollama and permission config.
 - config/runtime-guard.json — launcher-injected non-negotiable guard.
-- config/model-routes.json — deterministic local and allowlisted cloud routes.
+- config/model-routes.json — deterministic local routes, the local experiment
+  allowlist, and allowlisted cloud routes.
 - config/versions.json — pinned CLI/archive hash and workflow dependencies.
-- scripts/oc — one-repository launcher.
+- scripts/oc — one-repository launcher and run-history commands.
+- scripts/lib/fleet-contracts.sh — canonical credential and shell deny tables
+  shared by the launcher, doctor, and the installer.
+- scripts/oc-completion.bash — optional Bash completion.
 - scripts/doctor — no-model installation, policy, and clone diagnostics.
 - scripts/sync-clones — one-repository dry-run-first provisioning.
 - scripts/install-* — reversible local installers.

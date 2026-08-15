@@ -52,8 +52,8 @@ comment with the exact target SHA and workflow-run link.
 
 Both global and agent-level read policies explicitly deny common credential
 files at root and nested paths, including environment files, netrc/npm/pypi
-credentials, Git credentials, secret JSON/YAML, private keys, and SSH identity
-files. Grep and LSP are separately denied at both scopes because those
+credentials, Git credentials, secret JSON/YAML/TOML, private keys, and SSH
+identity files. Grep and LSP are separately denied at both scopes because those
 content-returning tools do not inherit the read tool's path exclusions.
 Unknown tools inherit the global deny; the remaining glob/list permissions
 enumerate paths without returning file contents.
@@ -119,8 +119,12 @@ The six keys are exact; extension keys fail closed. `allowed_exact` contains rel
 
 The shipped standard policy is intentionally documentation-and-test-only.
 Source and operational-script work remains in the operator-present local lane.
-Repository allowlists can only narrow the central policy. The central validator
-rejects:
+
+The central gate pins the path allowlist to the risk-class template rather than
+trusting the consumer's copy: `allowed_exact` must equal `["README.md"]` and
+`allowed_prefixes` must equal `["docs/", "tests/"]`, so a consumer repository
+cannot widen its own remote authority beyond what D7 promises. Numeric bounds
+may still narrow. The central validator also rejects:
 
 - workflow, agent, policy, environment, key, certificate, and submodule files;
 - dependency manifests and lockfiles;

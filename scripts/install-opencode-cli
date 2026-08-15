@@ -61,6 +61,40 @@ validate_target_parent() {
   validate_path_chain "$1" "$(dirname -- "$2")" "$3 parent"
 }
 
+# A failed transaction must leave its evidence in one place. The private
+# staging directory and the staged binary live inside the operator's real
+# ~/.opencode/bin, so a failure that leaves them behind litters a live
+# directory with half-installed state. They are relocated into the
+# transaction's backup root instead, beside the rest of the preserved state.
+relocate_staged_temporary() {
+  local source="$1"
+  local destination="$backup_root/$2"
+
+  [[ -n "$source" && ( -e "$source" || -L "$source" ) ]] || return 0
+  [[ -d "$backup_root" && ! -L "$backup_root" ]] || return 1
+  [[ ! -e "$destination" && ! -L "$destination" ]] || return 1
+  mv -- "$source" "$destination"
+}
+
+preserve_staged_temporaries() {
+  local failed=false
+
+  relocate_staged_temporary "${staging_root:-}" staging.failed || failed=true
+  relocate_staged_temporary "${binary_temporary:-}" \
+    opencode.failed-staged || failed=true
+  [[ "$failed" == false ]]
+}
+
+# Installed before the transaction becomes active: a die between staging and
+# the durable record has no targets to restore, but it still owns temporaries.
+reconcile_staged_failure() {
+  local original_status="$1"
+
+  [[ "$original_status" -ne 0 ]] || return 0
+  preserve_staged_temporaries ||
+    printf 'install-opencode-cli: staged temporary files could not be relocated into %s; inspect and remove them before rerunning\n' "$backup_root" >&2
+}
+
 reconcile_cli_failure() {
   local original_status="$1"
   local reconciliation_failed=false
@@ -70,6 +104,7 @@ reconcile_cli_failure() {
 
   [[ "${transaction_active:-false}" == true ]] || return 0
   set +e
+  preserve_staged_temporaries || reconciliation_failed=true
   if [[ -e "$target_binary" || -L "$target_binary" ]]; then
     if [[ ! -e "$failed_binary" && ! -L "$failed_binary" ]]; then
       mv -- "$target_binary" "$failed_binary" || reconciliation_failed=true
@@ -126,8 +161,8 @@ while (($#)); do
   shift
 done
 
-for command_name in jq sha256sum tar mktemp install realpath stat cp mv chmod \
-  rmdir uname cut date basename dirname id sync flock; do
+for command_name in jq sha256sum tar mktemp install realpath stat cp mv rm chmod \
+  uname cut date basename dirname id sync flock; do
   command -v "$command_name" >/dev/null 2>&1 ||
     die "required command is missing: $command_name"
 done
@@ -140,9 +175,13 @@ done
 [[ "$state_root" == "$target_home/"* ]] ||
   die "state root must remain inside the selected home"
 jq -e '
-  (keys == ["opencode"] or (keys | sort) == ["actionsCheckout", "opencode"]) and
+  (keys | sort) == ["actionsCheckout", "opencode"] and
   (.opencode | keys | sort) ==
-    ["linuxX64Archive", "linuxX64Sha256", "version"] and
+    ["linuxX64Archive", "linuxX64Sha256", "linuxX64Size", "version"] and
+  (.opencode.linuxX64Size | type == "string" and test("^[1-9][0-9]*$")) and
+  (.actionsCheckout | keys | sort) == ["sha", "version"] and
+  (.actionsCheckout.version | type == "string" and test("^v[0-9]+$")) and
+  (.actionsCheckout.sha | type == "string" and test("^[0-9a-f]{40}$")) and
   (.opencode.version | type == "string" and
     test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
   (.opencode.linuxX64Archive | type == "string" and length > 0) and
@@ -218,6 +257,33 @@ flock -n 9 || die "another OpenCode fleet session owns the local lane"
 for target in "$target_binary" "$install_record"; do
   [[ ! -d "$target" ]] || die "installation target became a directory"
 done
+
+# D9 makes install intent durable so a power loss leaves a recoverable prepared
+# record instead of an unrecorded partial install. Rerunning the installer over
+# that record would back the prepared transaction up as this transaction's
+# "previous" state and then overwrite it, laundering crash-mixed targets into
+# the new backup set and destroying the recovery path. Recovery comes first and
+# there is no override.
+if [[ -f "$install_record" && ! -L "$install_record" ]] &&
+   [[ "$(jq -r 'if type == "object" then (.status // "") else "" end' \
+        "$install_record" 2>/dev/null || printf '')" == "prepared" ]]; then
+  die "existing CLI install record is a prepared transaction; recover it with 'scripts/rollback cli' before rerunning the installer"
+fi
+
+# Test rendezvous, not a timed sleep: the harness must be able to observe this
+# process holding the lock and mutate state underneath it. A fixed sleep makes
+# that a race -- on a loaded machine the parent can be descheduled through the
+# whole window and never see the lock held -- so the variable names a hold file
+# that this process creates a marker for and then waits to be released.
+if [[ "${OPENCODE_FLEET_TESTING:-0}" == 1 &&
+      -n "${OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK:-}" ]]; then
+  : >"${OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK}.acquired"
+  for ((pause_attempt = 0; pause_attempt < 2400; pause_attempt++)); do
+    [[ -e "$OPENCODE_FLEET_TEST_PAUSE_AFTER_LOCK" ]] || break
+    sleep 0.05
+  done
+fi
+
 install -d -m 700 "$target_home/.opencode" "$target_dir" \
   "$state_root/cli-backups" "$backup_root"
 validate_target_parent "$target_home" "$target_binary" "CLI target"
@@ -228,6 +294,8 @@ chmod 700 "$target_home/.opencode" "$target_dir" "$state_root" \
 
 binary_backup=""
 record_backup=""
+staging_root=""
+binary_temporary=""
 if [[ -e "$target_binary" || -L "$target_binary" ]]; then
   binary_backup="$backup_root/opencode.previous"
   cp -a -- "$target_binary" "$binary_backup"
@@ -238,12 +306,29 @@ if [[ -e "$install_record" || -L "$install_record" ]]; then
 fi
 chmod -R go-rwx "$backup_root"
 
-members="$(tar -tzf "$archive")"
+# Verify-then-use: the pin was checked against the caller's path during
+# argument validation, outside the lock, where anything may replace the file
+# afterwards. The archive is copied into the mode-700 private staging directory
+# and re-verified against the pin there, and every subsequent read — both tar
+# invocations — is anchored to that verified private copy rather than to a path
+# the caller still controls.
+staging_root="$(mktemp -d "$target_dir/.stage.XXXXXX")"
+chmod 700 "$staging_root"
+trap 'status=$?; reconcile_staged_failure "$status"; exit "$status"' EXIT
+staged_archive="$staging_root/archive.tar.gz"
+cp -- "$archive" "$staged_archive"
+chmod 600 "$staged_archive"
+staged_sha256="$(sha256sum "$staged_archive" | cut -d' ' -f1)"
+[[ "$staged_sha256" == "$expected_sha256" ]] ||
+  die "staged archive SHA-256 does not match the pin"
+
+members="$(tar -tzf "$staged_archive")"
 [[ "$members" == "opencode" || "$members" == "./opencode" ]] ||
   die "archive must contain exactly one root-level opencode binary"
-extract_dir="$(mktemp -d "$target_dir/.extract.XXXXXX")"
-chmod 700 "$extract_dir"
-tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$extract_dir"
+extract_dir="$staging_root/extract"
+install -d -m 700 "$extract_dir"
+tar -xzf "$staged_archive" --no-same-owner --no-same-permissions \
+  -C "$extract_dir"
 candidate="$extract_dir/opencode"
 [[ -f "$candidate" && ! -L "$candidate" ]] ||
   die "extracted opencode is not a regular file"
@@ -257,7 +342,8 @@ binary_temporary="$target_dir/.opencode.$timestamp"
 [[ ! -e "$binary_temporary" && ! -L "$binary_temporary" ]] ||
   die "temporary binary target already exists"
 mv -- "$candidate" "$binary_temporary"
-rmdir "$extract_dir"
+rm -rf -- "$staging_root"
+staging_root=""
 
 prepared_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 record_temporary="$(mktemp "$state_root/.cli-install.XXXXXX")"
@@ -298,6 +384,14 @@ sync -f "$install_record" "$state_root"
 if [[ "${OPENCODE_FLEET_TESTING:-0}" == 1 &&
       "${OPENCODE_FLEET_TEST_FAIL_AFTER_RECORD:-0}" == 1 ]]; then
   die "injected failure after durable CLI install record"
+fi
+
+# Trapped failures are the easy half of D9. This hook lets the suite stop the
+# process here so it can be killed uncatchably — no trap, no reconciliation —
+# which is the power-loss window the durable prepared record exists for.
+if [[ "${OPENCODE_FLEET_TESTING:-0}" == 1 &&
+      "${OPENCODE_FLEET_TEST_STOP_AFTER_RECORD:-0}" == 1 ]]; then
+  kill -s STOP -- "$BASHPID"
 fi
 
 mv -fT -- "$binary_temporary" "$target_binary"
