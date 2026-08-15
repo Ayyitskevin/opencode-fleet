@@ -21,6 +21,7 @@
     "model": "ollama/qwen3-coder-next:q8_0",
     "costClass": "local-ceiling"
   },
+  "localExperiments": [],
   "cloud": {
     "enabled": false,
     "allowlist": []

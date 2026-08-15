@@ -2,6 +2,13 @@
 
 set -euo pipefail
 
+# Ambient and host Git configuration must not reach the suite: insteadOf
+# rewrites, commit.gpgsign, and hooks all change observable Git behaviour.
+unset "${!GIT_CONFIG@}"
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+
 test_path="$(readlink -f "${BASH_SOURCE[0]}")"
 fleet_root="$(cd "$(dirname "$test_path")/.." && pwd)"
 temp_root="$(mktemp -d)"
@@ -49,6 +56,7 @@ jq -n \
   --arg googleCredentials "${GOOGLE_APPLICATION_CREDENTIALS:-}" \
   --arg openaiKey "${OPENAI_API_KEY:-}" \
   --arg opencodeKey "${OPENCODE_API_KEY:-}" \
+  --arg futureProviderKey "${SOME_FUTURE_PROVIDER_API_KEY:-}" \
   --arg sshAgent "${SSH_AUTH_SOCK:-}" \
   --arg gitCount "$GIT_CONFIG_COUNT" \
   --arg pushUrl "$GIT_CONFIG_VALUE_3" \
@@ -62,12 +70,17 @@ jq -n \
     githubToken: $githubToken, anthropicKey: $anthropicKey,
     awsAccessKey: $awsAccessKey, googleCredentials: $googleCredentials,
     openaiKey: $openaiKey, opencodeKey: $opencodeKey,
+    futureProviderKey: $futureProviderKey,
     sshAgent: $sshAgent,
     gitCount: $gitCount, pushUrl: $pushUrl, gitSsh: $gitSsh,
     noSystem: $noSystem}' >>"$FAKE_ENV_LOG"
 if [[ "$FAKE_MUTATE" == "1" ]]; then
   printf 'changed\n' >>"$2/tracked.txt"
   printf 'untracked\n' >"$2/untracked.txt"
+fi
+if [[ -n "${FAKE_SLEEP:-}" ]]; then
+  printf 'started\n' >"$FAKE_STARTED"
+  sleep "$FAKE_SLEEP"
 fi
 exit "$FAKE_EXIT_CODE"
 FAKE
@@ -118,6 +131,7 @@ common_env=(
   GOOGLE_APPLICATION_CREDENTIALS="$temp_root/cloud-credentials.json"
   OPENAI_API_KEY=must-not-reach-local-model
   OPENCODE_API_KEY=cloud-explicit-key
+  SOME_FUTURE_PROVIDER_API_KEY=must-not-reach-any-model
   SSH_AUTH_SOCK="$temp_root/agent.sock"
 )
 
@@ -196,6 +210,79 @@ jq -e '
   .costClass == "paid-cloud"
 ' <<<"$cloud_output" >/dev/null
 
+# Practising with another local model is an allowlisted escalation, not an
+# environment override: an empty allowlist is the shipped default and must
+# refuse, and an allowlisted model still has to exist in the staged catalog.
+experiment_routes="$temp_root/experiment-routes.json"
+assert_refusal_early() {
+  local label="$1"
+  local expected="$2"
+  shift 2
+  local output
+  if output="$("$@" 2>&1 >/dev/null)"; then
+    printf 'expected refusal for %s\n' "$label" >&2
+    exit 1
+  fi
+  grep -Fq -- "$expected" <<<"$output" ||
+    { printf 'refusal for %s gave the wrong reason: %s\n' "$label" "$output" >&2
+      exit 1; }
+}
+assert_refusal_early "experiment with the shipped empty allowlist" \
+  "not in the local experiment allowlist" \
+  env "${common_env[@]}" "$fleet_root/scripts/oc" Example \
+  --experiment ollama/qwen3.6:35b --dry-run
+
+jq '.localExperiments = ["ollama/qwen3.6:35b"]' \
+  "$fleet_root/config/model-routes.json" >"$experiment_routes"
+experiment_output="$(
+  env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
+    "$fleet_root/scripts/oc" Example plan --experiment ollama/qwen3.6:35b --dry-run
+)"
+jq -e '
+  .mode == "plan" and
+  .agent == "fleet-plan" and
+  .model == "ollama/qwen3.6:35b" and
+  .costClass == "local-experiment"
+' <<<"$experiment_output" >/dev/null ||
+  { printf 'allowlisted experiment model was not selected\n' >&2; exit 1; }
+
+# An allowlist entry is not enough on its own: the model must be staged.
+jq '.localExperiments = ["ollama/not-installed:7b"]' \
+  "$fleet_root/config/model-routes.json" >"$experiment_routes"
+assert_refusal_early "experiment model absent from the catalog" \
+  "absent from the staged provider catalog" \
+  env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
+  "$fleet_root/scripts/oc" Example --experiment ollama/not-installed:7b --dry-run
+
+# The daily routes stay deterministic: an experiment cannot be requested by
+# environment variable, cannot shadow a pinned route, and cannot combine with
+# another escalation.
+jq '.localExperiments = ["ollama/qwen3-coder:30b"]' \
+  "$fleet_root/config/model-routes.json" >"$experiment_routes"
+assert_refusal_early "experiment allowlist shadowing a pinned route" \
+  "model routes failed strict validation" \
+  env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
+  "$fleet_root/scripts/oc" Example --dry-run
+
+jq '.localExperiments = ["ollama/qwen3.6:35b"]' \
+  "$fleet_root/config/model-routes.json" >"$experiment_routes"
+for exclusive_flag in --ceiling --cloud; do
+  assert_refusal_early "experiment combined with $exclusive_flag" \
+    "mutually exclusive" \
+    env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
+    "$fleet_root/scripts/oc" Example --experiment ollama/qwen3.6:35b \
+    "$exclusive_flag" --dry-run
+done
+default_route_output="$(
+  env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
+    OPENCODE_FLEET_EXPERIMENT=ollama/qwen3.6:35b \
+    "$fleet_root/scripts/oc" Example --dry-run
+)"
+jq -e '.model == "ollama/qwen3-coder:30b" and .costClass == "local-mid"' \
+  <<<"$default_route_output" >/dev/null ||
+  { printf 'an environment variable changed the daily model route\n' >&2
+    exit 1; }
+
 bad_guard="$temp_root/bad-guard.json"
 jq '.permission.read["**/.env.example"] = "allow"' \
   "$fleet_root/config/runtime-guard.json" >"$bad_guard"
@@ -230,7 +317,68 @@ for guard_filter in \
     exit 1
   fi
 done
+# The credential and shell deny tables are pinned by exact content and order,
+# not merely by shape: a table reduced to its allow-everything head, a single
+# missing deny, or a reordering must each be refused, and refused for that
+# stated reason rather than incidentally.
+assert_refusal() {
+  local label="$1"
+  local expected="$2"
+  shift 2
+  local output
+  if output="$("$@" 2>&1 >/dev/null)"; then
+    printf 'expected refusal for %s\n' "$label" >&2
+    exit 1
+  fi
+  grep -Fq -- "$expected" <<<"$output" ||
+    { printf 'refusal for %s gave the wrong reason: %s\n' "$label" "$output" >&2
+      exit 1; }
+}
+
+contract_message="failed the canonical credential and shell contract"
+# Every case below still passes the older structural validator: the deny table
+# begins with an allow, ends with the push catch-all, and every remaining entry
+# denies. Only the canonical contract notices that one specific credential or
+# shell rule went missing, so these are what prove the content pinning does
+# work the shape check never did.
+guard_contract_cases=(
+  'missing-netrc|del(.permission.read[".netrc"])'
+  'missing-nested-npmrc|del(.permission.read["**/.npmrc"])'
+  'missing-credentials-glob|del(.permission.read["*credentials*"])'
+  'missing-ssh-identity|del(.permission.read["id_ed25519"])'
+  'missing-review-push-deny|del(.agent["fleet-review"].permission.bash["git push*"])'
+  'missing-build-sudo-deny|del(.agent["fleet-build"].permission.bash["sudo *"])'
+)
+for guard_contract_case in "${guard_contract_cases[@]}"; do
+  IFS='|' read -r contract_name contract_filter <<<"$guard_contract_case"
+  jq "$contract_filter" "$fleet_root/config/runtime-guard.json" >"$bad_guard"
+  jq -e '
+    (.permission.read | to_entries | .[0] == {key: "*", value: "allow"}) and
+    all(.permission.read | to_entries[1:][]; .value == "deny") and
+    (.permission.bash | to_entries | .[-1] ==
+      {key: "*git*push*", value: "deny"})
+  ' "$bad_guard" >/dev/null ||
+    { printf 'case %s no longer isolates the content contract\n' \
+        "$contract_name" >&2; exit 1; }
+  assert_refusal "guard $contract_name" "$contract_message" \
+    env "${common_env[@]}" OPENCODE_FLEET_GUARD="$bad_guard" \
+    "$fleet_root/scripts/oc" Example --dry-run
+done
+
 bad_config="$temp_root/bad-config.json"
+staged_contract_cases=(
+  'missing-pypirc|del(.permission.read[".pypirc"])'
+  'missing-secrets-yaml|del(.permission.read["**/secrets.yaml"])'
+)
+for staged_contract_case in "${staged_contract_cases[@]}"; do
+  IFS='|' read -r contract_name contract_filter <<<"$staged_contract_case"
+  sed '/^[[:space:]]*\/\//d' "$fleet_root/config/opencode.jsonc" |
+    jq "$contract_filter" >"$bad_config"
+  assert_refusal "staged $contract_name" "$contract_message" \
+    env "${common_env[@]}" OPENCODE_FLEET_CONFIG="$bad_config" \
+    "$fleet_root/scripts/oc" Example --dry-run
+done
+
 sed '/^[[:space:]]*\/\//d' "$fleet_root/config/opencode.jsonc" | \
   jq '.agent["fleet-build"].permission.bash["curl *"] = "allow"' \
   >"$bad_config"
@@ -415,12 +563,15 @@ jq -e \
     .githubToken == "" and .sshAgent == "" and
     .anthropicKey == "" and .awsAccessKey == "" and
     .googleCredentials == "" and .openaiKey == "" and .opencodeKey == "" and
+    .futureProviderKey == "" and
     ((.configContent | fromjson).enabled_providers == ["ollama"]) and
     ((.configContent | fromjson).permission.grep == "deny") and
     ((.configContent | fromjson).permission.lsp == "deny") and
     .gitCount == "4" and .pushUrl == "disabled://opencode-fleet-local" and
     .gitSsh == "/bin/false" and .noSystem == "1"
-  ' "$fake_env_log" >/dev/null
+  ' "$fake_env_log" >/dev/null ||
+  { printf 'local run environment did not match the sanitized contract\n' >&2
+    jq -s '.[-1]' "$fake_env_log" >&2; exit 1; }
 
 cp "$state_root/cli-install.json" "$temp_root/cli-install.good.json"
 jq '.binarySha256 = ("0" * 64)' "$state_root/cli-install.json" \
@@ -455,10 +606,19 @@ set -e
 [[ "$(wc -l <"$fake_log")" -eq 1 ]] ||
   { printf 'cloud failure triggered a fallback invocation\n' >&2; exit 1; }
 grep -q -- '--model opencode/test-cloud' "$fake_log"
-jq -e '
+# The cloud lane enables exactly one provider, so exactly that provider's
+# credential may survive. Every other provider's key, the GitHub token, and the
+# SSH agent must be absent from a paid run too, not only from local runs.
+jq -e -s '.[-1] |
   .opencodeKey == "cloud-explicit-key" and
+  .githubToken == "" and .sshAgent == "" and
+  .anthropicKey == "" and .awsAccessKey == "" and
+  .googleCredentials == "" and .openaiKey == "" and
+  .futureProviderKey == "" and
   ((.configContent | fromjson).enabled_providers == ["opencode"])
-' "$fake_env_log" >/dev/null
+' "$fake_env_log" >/dev/null ||
+  { printf 'cloud run received credentials beyond its one provider\n' >&2
+    jq -s '.[-1]' "$fake_env_log" >&2; exit 1; }
 jq -e '.status == "failed" and .exitCode == 37' \
   "$state_root/runs/cloud-failure/record.json" >/dev/null
 
@@ -512,4 +672,157 @@ if env "${common_env[@]}" OPENCODE_FLEET_RUN_ID=locked \
 fi
 flock -u 8
 
+# Cleanliness that Git could not report is not cleanliness: a failing status
+# must refuse the build rather than read as a clean tree.
+cp "$repository/.git/index" "$temp_root/index.good"
+printf 'corrupt' >"$repository/.git/index"
+status_refusal="$(env "${common_env[@]}" OPENCODE_FLEET_RUN_ID=status-failure \
+  "$fleet_root/scripts/oc" Example build 2>&1 >/dev/null || true)"
+cp "$temp_root/index.good" "$repository/.git/index"
+grep -Fq 'cannot determine clone cleanliness' <<<"$status_refusal" ||
+  { printf 'launcher accepted a clone whose status it could not read: %s\n' \
+      "$status_refusal" >&2; exit 1; }
+
+# Ctrl-C is the ordinary way to leave a session, so an interrupted run must
+# still finalize its own evidence instead of claiming to be active forever.
+started_marker="$temp_root/model-started"
+# Job control matters here: with the monitor disabled bash sets SIGINT to
+# SIG_IGN for asynchronous commands, so an untrappable INT would make the
+# Ctrl-C case silently vacuous. Monitor mode also gives the job its own
+# process group, which is what a terminal signals.
+set -m
+run_until_started() {
+  local run_id="$1"
+  shift
+  rm -f "$started_marker"
+  env "${common_env[@]}" \
+    FAKE_SLEEP=60 FAKE_STARTED="$started_marker" \
+    OPENCODE_FLEET_RUN_ID="$run_id" \
+    "$fleet_root/scripts/oc" Example "$@" >/dev/null 2>&1 &
+  interrupted_pid=$!
+  local waited=0
+  while [[ ! -f "$started_marker" ]]; do
+    sleep 0.05
+    waited=$((waited + 1))
+    if ((waited > 400)); then
+      printf 'fake model never started for %s\n' "$run_id" >&2
+      kill -KILL -"$interrupted_pid" 2>/dev/null || true
+      exit 1
+    fi
+  done
+}
+
+signal_cases=(
+  "interrupt-term|TERM|15"
+  "interrupt-int|INT|2"
+  "interrupt-hup|HUP|1"
+)
+for signal_case in "${signal_cases[@]}"; do
+  IFS='|' read -r signal_run_id signal_name signal_number <<<"$signal_case"
+  run_until_started "$signal_run_id" plan
+  kill -"$signal_name" -"$interrupted_pid" 2>/dev/null ||
+    kill -"$signal_name" "$interrupted_pid"
+  signal_status=0
+  { wait "$interrupted_pid" || signal_status=$?; } 2>/dev/null
+  [[ "$signal_status" -eq $((128 + signal_number)) ]] ||
+    { printf 'interrupted launcher exit status was %s for %s\n' \
+        "$signal_status" "$signal_name" >&2; exit 1; }
+  jq -e \
+    --arg signal "$signal_name" \
+    --argjson exitCode $((128 + signal_number)) '
+      .status == "interrupted" and
+      .interruptedBy == $signal and
+      .exitCode == $exitCode and
+      (.endedAt | type == "string" and length > 0)
+    ' "$state_root/runs/$signal_run_id/record.json" >/dev/null ||
+    { printf 'interrupted run record was not finalized for %s\n' \
+        "$signal_name" >&2
+      cat "$state_root/runs/$signal_run_id/record.json" >&2
+      exit 1; }
+done
+set +m
+
+# The lane must be usable again immediately: the lock is released and a new
+# run with a fresh identity succeeds.
+exec 7>"$state_root/session.lock"
+flock -n 7 ||
+  { printf 'session lock was not released by an interrupted run\n' >&2; exit 1; }
+flock -u 7
+exec 7>&-
+env "${common_env[@]}" OPENCODE_FLEET_RUN_ID=after-interrupt \
+  "$fleet_root/scripts/oc" Example plan >/dev/null
+jq -e '.status == "completed" and .exitCode == 0' \
+  "$state_root/runs/after-interrupt/record.json" >/dev/null
+
+# A die between provisioning and execution must leave a reconciled record, not
+# a run directory that claims to still be provisioning.
+install -d -m 700 "$state_root/worktrees/example/collide-build"
+if env "${common_env[@]}" OPENCODE_FLEET_RUN_ID=collide-build \
+  "$fleet_root/scripts/oc" Example build >/dev/null 2>&1; then
+  printf 'colliding private worktree was accepted\n' >&2
+  exit 1
+fi
+jq -e '
+  .status == "aborted" and
+  (.endedAt | type == "string" and length > 0) and
+  (.durationSeconds | type == "number")
+' "$state_root/runs/collide-build/record.json" >/dev/null ||
+  { printf 'aborted run left an unreconciled record\n' >&2; exit 1; }
+
+# Run records and preserved worktrees are only useful if they can be read back.
+# These subcommands are read-only over lane-owned state, so a run must survive
+# being inspected byte-for-byte unchanged.
+env "${common_env[@]}" FAKE_MUTATE=1 OPENCODE_FLEET_RUN_ID=history-build \
+  "$fleet_root/scripts/oc" Example build >/dev/null
+history_record="$state_root/runs/history-build/record.json"
+jq -e '
+  .status == "completed" and
+  (.durationSeconds | type == "number") and
+  .diffstat.files == 1 and .diffstat.insertions == 1 and
+  .diffstat.untrackedFiles == 1
+' "$history_record" >/dev/null ||
+  { printf 'build run did not record duration and diffstat\n' >&2
+    jq . "$history_record" >&2; exit 1; }
+
+runs_before="$(sha256sum "$history_record" | cut -d' ' -f1)"
+runs_table="$(env "${common_env[@]}" "$fleet_root/scripts/oc" runs)"
+grep -q 'history-build' <<<"$runs_table" ||
+  { printf 'oc runs did not list a recorded run\n' >&2; exit 1; }
+grep -q 'history-build' \
+  <<<"$(env "${common_env[@]}" "$fleet_root/scripts/oc" runs Example)" ||
+  { printf 'oc runs ignored its repository filter\n' >&2; exit 1; }
+[[ -z "$(env "${common_env[@]}" "$fleet_root/scripts/oc" runs Nonexistent)" ]] ||
+  { printf 'oc runs matched an unrelated repository\n' >&2; exit 1; }
+env "${common_env[@]}" "$fleet_root/scripts/oc" show history-build |
+  jq -e '.runId == "history-build"' >/dev/null ||
+  { printf 'oc show did not return the run record\n' >&2; exit 1; }
+env "${common_env[@]}" "$fleet_root/scripts/oc" diff history-build |
+  grep -q '^+changed$' ||
+  { printf 'oc diff did not show the run worktree changes\n' >&2; exit 1; }
+[[ "$(sha256sum "$history_record" | cut -d' ' -f1)" == "$runs_before" ]] ||
+  { printf 'a read-only subcommand mutated a run record\n' >&2; exit 1; }
+
+env "${common_env[@]}" "$fleet_root/scripts/oc" note history-build \
+  'qwen3-coder planned well but missed the test layout' >/dev/null
+jq -e '
+  (.notes | length) == 1 and
+  (.notes[0].note | test("missed the test layout")) and
+  (.notes[0].at | type == "string" and length > 0)
+' "$history_record" >/dev/null ||
+  { printf 'oc note did not append an operator note\n' >&2; exit 1; }
+stats_table="$(env "${common_env[@]}" "$fleet_root/scripts/oc" stats)"
+grep -q 'ollama/qwen3-coder:30b' <<<"$stats_table" ||
+  { printf 'oc stats did not aggregate by model\n' >&2; exit 1; }
+grep -q 'Example' \
+  <<<"$(env "${common_env[@]}" "$fleet_root/scripts/oc" stats --repo)" ||
+  { printf 'oc stats --repo did not aggregate by repository\n' >&2; exit 1; }
+for unsafe_run in '../escape' 'no-such-run'; do
+  if env "${common_env[@]}" "$fleet_root/scripts/oc" show "$unsafe_run" \
+    >/dev/null 2>&1; then
+    printf 'oc show accepted an invalid run ID: %s\n' "$unsafe_run" >&2
+    exit 1
+  fi
+done
+
 printf 'launcher tests passed\n'
+

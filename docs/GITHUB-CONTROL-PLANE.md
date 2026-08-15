@@ -119,8 +119,12 @@ The six keys are exact; extension keys fail closed. `allowed_exact` contains rel
 
 The shipped standard policy is intentionally documentation-and-test-only.
 Source and operational-script work remains in the operator-present local lane.
-Repository allowlists can only narrow the central policy. The central validator
-rejects:
+
+The central gate pins the path allowlist to the risk-class template rather than
+trusting the consumer's copy: `allowed_exact` must equal `["README.md"]` and
+`allowed_prefixes` must equal `["docs/", "tests/"]`, so a consumer repository
+cannot widen its own remote authority beyond what D7 promises. Numeric bounds
+may still narrow. The central validator also rejects:
 
 - workflow, agent, policy, environment, key, certificate, and submodule files;
 - dependency manifests and lockfiles;

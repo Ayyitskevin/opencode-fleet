@@ -5,6 +5,8 @@ umask 077
 
 script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+# shellcheck source=scripts/lib/fleet-contracts.sh
+. "$fleet_root/scripts/lib/fleet-contracts.sh"
 manifest="${OPENCODE_FLEET_MANIFEST:-$fleet_root/config/repos.json}"
 config="${OPENCODE_FLEET_CONFIG:-$fleet_root/config/opencode.jsonc}"
 guard="${OPENCODE_FLEET_GUARD:-$fleet_root/config/runtime-guard.json}"
@@ -18,18 +20,27 @@ usage() {
   cat <<'USAGE'
 Usage:
   oc list
-  oc doctor [--strict]
-  oc <repository> [plan|build|review] [--ceiling | --cloud] [--dry-run]
+  oc doctor [--strict] [--local-models]
+  oc runs [repository]
+  oc show <run-id>
+  oc diff <run-id>
+  oc note <run-id> <text>
+  oc stats [--model | --repo]
+  oc <repository> [plan|build|review]
+     [--ceiling | --cloud | --experiment ollama/<model>] [--dry-run]
 
 Examples:
   oc Icarus plan
   oc Icarus build
   oc Icarus review --ceiling
+  oc Icarus plan --experiment ollama/qwen3.6:35b
   OPENCODE_FLEET_CLOUD_MODEL=provider/model oc Icarus build --cloud
 
 Local modes use the pinned cost-efficient coder. --ceiling is the only route to
-the pinned local ceiling. Cloud use requires both an enabled cloud policy and
-an exact model allowlist entry in config/model-routes.json.
+the pinned local ceiling. --experiment runs another local model, and accepts
+only models listed in localExperiments in config/model-routes.json. Cloud use
+requires both an enabled cloud policy and an exact model allowlist entry in
+config/model-routes.json.
 USAGE
 }
 
@@ -93,7 +104,16 @@ validate_routes() {
       test("^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$") and
       (startswith("ollama/") | not)
     ) and
-    (.cloud.allowlist | length == (unique | length))
+    (.cloud.allowlist | length == (unique | length)) and
+    ((.localExperiments // []) | type == "array") and
+    all((.localExperiments // [])[];
+      type == "string" and
+      test("^ollama/[A-Za-z0-9._:-]+$")
+    ) and
+    ((.localExperiments // []) | length == (unique | length)) and
+    (((.localExperiments // []) - [.routes.plan.model, .routes.build.model,
+      .routes.review.model, .ceiling.model]) ==
+      (.localExperiments // []))
   ' "$routes" >/dev/null || die "model routes failed strict validation"
 }
 
@@ -186,6 +206,8 @@ validate_runtime_guard() {
     (.agent["fleet-build"].permission.bash | to_entries | .[-1] ==
       {key: "*git*push*", value: "deny"})
   ' "$guard" >/dev/null || die "runtime guard failed strict semantic validation"
+  fleet_assert_permission_contract <"$guard" ||
+    die "runtime guard failed the canonical credential and shell contract"
 }
 
 validate_staged_config() {
@@ -280,6 +302,8 @@ validate_staged_config() {
     (.agent["fleet-build"].permission.bash | to_entries | .[-1] ==
       {key: "*git*push*", value: "deny"})
   ' <<<"$config_json" >/dev/null || die "staged config failed strict semantic validation"
+  fleet_assert_permission_contract <<<"$config_json" ||
+    die "staged config failed the canonical credential and shell contract"
 }
 
 validate_versions() {
@@ -424,32 +448,157 @@ ensure_private_directory() {
   [[ "$canonical" == "$path" ]] || die "state root must be canonical and contain no symlink"
 }
 
+update_run_record() {
+  local temporary
+
+  temporary="$(mktemp "$run_dir/.record.XXXXXX")"
+  jq "$@" "$record_path" >"$temporary"
+  chmod 600 "$temporary"
+  mv -f -- "$temporary" "$record_path"
+}
+
 write_run_record() {
   local status="$1"
   local exit_code="${2:-}"
   local ended_at="${3:-}"
-  local temporary
+  local signal="${4:-}"
 
-  temporary="$(mktemp "$run_dir/.record.XXXXXX")"
   if [[ -n "$exit_code" ]]; then
-    jq \
+    update_run_record \
       --arg status "$status" \
       --argjson exitCode "$exit_code" \
       --arg endedAt "$ended_at" \
-      '.status = $status | .exitCode = $exitCode | .endedAt = $endedAt' \
-      "$record_path" >"$temporary"
+      --arg signal "$signal" \
+      '.status = $status | .exitCode = $exitCode | .endedAt = $endedAt |
+       if $signal == "" then . else .interruptedBy = $signal end'
   else
-    jq --arg status "$status" '.status = $status' "$record_path" >"$temporary"
+    update_run_record --arg status "$status" '.status = $status'
   fi
-  chmod 600 "$temporary"
-  mv -f -- "$temporary" "$record_path"
 }
+
+# What a run cost and what it produced is the whole point of keeping records
+# for practice: without it there is no way to learn which local model is good
+# at what. Both are additive optional fields, so schemaVersion stays 1.
+record_run_outcome() {
+  local duration=$(( $(date -u +%s) - run_started_epoch ))
+  local numstat="" files=0 insertions=0 deletions=0
+
+  [[ "$duration" -ge 0 ]] || duration=0
+  update_run_record --argjson durationSeconds "$duration" \
+    '.durationSeconds = $durationSeconds'
+  [[ -n "${worktree_path:-}" && -d "${worktree_path:-}" &&
+     -n "${base_commit:-}" ]] || return 0
+  numstat="$(git -C "$worktree_path" diff --numstat "$base_commit" 2>/dev/null)" ||
+    return 0
+  while read -r added removed _; do
+    [[ -n "${added:-}" ]] || continue
+    files=$((files + 1))
+    [[ "$added" == "-" ]] || insertions=$((insertions + added))
+    [[ "$removed" == "-" ]] || deletions=$((deletions + removed))
+  done <<<"$numstat"
+  # Tracked edits and brand-new files are both real model output, but a diff
+  # against the base commit can only see the tracked half. Counting untracked
+  # files separately keeps the number honest instead of silently low.
+  local untracked=0
+  untracked="$(git -C "$worktree_path" ls-files --others --exclude-standard |
+    grep -c '' || true)"
+  update_run_record \
+    --argjson files "$files" \
+    --argjson insertions "$insertions" \
+    --argjson deletions "$deletions" \
+    --argjson untracked "${untracked:-0}" \
+    '.diffstat = {files: $files, insertions: $insertions,
+      deletions: $deletions, untrackedFiles: $untracked}'
+}
+
+# A run record is durable evidence, so it must never outlive the process while
+# still claiming the run is in progress. The epilogue finalizes an ordinary
+# return; this reconciler covers every other exit — a die between provisioning
+# and execution, or a signal delivered while the model owns the terminal.
+# Ctrl-C is the normal way to leave a session, so this is the common path, not
+# the exceptional one.
+run_record_finalized=false
+run_record_signal=""
+# Defaulted here, not at the model invocation: a run aborted during
+# provisioning still reconciles through the same path, and an unbound variable
+# under `set -u` would kill the trap that exists to finalize the record.
+run_started_epoch="$(date -u +%s)"
+
+finalize_run_record() {
+  local status="$1"
+  local exit_code="$2"
+
+  [[ "$run_record_finalized" == false ]] || return 0
+  run_record_finalized=true
+  write_run_record "$status" "$exit_code" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_record_signal"
+  record_run_outcome || true
+}
+
+reconcile_run_record() {
+  local exit_code="$?"
+
+  [[ "$run_record_finalized" == false ]] || return 0
+  [[ -n "${record_path:-}" && -f "${record_path:-}" ]] || return 0
+  if [[ -n "$run_record_signal" ]]; then
+    finalize_run_record interrupted "$exit_code"
+  else
+    finalize_run_record aborted "$exit_code"
+  fi
+}
+
+trap_run_signal() {
+  local name="$1"
+  local number="$2"
+
+  run_record_signal="$name"
+  trap - INT TERM HUP
+  finalize_run_record interrupted $((128 + number))
+  # Re-raise so the caller observes a genuine signal death, not a plain exit.
+  kill -s "$name" -- "$BASHPID" 2>/dev/null
+  exit $((128 + number))
+}
+
+# Usage needs no policy file and no dependency: it must answer even on a
+# machine where nothing is installed yet.
+command_name="${1:-}"
+case "$command_name" in
+  ""|-h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
 
 for dependency in jq git realpath flock install mktemp stat chmod mv date id \
   sha256sum cut sed env; do
   require_command "$dependency"
 done
 [[ "$(id -u)" -ne 0 ]] || die "refusing to run OpenCode as root"
+
+# Diagnosis is dispatched before policy validation. Every validator below is a
+# single fail-closed die, so validating first would make the diagnostic tool
+# unreachable in exactly the broken-fleet case it exists to explain. doctor
+# performs its own validation and reports every defect instead of the first.
+if [[ "$command_name" == "doctor" ]]; then
+  shift
+  exec "$fleet_root/scripts/doctor" "$@"
+fi
+
+# Every OPENCODE_FLEET_* override redirects policy, catalog, or lane state.
+# STATE_ROOT relocates the global session lock, so an override left exported in
+# a shell would silently split the lane instead of serializing it; MANIFEST and
+# WORKSPACE_ROOT redirect which clone is opened. Production uses the canonical
+# paths only.
+if [[ "${OPENCODE_FLEET_TESTING:-0}" != "1" ]]; then
+  for override in OPENCODE_FLEET_MANIFEST OPENCODE_FLEET_CONFIG \
+    OPENCODE_FLEET_GUARD OPENCODE_FLEET_ROUTES OPENCODE_FLEET_VERSIONS \
+    OPENCODE_FLEET_BIN OPENCODE_FLEET_CLI_RECORD OPENCODE_FLEET_STATE_ROOT \
+    OPENCODE_FLEET_WORKSPACE_ROOT; do
+    [[ -z "${!override:-}" ]] ||
+      die "policy, catalog, and lane-state overrides are test-only: $override"
+  done
+fi
+
 [[ -r "$manifest" ]] || die "repository manifest is not readable"
 [[ -r "$config" ]] || die "staged OpenCode config is not readable"
 [[ -r "$guard" ]] || die "runtime guard is not readable"
@@ -461,19 +610,116 @@ validate_runtime_guard
 validate_staged_config
 validate_versions
 
-command_name="${1:-}"
+if [[ "$command_name" == "list" ]]; then
+  jq -r '.repositories[] | [.name, .state, .risk, .githubMode] | @tsv' "$manifest"
+  exit 0
+fi
+
+# Run records and preserved worktrees were write-only evidence: rich, private,
+# and unreadable without hand-inspecting JSON paths. These subcommands are
+# read-only over lane-owned state and add no authority — no run is started, no
+# clone is touched, and nothing is ever pushed.
+runs_root="$state_root/runs"
+
+resolve_run_record() {
+  local candidate="${1:-}"
+
+  [[ -n "$candidate" ]] || die "a run ID is required"
+  [[ "$candidate" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    die "run ID contains unsafe characters"
+  run_dir="$runs_root/$candidate"
+  record_path="$run_dir/record.json"
+  [[ -d "$run_dir" && ! -L "$run_dir" ]] || die "no such run: $candidate"
+  [[ -f "$record_path" && ! -L "$record_path" ]] ||
+    die "run has no readable record: $candidate"
+}
+
+collect_run_records() {
+  local record
+  run_records=()
+  [[ -d "$runs_root" ]] || return 0
+  for record in "$runs_root"/*/record.json; do
+    [[ -f "$record" && ! -L "$record" ]] || continue
+    run_records+=("$record")
+  done
+}
+
 case "$command_name" in
-  ""|-h|--help|help)
-    usage
-    exit 0
-    ;;
-  list)
-    jq -r '.repositories[] | [.name, .state, .risk, .githubMode] | @tsv' "$manifest"
-    exit 0
-    ;;
-  doctor)
+  runs)
     shift
-    exec "$fleet_root/scripts/doctor" "$@"
+    run_filter="${1:-}"
+    collect_run_records
+    [[ "${#run_records[@]}" -gt 0 ]] || exit 0
+    run_rows="$(jq -r --arg filter "${run_filter,,}" '
+      select($filter == "" or (.repository | ascii_downcase) == $filter) |
+      [.runId, .repository, .mode, .model, .status,
+       (.durationSeconds // "-" | tostring),
+       (if .diffstat
+          then "+\(.diffstat.insertions)/-\(.diffstat.deletions)"
+          else "-" end),
+       .createdAt] | @tsv
+    ' "${run_records[@]}" | sort)"
+    # A filter that matches nothing prints nothing, header included: an empty
+    # result must stay empty for anything reading this.
+    [[ -n "$run_rows" ]] || exit 0
+    printf 'RUN\tREPOSITORY\tMODE\tMODEL\tSTATUS\tSECONDS\tDIFF\tCREATED\n'
+    printf '%s\n' "$run_rows"
+    exit 0
+    ;;
+  show)
+    shift
+    resolve_run_record "${1:-}"
+    jq . "$record_path"
+    exit 0
+    ;;
+  diff)
+    shift
+    resolve_run_record "${1:-}"
+    run_worktree="$(jq -r '.worktreePath // ""' "$record_path")"
+    run_base="$(jq -r '.baseCommit // ""' "$record_path")"
+    [[ -n "$run_worktree" ]] ||
+      die "only build runs have a worktree to diff"
+    [[ -d "$run_worktree" ]] ||
+      die "the run worktree is no longer present"
+    [[ -n "$run_base" ]] || die "run record has no base commit"
+    exec git -C "$run_worktree" diff "$run_base"
+    ;;
+  note)
+    shift
+    resolve_run_record "${1:-}"
+    shift
+    note_text="$*"
+    [[ -n "$note_text" ]] || die "a note requires text"
+    note_status="$(jq -r '.status' "$record_path")"
+    [[ "$note_status" != "provisioning" && "$note_status" != "active" ]] ||
+      die "refusing to annotate a run that is still in progress"
+    update_run_record \
+      --arg note "$note_text" \
+      --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '.notes = ((.notes // []) + [{at: $at, note: $note}])'
+    exit 0
+    ;;
+  stats)
+    shift
+    stats_key="model"
+    case "${1:-}" in
+      ""|--model) ;;
+      --repo) stats_key="repository" ;;
+      *) die "unknown argument: $1" ;;
+    esac
+    collect_run_records
+    [[ "${#run_records[@]}" -gt 0 ]] || { printf 'no runs recorded\n'; exit 0; }
+    printf '%s\tRUNS\tCOMPLETED\tMEAN_SECONDS\tINSERTIONS\tDELETIONS\n' \
+      "${stats_key^^}"
+    jq -s -r --arg key "$stats_key" '
+      group_by(.[$key])[] |
+      [.[0][$key], length,
+       (map(select(.status == "completed")) | length),
+       ((map(.durationSeconds // 0) | add) / length | floor),
+       (map(.diffstat.insertions // 0) | add),
+       (map(.diffstat.deletions // 0) | add)] | @tsv
+    ' "${run_records[@]}"
+    exit 0
     ;;
 esac
 
@@ -487,6 +733,7 @@ fi
 
 use_ceiling=false
 use_cloud=false
+experiment_model=""
 dry_run=false
 while (($#)); do
   case "$1" in
@@ -495,6 +742,14 @@ while (($#)); do
       ;;
     --cloud)
       use_cloud=true
+      ;;
+    --experiment)
+      shift
+      (($#)) || die "--experiment requires an ollama/<model> argument"
+      experiment_model="$1"
+      ;;
+    --experiment=*)
+      experiment_model="${1#--experiment=}"
       ;;
     --dry-run)
       dry_run=true
@@ -510,8 +765,12 @@ while (($#)); do
   shift
 done
 
-[[ "$use_ceiling" != true || "$use_cloud" != true ]] ||
-  die "--ceiling and --cloud are mutually exclusive"
+selected_routes=0
+[[ "$use_ceiling" != true ]] || selected_routes=$((selected_routes + 1))
+[[ "$use_cloud" != true ]] || selected_routes=$((selected_routes + 1))
+[[ -z "$experiment_model" ]] || selected_routes=$((selected_routes + 1))
+[[ "$selected_routes" -le 1 ]] ||
+  die "--ceiling, --cloud, and --experiment are mutually exclusive"
 
 matches="$(
   jq -c --arg query "${repository_query,,}" '
@@ -551,6 +810,19 @@ cost_class="$(jq -r --arg mode "$mode" '.routes[$mode].costClass' "$routes")"
 if [[ "$use_ceiling" == true ]]; then
   model="$(jq -r '.ceiling.model' "$routes")"
   cost_class="$(jq -r '.ceiling.costClass' "$routes")"
+elif [[ -n "$experiment_model" ]]; then
+  # Practising with another local model is an explicit, allowlisted escalation
+  # in the same shape as --ceiling and --cloud: never an environment override,
+  # never a fallback, and never off the pinned loopback provider.
+  jq -e --arg model "$experiment_model" \
+    '(.localExperiments // []) | index($model) != null' "$routes" >/dev/null ||
+    die "requested model is not in the local experiment allowlist"
+  sed '/^[[:space:]]*\/\//d' "$config" |
+    jq -e --arg model "${experiment_model#ollama/}" \
+      '.provider.ollama.models[$model] != null' >/dev/null ||
+    die "experiment model is absent from the staged provider catalog"
+  model="$experiment_model"
+  cost_class="local-experiment"
 elif [[ "$use_cloud" == true ]]; then
   [[ "$(jq -r '.cloud.enabled' "$routes")" == "true" ]] ||
     die "cloud routing is disabled by policy"
@@ -564,8 +836,9 @@ elif [[ "$use_cloud" == true ]]; then
 fi
 
 dirty=false
-[[ -z "$(git -C "$repository_path" status --porcelain=v1 --untracked-files=all)" ]] ||
-  dirty=true
+status_output="$(git -C "$repository_path" status --porcelain=v1 --untracked-files=all)" ||
+  die "cannot determine clone cleanliness"
+[[ -z "$status_output" ]] || dirty=true
 current_branch="$(git -C "$repository_path" symbolic-ref --quiet --short HEAD || true)"
 base_commit="$(git -C "$repository_path" rev-parse --verify HEAD 2>/dev/null)" ||
   die "catalogued clone has no valid HEAD"
@@ -609,11 +882,6 @@ if [[ "$dry_run" == true ]]; then
   exit 0
 fi
 
-if [[ "${OPENCODE_FLEET_TESTING:-0}" != "1" ]]; then
-  [[ -z "${OPENCODE_FLEET_BIN:-}" && -z "${OPENCODE_FLEET_CLI_RECORD:-}" &&
-     -z "${OPENCODE_FLEET_VERSIONS:-}" ]] ||
-    die "CLI binary, record, and version overrides are test-only"
-fi
 validate_pinned_cli
 
 ensure_private_directory "$state_root"
@@ -647,15 +915,12 @@ if [[ "$mode" == "build" ]]; then
   worktree_parent="$state_root/worktrees/${repository_name,,}"
   ensure_private_directory "$worktree_parent"
   worktree_path="$worktree_parent/$run_id"
-  [[ ! -e "$worktree_path" && ! -L "$worktree_path" ]] ||
-    die "private run worktree already exists"
   run_branch="opencode/build/$run_id"
-  git check-ref-format "refs/heads/$run_branch" >/dev/null 2>&1 ||
-    die "generated run branch is invalid"
   execution_path="$worktree_path"
 fi
 
 created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+record_temporary="$(mktemp "$run_dir/.record.XXXXXX")"
 jq -n \
   --arg runId "$run_id" \
   --arg repository "$repository_name" \
@@ -688,13 +953,27 @@ jq -n \
     runBranch: $runBranch,
     createdAt: $createdAt,
     status: "provisioning"
-  }' >"$record_path"
-chmod 600 "$record_path"
+  }' >"$record_temporary"
+chmod 600 "$record_temporary"
+mv -f -- "$record_temporary" "$record_path"
+
+# The record now exists, so every later exit path has something to reconcile.
+trap 'trap_run_signal INT 2' INT
+trap 'trap_run_signal TERM 15' TERM
+trap 'trap_run_signal HUP 1' HUP
+trap reconcile_run_record EXIT
+
+if [[ "$mode" == "build" ]]; then
+  [[ ! -e "$worktree_path" && ! -L "$worktree_path" ]] ||
+    die "private run worktree already exists"
+  git check-ref-format "refs/heads/$run_branch" >/dev/null 2>&1 ||
+    die "generated run branch is invalid"
+fi
 
 if [[ "$mode" == "build" ]]; then
   if ! git -C "$repository_path" worktree add --quiet \
     -b "$run_branch" "$worktree_path" "$base_commit"; then
-    write_run_record "provision-failed"
+    finalize_run_record "provision-failed" 1
     die "private run worktree provisioning failed"
   fi
 fi
@@ -705,60 +984,89 @@ runtime_config_dir="$runtime_home/.config/opencode"
 install -d -m 700 "$runtime_home" "$runtime_home/.config" \
   "$runtime_home/.cache" "$runtime_home/.local/share" \
   "$runtime_home/.local/state" "$runtime_config_dir"
-provider_env_sanitizers=()
+# A denylist of provider credentials cannot be complete: it is only ever as
+# current as the day it was written. The explicit names below document the
+# providers known today; the pattern sweep closes the same door for every
+# credential-shaped variable that exists in this environment, including ones
+# from providers that did not exist when this was written.
+provider_credential_names=(
+  AI21_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
+  AWS_ACCESS_KEY_ID AWS_CONFIG_FILE AWS_CONTAINER_CREDENTIALS_FULL_URI
+  AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_DEFAULT_PROFILE AWS_PROFILE
+  AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SHARED_CREDENTIALS_FILE
+  AWS_WEB_IDENTITY_TOKEN_FILE AZURE_API_KEY AZURE_CLIENT_ID
+  AZURE_CLIENT_SECRET AZURE_OPENAI_API_KEY AZURE_OPENAI_ENDPOINT
+  AZURE_TENANT_ID BEDROCK_API_KEY CEREBRAS_API_KEY COHERE_API_KEY
+  DASHSCOPE_API_KEY DATABRICKS_TOKEN DEEPINFRA_API_KEY DEEPSEEK_API_KEY
+  FIREWORKS_API_KEY GEMINI_API_KEY GOOGLE_API_KEY
+  GOOGLE_APPLICATION_CREDENTIALS GOOGLE_GENERATIVE_AI_API_KEY GROQ_API_KEY
+  HF_TOKEN HUGGINGFACE_API_KEY MISTRAL_API_KEY MOONSHOT_API_KEY
+  NVIDIA_API_KEY OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_PROJECT
+  OPENCODE_API_KEY OPENROUTER_API_KEY PERPLEXITY_API_KEY REPLICATE_API_TOKEN
+  TOGETHER_API_KEY VERTEXAI_PROJECT XAI_API_KEY
+)
+
+provider_credential_patterns=(
+  '*_ACCESS_KEY' '*_ACCESS_KEY_ID' '*_APIKEY' '*_API_KEY' '*_AUTH_TOKEN'
+  '*_CREDENTIALS' '*_CREDENTIALS_FILE' '*_PASSWORD' '*_PRIVATE_KEY'
+  '*_SECRET' '*_SECRET_ACCESS_KEY' '*_SECRET_KEY' '*_SESSION_TOKEN' '*_TOKEN'
+)
+
+# The explicit cloud lane enables exactly one provider, so exactly that
+# provider's credentials survive. An allowlisted model whose provider has no
+# declared mapping fails closed rather than falling back to passing everything.
+cloud_provider_credentials() {
+  case "$1" in
+    anthropic) printf '%s\n' ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ;;
+    openai) printf '%s\n' OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID \
+      OPENAI_PROJECT ;;
+    opencode) printf '%s\n' OPENCODE_API_KEY ;;
+    openrouter) printf '%s\n' OPENROUTER_API_KEY ;;
+    google) printf '%s\n' GEMINI_API_KEY GOOGLE_API_KEY \
+      GOOGLE_GENERATIVE_AI_API_KEY ;;
+    groq) printf '%s\n' GROQ_API_KEY ;;
+    mistral) printf '%s\n' MISTRAL_API_KEY ;;
+    deepseek) printf '%s\n' DEEPSEEK_API_KEY ;;
+    xai) printf '%s\n' XAI_API_KEY ;;
+    *) return 1 ;;
+  esac
+}
+
+declare -A sanitized_credentials=()
+for credential_name in "${provider_credential_names[@]}"; do
+  sanitized_credentials["$credential_name"]=1
+done
+while IFS='=' read -r -d '' credential_name _; do
+  [[ "$credential_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+  for credential_pattern in "${provider_credential_patterns[@]}"; do
+    # shellcheck disable=SC2053
+    if [[ "$credential_name" == $credential_pattern ]]; then
+      sanitized_credentials["$credential_name"]=1
+      break
+    fi
+  done
+done < <(env -0)
+
 if [[ "$use_cloud" == true ]]; then
   cloud_provider="${model%%/*}"
   [[ "$cloud_provider" =~ ^[A-Za-z0-9._-]+$ ]] ||
     die "allowlisted cloud model has an invalid provider identifier"
+  mapfile -t cloud_credentials < <(cloud_provider_credentials "$cloud_provider")
+  [[ "${#cloud_credentials[@]}" -gt 0 ]] ||
+    die "allowlisted cloud provider has no declared credential mapping"
+  for credential_name in "${cloud_credentials[@]}"; do
+    unset "sanitized_credentials[$credential_name]"
+  done
   guard_content="$(jq -c --arg provider "$cloud_provider" \
     '.enabled_providers = [$provider]' "$guard")"
 else
   guard_content="$(jq -c '.enabled_providers = ["ollama"]' "$guard")"
-  provider_env_sanitizers=(
-    -u AI21_API_KEY
-    -u ANTHROPIC_API_KEY
-    -u AWS_ACCESS_KEY_ID
-    -u AWS_CONFIG_FILE
-    -u AWS_CONTAINER_CREDENTIALS_FULL_URI
-    -u AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
-    -u AWS_DEFAULT_PROFILE
-    -u AWS_PROFILE
-    -u AWS_SECRET_ACCESS_KEY
-    -u AWS_SESSION_TOKEN
-    -u AWS_SHARED_CREDENTIALS_FILE
-    -u AWS_WEB_IDENTITY_TOKEN_FILE
-    -u AZURE_API_KEY
-    -u AZURE_CLIENT_ID
-    -u AZURE_CLIENT_SECRET
-    -u AZURE_OPENAI_API_KEY
-    -u AZURE_OPENAI_ENDPOINT
-    -u AZURE_TENANT_ID
-    -u BEDROCK_API_KEY
-    -u CEREBRAS_API_KEY
-    -u COHERE_API_KEY
-    -u DATABRICKS_TOKEN
-    -u DEEPSEEK_API_KEY
-    -u FIREWORKS_API_KEY
-    -u GEMINI_API_KEY
-    -u GOOGLE_API_KEY
-    -u GOOGLE_APPLICATION_CREDENTIALS
-    -u GOOGLE_GENERATIVE_AI_API_KEY
-    -u GROQ_API_KEY
-    -u HF_TOKEN
-    -u HUGGINGFACE_API_KEY
-    -u MISTRAL_API_KEY
-    -u OPENAI_API_KEY
-    -u OPENAI_BASE_URL
-    -u OPENAI_ORG_ID
-    -u OPENAI_PROJECT
-    -u OPENCODE_API_KEY
-    -u OPENROUTER_API_KEY
-    -u PERPLEXITY_API_KEY
-    -u REPLICATE_API_TOKEN
-    -u TOGETHER_API_KEY
-    -u XAI_API_KEY
-  )
 fi
+
+provider_env_sanitizers=()
+for credential_name in "${!sanitized_credentials[@]}"; do
+  provider_env_sanitizers+=(-u "$credential_name")
+done
 
 printf 'run:        %s\n' "$run_id"
 printf 'repository: %s (%s)\n' "$repository_name" "$repository_risk"
@@ -769,6 +1077,7 @@ printf 'source:     %s\n' "$repository_path"
 printf 'execution:  %s\n' "$execution_path"
 printf 'record:     %s\n' "$record_path"
 
+run_started_epoch="$(date -u +%s)"
 set +e
 env \
   "${provider_env_sanitizers[@]}" \
@@ -817,10 +1126,9 @@ env \
 exit_code=$?
 set -e
 
-ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if [[ "$exit_code" -eq 0 ]]; then
-  write_run_record "completed" "$exit_code" "$ended_at"
+  finalize_run_record "completed" "$exit_code"
 else
-  write_run_record "failed" "$exit_code" "$ended_at"
+  finalize_run_record "failed" "$exit_code"
 fi
 exit "$exit_code"

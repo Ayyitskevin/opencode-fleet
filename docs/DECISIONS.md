@@ -93,3 +93,62 @@ Grep and LSP are separately denied because their permission checks do not
 reapply those read-path exclusions and can return repository content. The
 remaining allowed enumeration tools return paths, not file contents; unknown
 tools inherit the fail-closed default.
+
+## D12 — Practising with another local model is an allowlisted escalation
+
+D8 originally treated any model other than the pinned route and ceiling as a
+configuration error. That kept the daily lane deterministic but left the staged
+provider catalog unreachable, so deliberate practice with a different local
+model had no sanctioned path at all and the only way to try one was to edit the
+route table and defeat strict validation.
+
+`--experiment ollama/<model>` is that path, in the same shape as `--ceiling`
+and `--cloud`: an explicit command-line request, checked against an exact
+`localExperiments` allowlist in config/model-routes.json, required to exist in
+the staged provider catalog, forbidden from shadowing a pinned route, and
+mutually exclusive with the other escalations. The shipped allowlist is empty.
+
+D8's actual invariants are unchanged: only the Ollama provider, only the mickey
+loopback URL, `enabled_providers` exactly `["ollama"]`, no environment model
+override, and no fallback. What is amended is only the claim that alternate
+local models are errors; on free local compute, the cost the pin was protecting
+against does not exist.
+
+## D13 — A record that outlives its process must not lie
+
+Installers reconcile their transaction records through traps (D9), but the
+launcher did not, so an ordinary Ctrl-C left a run record permanently claiming
+to be `active` with no exit code or end time. Records are durable evidence, and
+evidence that is wrong is worse than evidence that is missing.
+
+Every run now finalizes its own record on any exit: `completed` or `failed`
+from the model's status, `interrupted` with the signal when a session is
+signalled, `aborted` when the launcher dies between provisioning and execution.
+The record is created before any provisioning failure can occur, so a run
+directory never exists without one.
+
+## D14 — Run evidence is readable, and publication stays human
+
+Run records and preserved build worktrees were write-only. `oc runs`, `oc show`,
+`oc diff`, `oc stats`, and `oc note` make that evidence usable — all read-only
+over lane-owned private state except the note append, none of them starting a
+run, touching a catalogued clone, or gaining any authority the launcher did not
+already have.
+
+Promotion is deliberately not automated. No fleet script pushes anywhere; a
+finished run branch is reviewed with `oc diff` and published by the operator by
+hand. That boundary is the point, not an omission.
+
+## D15 — Policy contracts are pinned by content, not by shape
+
+The credential read table and the shell deny tables were validated
+structurally: the first entry allows, every later entry denies, the last bash
+entry is the push catch-all. That is vacuously true of a table with no
+credential entries left in it, so silently deleting most credential denials
+passed every gate.
+
+`scripts/lib/fleet-contracts.sh` holds those tables once, by exact content and
+exact order, and the launcher, doctor, and installer all assert against it.
+Order is part of the contract because OpenCode resolves permissions by pattern
+order. Diagnosis now accepts exactly what the launcher accepts, so doctor can
+no longer report a healthy fleet that `oc` refuses to run.

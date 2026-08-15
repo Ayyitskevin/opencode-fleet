@@ -2,6 +2,13 @@
 
 set -euo pipefail
 
+# Ambient and host Git configuration must not reach the suite: insteadOf
+# rewrites, commit.gpgsign, and hooks all change observable Git behaviour.
+unset "${!GIT_CONFIG@}"
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+
 test_path="$(readlink -f "${BASH_SOURCE[0]}")"
 fleet_root="$(cd "$(dirname "$test_path")/.." && pwd)"
 manifest="$fleet_root/config/repos.json"

@@ -5,30 +5,79 @@ set -euo pipefail
 script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
 
-for script in \
-  "$fleet_root/scripts/check" \
-  "$fleet_root/scripts/doctor" \
-  "$fleet_root/scripts/github-rollout" \
-  "$fleet_root/scripts/github-runtime/extract-inline.sh" \
-  "$fleet_root/scripts/install-local" \
-  "$fleet_root/scripts/install-opencode-cli" \
-  "$fleet_root/scripts/oc" \
-  "$fleet_root/scripts/render-callers" \
-  "$fleet_root/scripts/rollback" \
-  "$fleet_root/scripts/sync-clones" \
-  "$fleet_root/tests/launcher.test.sh" \
-  "$fleet_root/tests/local-lane.test.sh" \
-  "$fleet_root/tests/manifest.test.sh" \
-  "$fleet_root/tests/rollout.test.sh" \
-  "$fleet_root/tests/workflow-security.test.sh"; do
-  bash -n "$script"
+die() {
+  printf 'check: %s\n' "$*" >&2
+  exit 1
+}
+
+[[ "$(id -u)" -ne 0 ]] ||
+  die 'run the acceptance gate as a non-root user (scripts/oc refuses root)'
+
+# The inventory is discovered, never enumerated: a new script or test must not
+# be able to escape the gate by being forgotten here. Unrecognized file types
+# fail closed rather than being skipped silently.
+syntax_check() {
+  local path="$1"
+  local first_line
+
+  [[ -f "$path" ]] || return 0
+
+  case "$path" in
+    *.json)
+      jq -e . "$path" >/dev/null || die "invalid JSON: $path"
+      return 0
+      ;;
+    *.bash | *.sh)
+      bash -n "$path"
+      return 0
+      ;;
+  esac
+
+  first_line="$(head -n 1 -- "$path")"
+  case "$first_line" in
+    '#!'*bash* | '#!'*/sh | '#!'*/sh\ *)
+      bash -n "$path"
+      ;;
+    *)
+      die "unrecognized file in the acceptance inventory: $path"
+      ;;
+  esac
+}
+
+shopt -s nullglob
+for path in \
+  "$fleet_root"/scripts/* \
+  "$fleet_root"/scripts/lib/* \
+  "$fleet_root"/scripts/github-runtime/* \
+  "$fleet_root"/tests/*.test.sh \
+  "$fleet_root"/tests/fixtures/*; do
+  syntax_check "$path"
 done
 
-bash -n "$fleet_root/tests/fixtures/fake-gh-rollout"
-bash -n "$fleet_root/tests/fixtures/fake-opencode-pure"
+# Known suites run in dependency order; anything newly added runs after them so
+# a new test file is executed by the gate without editing this script.
+ordered_suites=(
+  manifest.test.sh
+  launcher.test.sh
+  local-lane.test.sh
+  workflow-security.test.sh
+  rollout.test.sh
+)
 
-bash "$fleet_root/tests/manifest.test.sh"
-bash "$fleet_root/tests/launcher.test.sh"
-bash "$fleet_root/tests/local-lane.test.sh"
-bash "$fleet_root/tests/workflow-security.test.sh"
-bash "$fleet_root/tests/rollout.test.sh"
+declare -A is_ordered=()
+for suite in "${ordered_suites[@]}"; do
+  is_ordered["$suite"]=1
+  [[ -f "$fleet_root/tests/$suite" ]] ||
+    die "expected suite is missing: tests/$suite"
+done
+
+for suite in "${ordered_suites[@]}"; do
+  bash "$fleet_root/tests/$suite"
+done
+
+for path in "$fleet_root"/tests/*.test.sh; do
+  suite="$(basename "$path")"
+  [[ -z "${is_ordered[$suite]:-}" ]] || continue
+  bash "$path"
+done
+shopt -u nullglob
