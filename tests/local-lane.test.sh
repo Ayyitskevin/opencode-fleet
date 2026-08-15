@@ -3,6 +3,13 @@
 set -euo pipefail
 umask 077
 
+# Ambient and host Git configuration must not reach the suite: insteadOf
+# rewrites, commit.gpgsign, and hooks all change observable Git behaviour.
+unset "${!GIT_CONFIG@}"
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+
 test_path="$(readlink -f "${BASH_SOURCE[0]}")"
 fleet_root="$(cd "$(dirname "$test_path")/.." && pwd)"
 temp_root="$(mktemp -d)"
@@ -83,7 +90,7 @@ env "${provision_env[@]}" "$fleet_root/scripts/sync-clones" \
 dedicated_clone="$workspace/Example"
 [[ -d "$dedicated_clone/.git" && ! -L "$dedicated_clone/.git" ]] ||
   { printf 'independent clone was not created\n' >&2; exit 1; }
-dedicated_origin="$(git -C "$dedicated_clone" remote get-url origin)"
+dedicated_origin="$(git -C "$dedicated_clone" config --get remote.origin.url)"
 [[ "$dedicated_origin" == "git@github.com:Ayyitskevin/Example.git" ]] ||
   { printf 'provisioned origin is not canonical\n' >&2; exit 1; }
 commit="$(git -C "$source_clone" rev-parse HEAD)"
