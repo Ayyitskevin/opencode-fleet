@@ -232,7 +232,7 @@ jq '.localExperiments = []' "$fleet_root/config/model-routes.json" \
 assert_refusal_early "experiment against an empty allowlist" \
   "not in the local experiment allowlist" \
   env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
-  "$fleet_root/scripts/oc" Example --experiment ollama/qwen3.6:35b --dry-run
+  "$fleet_root/scripts/oc" Example --experiment ollama/qwen3.8:27b --dry-run
 # The shipped allowlist is not a blanket permit: a model outside it is refused
 # even though other models are allowed.
 assert_refusal_early "experiment outside the shipped allowlist" \
@@ -240,16 +240,16 @@ assert_refusal_early "experiment outside the shipped allowlist" \
   env "${common_env[@]}" "$fleet_root/scripts/oc" Example \
   --experiment ollama/not-allowlisted:1b --dry-run
 
-jq '.localExperiments = ["ollama/qwen3.6:35b"]' \
+jq '.localExperiments = ["ollama/qwen3.8:27b"]' \
   "$fleet_root/config/model-routes.json" >"$experiment_routes"
 experiment_output="$(
   env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
-    "$fleet_root/scripts/oc" Example plan --experiment ollama/qwen3.6:35b --dry-run
+    "$fleet_root/scripts/oc" Example plan --experiment ollama/qwen3.8:27b --dry-run
 )"
 jq -e '
   .mode == "plan" and
   .agent == "fleet-plan" and
-  .model == "ollama/qwen3.6:35b" and
+  .model == "ollama/qwen3.8:27b" and
   .costClass == "local-experiment"
 ' <<<"$experiment_output" >/dev/null ||
   { printf 'allowlisted experiment model was not selected\n' >&2; exit 1; }
@@ -272,18 +272,18 @@ assert_refusal_early "experiment allowlist shadowing a pinned route" \
   env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
   "$fleet_root/scripts/oc" Example --dry-run
 
-jq '.localExperiments = ["ollama/qwen3.6:35b"]' \
+jq '.localExperiments = ["ollama/qwen3.8:27b"]' \
   "$fleet_root/config/model-routes.json" >"$experiment_routes"
 for exclusive_flag in --ceiling --cloud; do
   assert_refusal_early "experiment combined with $exclusive_flag" \
     "mutually exclusive" \
     env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
-    "$fleet_root/scripts/oc" Example --experiment ollama/qwen3.6:35b \
+    "$fleet_root/scripts/oc" Example --experiment ollama/qwen3.8:27b \
     "$exclusive_flag" --dry-run
 done
 default_route_output="$(
   env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
-    OPENCODE_FLEET_EXPERIMENT=ollama/qwen3.6:35b \
+    OPENCODE_FLEET_EXPERIMENT=ollama/qwen3.8:27b \
     "$fleet_root/scripts/oc" Example --dry-run
 )"
 jq -e '.model == "ollama/qwen3-coder:30b" and .costClass == "local-mid"' \
@@ -443,7 +443,7 @@ for config_mutation in extra-enabled-provider grep-allow lsp-allow unknown-conte
 done
 
 bad_routes="$temp_root/bad-routes.json"
-jq '.routes.plan.model = "ollama/qwen3.6:35b"' \
+jq '.routes.plan.model = "ollama/qwen3.8:27b"' \
   "$fleet_root/config/model-routes.json" >"$bad_routes"
 if env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$bad_routes" \
   "$fleet_root/scripts/oc" Example --dry-run >/dev/null 2>&1; then
