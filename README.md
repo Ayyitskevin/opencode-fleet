@@ -102,10 +102,12 @@ path (plan/review) as an interactive run, under the same guard, lock, and
 sanitized environment. Output is captured into the run record so a
 non-interactive practice run leaves reviewable evidence alongside its diffstat.
 It is the invocation shape `oc compare` will build on; on its own it is the
-way to run a model against a task without holding a terminal. The pinned
-OpenCode binary's non-interactive behaviour under the fleet's isolated runtime
-is not yet verified against the pinned version, so treat a `--prompt` run
-against the real binary as experimental until that check is done.
+way to run a model against a task without holding a terminal. The
+non-interactive `opencode run --pure --dir` shape was smoke-tested under the
+fleet's isolated runtime (sanitized environment, `--pure`, injected guard)
+against the installed 1.18.18 binary: a trivial reply and a `fleet-build`
+file-write task both completed without hanging. The fleet pins 1.18.4, so
+confirm on the pinned binary before relying on it in production.
 
 `oc compare` runs one `--prompt` task across N local models so practice
 compounds into a record of which model is good at what. It is a local-only
@@ -119,8 +121,8 @@ widening any boundary. The global lock serializes the runs; compare itself
 holds no lock and creates no worktree. The runs are reviewed afterwards with
 `oc diff <run-id>` and `oc show <run-id>`, and the comparison table compare
 prints (model, status, duration, diffstat, run) is read back from the same
-records. The same experimental caveat as `--prompt` applies until the
-non-interactive shape is verified against the pinned binary.
+records. The same 1.18.18-smoke-tested / pinned-1.18.4-unconfirmed caveat as
+`--prompt` applies.
 
 The staged catalog deliberately holds only models that can drive an agent.
 Embedding models, safety classifiers, and single-domain models are left out
