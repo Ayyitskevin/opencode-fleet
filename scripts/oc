@@ -625,16 +625,10 @@ fi
 # STATE_ROOT relocates the global session lock, so an override left exported in
 # a shell would silently split the lane instead of serializing it; MANIFEST and
 # WORKSPACE_ROOT redirect which clone is opened. Production uses the canonical
-# paths only.
-if [[ "${OPENCODE_FLEET_TESTING:-0}" != "1" ]]; then
-  for override in OPENCODE_FLEET_MANIFEST OPENCODE_FLEET_CONFIG \
-    OPENCODE_FLEET_GUARD OPENCODE_FLEET_ROUTES OPENCODE_FLEET_VERSIONS \
-    OPENCODE_FLEET_BIN OPENCODE_FLEET_CLI_RECORD OPENCODE_FLEET_STATE_ROOT \
-    OPENCODE_FLEET_WORKSPACE_ROOT; do
-    [[ -z "${!override:-}" ]] ||
-      die "policy, catalog, and lane-state overrides are test-only: $override"
-  done
-fi
+# paths only. The override list and check live in fleet-contracts.sh so every
+# fleet script enforces the same boundary.
+{ fleet_offending="$(fleet_offending_override)"; } ||
+  die "policy, catalog, and lane-state overrides are test-only: $fleet_offending"
 
 [[ -r "$manifest" ]] || die "repository manifest is not readable"
 [[ -r "$config" ]] || die "staged OpenCode config is not readable"

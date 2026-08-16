@@ -281,3 +281,41 @@ fleet_assert_permission_contract() {
     --argjson bashBuild "$(fleet_bash_table build)" \
     "$(fleet_permission_contract)" >/dev/null
 }
+
+# The OPENCODE_FLEET_* environment overrides that redirect policy, catalog, or
+# lane state. STATE_ROOT relocates the global session lock; HOME relocates the
+# selected home (and therefore the lock's default location); the rest redirect
+# which policy file, catalog, binary, record, or workspace a script acts on.
+# None are legitimate in production -- they exist so the suite can point every
+# script at temporary state. A stray override left exported in a shell would
+# silently split the lane or redirect a mutation, so every fleet script rejects
+# them unless OPENCODE_FLEET_TESTING=1 is set.
+#
+# OPENCODE_FLEET_CLOUD_MODEL is intentionally absent: it is the documented
+# operator env for the --cloud lane, not a test override. OPENCODE_FLEET_RUN_ID
+# is gated separately by the launcher at its own call site.
+FLEET_PRODUCTION_OVERRIDES=(
+  OPENCODE_FLEET_MANIFEST
+  OPENCODE_FLEET_CONFIG
+  OPENCODE_FLEET_GUARD
+  OPENCODE_FLEET_ROUTES
+  OPENCODE_FLEET_VERSIONS
+  OPENCODE_FLEET_BIN
+  OPENCODE_FLEET_CLI_RECORD
+  OPENCODE_FLEET_STATE_ROOT
+  OPENCODE_FLEET_WORKSPACE_ROOT
+  OPENCODE_FLEET_HOME
+)
+
+# Print the first production override that is set, to stdout, and return 1; or
+# print nothing and return 0 when every override is unset or testing mode is on.
+# Callers die with their own prefix, so this function stays prefix-free and
+# usable from scripts (like doctor) that do not define a die().
+fleet_offending_override() {
+  [[ "${OPENCODE_FLEET_TESTING:-0}" == "1" ]] && return 0
+  local override
+  for override in "${FLEET_PRODUCTION_OVERRIDES[@]}"; do
+    [[ -z "${!override:-}" ]] || { printf '%s' "$override"; return 1; }
+  done
+  return 0
+}

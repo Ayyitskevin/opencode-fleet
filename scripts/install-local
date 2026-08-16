@@ -179,6 +179,12 @@ for command_name in jq realpath install mktemp sha256sum stat cp mv ln chmod sed
 done
 [[ "$(id -u)" -ne 0 ]] || die "refusing to install OpenCode as root"
 
+# The installer mutates fleet config and acquires the global session lock. A
+# stray STATE_ROOT or HOME would acquire the lock at a different root than the
+# launcher and silently split the lane, so reject production overrides first.
+{ fleet_offending="$(fleet_offending_override)"; } ||
+  die "policy, catalog, and lane-state overrides are test-only: $fleet_offending"
+
 [[ -d "$target_home" && ! -L "$target_home" &&
    "$(realpath -e "$target_home")" == "$target_home" ]] ||
   die "target home must be an existing canonical directory"

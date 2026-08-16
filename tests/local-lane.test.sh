@@ -134,6 +134,7 @@ git -C "$contended_source" commit -qm "initial"
 git -C "$contended_source" remote add origin git@github.com:Ayyitskevin/Contended.git
 
 provision_env=(
+  OPENCODE_FLEET_TESTING=1
   OPENCODE_FLEET_HOME="$home_root"
   OPENCODE_FLEET_MANIFEST="$manifest"
   OPENCODE_FLEET_WORKSPACE_ROOT="$workspace"
@@ -144,7 +145,7 @@ sync_bad_home="$temp_root/sync-bad-home"
 sync_bad_outside="$temp_root/sync-bad-outside"
 mkdir -p "$sync_bad_home" "$sync_bad_outside"
 ln -s "$sync_bad_outside" "$sync_bad_home/.local"
-if env \
+if env OPENCODE_FLEET_TESTING=1 \
   OPENCODE_FLEET_HOME="$sync_bad_home" \
   OPENCODE_FLEET_MANIFEST="$manifest" \
   OPENCODE_FLEET_WORKSPACE_ROOT="$workspace" \
@@ -185,6 +186,7 @@ printf '#!/usr/bin/env bash\nprintf previous-launcher\n' >"$home_root/.local/bin
 chmod 700 "$home_root/.local/bin/oc"
 
 install_env=(
+  OPENCODE_FLEET_TESTING=1
   OPENCODE_FLEET_HOME="$home_root"
   OPENCODE_FLEET_STATE_ROOT="$state_root"
 )
@@ -369,7 +371,7 @@ bad_home="$temp_root/bad-home"
 bad_outside="$temp_root/bad-outside"
 mkdir -p "$bad_home" "$bad_outside"
 ln -s "$bad_outside" "$bad_home/.config"
-if env OPENCODE_FLEET_HOME="$bad_home" \
+if env OPENCODE_FLEET_TESTING=1 OPENCODE_FLEET_HOME="$bad_home" \
   OPENCODE_FLEET_STATE_ROOT="$bad_home/.local/state/opencode-fleet" \
   "$fleet_root/scripts/install-local" --apply >/dev/null 2>&1; then
   printf 'symlinked config parent was accepted\n' >&2
@@ -382,7 +384,7 @@ bad_cache_home="$temp_root/bad-cache-home"
 bad_cache_outside="$temp_root/bad-cache-outside"
 mkdir -p "$bad_cache_home" "$bad_cache_outside/opencode"
 ln -s "$bad_cache_outside" "$bad_cache_home/.cache"
-if env OPENCODE_FLEET_HOME="$bad_cache_home" \
+if env OPENCODE_FLEET_TESTING=1 OPENCODE_FLEET_HOME="$bad_cache_home" \
   OPENCODE_FLEET_STATE_ROOT="$bad_cache_home/.local/state/opencode-fleet" \
   "$fleet_root/scripts/install-local" --apply >/dev/null 2>&1; then
   printf 'symlinked hardening parent was accepted\n' >&2
@@ -799,5 +801,72 @@ grep -q 'old-cli' "$home_root/.opencode/bin/opencode" ||
 jq -e --arg target "$fake_bin" '.target == $target' \
   "$state_root/cli-install.json" >/dev/null ||
   fail 'rollback did not restore the pre-transaction CLI record'
+
+# H5: every fleet script rejects OPENCODE_FLEET_* overrides in production mode.
+# A stray STATE_ROOT (or HOME) relocates the global session lock and splits the
+# lane, so the gate must fire in every script that honors an override, not just
+# oc. Each script below reaches the gate with a minimal invocation -- oc list,
+# doctor, and the four mutating scripts with no arguments all dispatch past
+# dependency and root checks before any argument or policy validation.
+override_state="$temp_root/override-state"
+mkdir -p "$override_state"
+override_marker="overrides are test-only"
+capture_failure "$temp_root/override-oc.err" "$override_marker" \
+  'production STATE_ROOT override was accepted by oc' \
+  env -u OPENCODE_FLEET_TESTING \
+    OPENCODE_FLEET_STATE_ROOT="$override_state" \
+    "$fleet_root/scripts/oc" list
+capture_failure "$temp_root/override-doctor.err" "$override_marker" \
+  'production STATE_ROOT override was accepted by doctor' \
+  env -u OPENCODE_FLEET_TESTING \
+    OPENCODE_FLEET_STATE_ROOT="$override_state" \
+    "$fleet_root/scripts/doctor"
+capture_failure "$temp_root/override-rollback.err" "$override_marker" \
+  'production STATE_ROOT override was accepted by rollback' \
+  env -u OPENCODE_FLEET_TESTING \
+    OPENCODE_FLEET_STATE_ROOT="$override_state" \
+    "$fleet_root/scripts/rollback"
+capture_failure "$temp_root/override-sync.err" "$override_marker" \
+  'production STATE_ROOT override was accepted by sync-clones' \
+  env -u OPENCODE_FLEET_TESTING \
+    OPENCODE_FLEET_STATE_ROOT="$override_state" \
+    "$fleet_root/scripts/sync-clones"
+capture_failure "$temp_root/override-install-local.err" "$override_marker" \
+  'production STATE_ROOT override was accepted by install-local' \
+  env -u OPENCODE_FLEET_TESTING \
+    OPENCODE_FLEET_STATE_ROOT="$override_state" \
+    "$fleet_root/scripts/install-local"
+capture_failure "$temp_root/override-install-cli.err" "$override_marker" \
+  'production STATE_ROOT override was accepted by install-opencode-cli' \
+  env -u OPENCODE_FLEET_TESTING \
+    OPENCODE_FLEET_STATE_ROOT="$override_state" \
+    "$fleet_root/scripts/install-opencode-cli"
+
+# A second override on the launcher confirms the gate checks more than STATE_ROOT.
+capture_failure "$temp_root/override-manifest.err" "$override_marker" \
+  'production MANIFEST override was accepted by oc' \
+  env -u OPENCODE_FLEET_TESTING \
+    OPENCODE_FLEET_MANIFEST="$fleet_root/config/repos.json" \
+    "$fleet_root/scripts/oc" list
+
+# OPENCODE_FLEET_CLOUD_MODEL is the documented --cloud operator env, not a test
+# override: the gate must let it through so a production cloud run is not refused.
+cloud_err="$(env -u OPENCODE_FLEET_TESTING \
+  OPENCODE_FLEET_CLOUD_MODEL="opencode/test-cloud" \
+  "$fleet_root/scripts/oc" list 2>&1 >/dev/null)" || true
+[[ "$cloud_err" != *"$override_marker"* ]] ||
+  fail 'the override gate refused the documented CLOUD_MODEL operator env'
+
+# With testing mode on, the same override is accepted: the gate is a test-only
+# boundary, not a block on legitimate practice.
+if env OPENCODE_FLEET_TESTING=1 \
+  OPENCODE_FLEET_STATE_ROOT="$override_state" \
+  "$fleet_root/scripts/oc" list >/dev/null 2>"$temp_root/override-accepted.err"; then
+  :
+else
+  fail 'testing-mode STATE_ROOT override was refused by oc; got: '"$(cat "$temp_root/override-accepted.err")"
+fi
+[[ ! -s "$temp_root/override-accepted.err" ]] ||
+  fail 'testing-mode override produced unexpected stderr: '"$(cat "$temp_root/override-accepted.err")"
 
 printf 'local lane integration tests passed\n'

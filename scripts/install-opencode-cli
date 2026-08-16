@@ -5,6 +5,8 @@ umask 077
 
 script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+# shellcheck source=scripts/lib/fleet-contracts.sh
+. "$fleet_root/scripts/lib/fleet-contracts.sh"
 versions="${OPENCODE_FLEET_VERSIONS:-$fleet_root/config/versions.json}"
 target_home="${OPENCODE_FLEET_HOME:-$HOME}"
 state_root="${OPENCODE_FLEET_STATE_ROOT:-$target_home/.local/state/opencode-fleet}"
@@ -167,6 +169,13 @@ for command_name in jq sha256sum tar mktemp install realpath stat cp mv rm chmod
     die "required command is missing: $command_name"
 done
 [[ "$(id -u)" -ne 0 ]] || die "refusing to install OpenCode as root"
+
+# The CLI installer mutates fleet state under the global session lock. A stray
+# STATE_ROOT or HOME would acquire the lock at a different root than the launcher
+# and silently split the lane, so reject production overrides before any work.
+{ fleet_offending="$(fleet_offending_override)"; } ||
+  die "policy, catalog, and lane-state overrides are test-only: $fleet_offending"
+
 [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] ||
   die "the pinned archive supports only Linux x86_64"
 [[ -d "$target_home" && ! -L "$target_home" &&
@@ -188,10 +197,6 @@ jq -e '
   (.opencode.linuxX64Sha256 | type == "string" and
     test("^[0-9a-f]{64}$"))
 ' "$versions" >/dev/null || die "version pin file is invalid"
-if [[ "${OPENCODE_FLEET_TESTING:-0}" != "1" ]]; then
-  [[ -z "${OPENCODE_FLEET_VERSIONS:-}" ]] ||
-    die "version pin overrides are test-only"
-fi
 
 expected_version="$(jq -r '.opencode.version' "$versions")"
 expected_archive="$(jq -r '.opencode.linuxX64Archive' "$versions")"

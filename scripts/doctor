@@ -133,6 +133,16 @@ for command_name in jq git flock realpath stat sha256sum sed cut readlink grep; 
   fi
 done
 
+# Diagnosis must run against the real fleet state, not a redirected one. The
+# override gate is a hard precondition, not an accumulated finding: a stray
+# STATE_ROOT or HOME would make doctor diagnose the wrong state and report a
+# healthy fleet that oc refuses to run (or vice versa).
+{ fleet_offending="$(fleet_offending_override)"; } || {
+  printf 'doctor: policy, catalog, and lane-state overrides are test-only: %s\n' \
+    "$fleet_offending" >&2
+  exit 1
+}
+
 for file in "$manifest" "$config" "$guard" "$routes" "$versions"; do
   if [[ -r "$file" ]]; then
     pass "readable ${file#$fleet_root/}"

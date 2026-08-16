@@ -5,6 +5,8 @@ umask 077
 
 script_path="$(readlink -f "${BASH_SOURCE[0]}")"
 fleet_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+# shellcheck source=scripts/lib/fleet-contracts.sh
+. "$fleet_root/scripts/lib/fleet-contracts.sh"
 manifest="${OPENCODE_FLEET_MANIFEST:-$fleet_root/config/repos.json}"
 target_home="${OPENCODE_FLEET_HOME:-$HOME}"
 state_root="${OPENCODE_FLEET_STATE_ROOT:-$target_home/.local/state/opencode-fleet}"
@@ -103,6 +105,13 @@ for command_name in jq git realpath install flock chmod dirname; do
     die "required command is missing: $command_name"
 done
 [[ "$EUID" -ne 0 ]] || die "refusing to provision OpenCode clones as root"
+
+# Clone provisioning mutates fleet state under the global session lock. A stray
+# STATE_ROOT or HOME would acquire the lock at a different root than the launcher
+# and silently split the lane, so reject production overrides before any work.
+{ fleet_offending="$(fleet_offending_override)"; } ||
+  die "policy, catalog, and lane-state overrides are test-only: $fleet_offending"
+
 [[ -d "$target_home" && ! -L "$target_home" &&
    "$(realpath -e -- "$target_home")" == "$target_home" ]] ||
   die "selected home must be an existing canonical directory"
