@@ -286,10 +286,13 @@ fleet_assert_permission_contract() {
 # lane state. STATE_ROOT relocates the global session lock; HOME relocates the
 # selected home (and therefore the lock's default location); the rest redirect
 # which policy file, catalog, binary, record, or workspace a script acts on.
-# None are legitimate in production -- they exist so the suite can point every
-# script at temporary state. A stray override left exported in a shell would
-# silently split the lane or redirect a mutation, so every fleet script rejects
-# them unless OPENCODE_FLEET_TESTING=1 is set.
+# INSTALLED_CONFIG and INSTALLED_LAUNCHER redirect what doctor diagnoses, and
+# MODELS_URL redirects the --local-models loopback probe away from the pinned
+# endpoint -- none are legitimate in production, where doctor must report on the
+# real installed state and the real loopback. They exist so the suite can point
+# every script at temporary state. A stray override left exported in a shell
+# would silently split the lane or redirect a mutation, so every fleet script
+# rejects them unless OPENCODE_FLEET_TESTING=1 is set.
 #
 # OPENCODE_FLEET_CLOUD_MODEL is intentionally absent: it is the documented
 # operator env for the --cloud lane, not a test override. OPENCODE_FLEET_RUN_ID
@@ -305,6 +308,9 @@ FLEET_PRODUCTION_OVERRIDES=(
   OPENCODE_FLEET_STATE_ROOT
   OPENCODE_FLEET_WORKSPACE_ROOT
   OPENCODE_FLEET_HOME
+  OPENCODE_FLEET_INSTALLED_CONFIG
+  OPENCODE_FLEET_INSTALLED_LAUNCHER
+  OPENCODE_FLEET_MODELS_URL
 )
 
 # Print the first production override that is set, to stdout, and return 1; or

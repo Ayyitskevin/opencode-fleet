@@ -849,6 +849,15 @@ capture_failure "$temp_root/override-manifest.err" "$override_marker" \
     OPENCODE_FLEET_MANIFEST="$fleet_root/config/repos.json" \
     "$fleet_root/scripts/oc" list
 
+# Doctor-specific overrides redirect what diagnosis reports on; they are
+# test-only, so a production doctor must refuse them just as it refuses
+# STATE_ROOT.
+capture_failure "$temp_root/override-installed.err" "$override_marker" \
+  'production INSTALLED_CONFIG override was accepted by doctor' \
+  env -u OPENCODE_FLEET_TESTING \
+    OPENCODE_FLEET_INSTALLED_CONFIG="$fleet_root/config/opencode.jsonc" \
+    "$fleet_root/scripts/doctor"
+
 # OPENCODE_FLEET_CLOUD_MODEL is the documented --cloud operator env, not a test
 # override: the gate must let it through so a production cloud run is not refused.
 cloud_err="$(env -u OPENCODE_FLEET_TESTING \
