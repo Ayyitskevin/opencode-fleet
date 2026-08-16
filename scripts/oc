@@ -30,7 +30,8 @@ Usage:
   oc note <run-id> <text>
   oc stats [--model | --repo]
   oc <repository> [plan|build|review]
-     [--ceiling | --cloud | --experiment ollama/<model>] [--dry-run]
+     [--ceiling | --cloud | --experiment ollama/<model>]
+     [--prompt <file>] [--dry-run]
 
 Examples:
   oc Icarus plan
@@ -38,12 +39,15 @@ Examples:
   oc Icarus review --ceiling
   oc Icarus plan --experiment ollama/qwen3.6:35b
   OPENCODE_FLEET_CLOUD_MODEL=provider/model oc Icarus build --cloud
+  oc sandbox practice build --prompt task.txt --experiment ollama/qwen3.8:27b
 
 Local modes use the pinned cost-efficient coder. --ceiling is the only route to
 the pinned local ceiling. --experiment runs another local model, and accepts
 only models listed in localExperiments in config/model-routes.json. Cloud use
 requires both an enabled cloud policy and an exact model allowlist entry in
-config/model-routes.json.
+config/model-routes.json. --prompt <file> switches a run from the interactive
+TUI to a non-interactive `opencode run` of the file's contents, capturing
+output into the run record; it is the shape `oc compare` will build on.
 USAGE
 }
 
@@ -818,6 +822,7 @@ use_ceiling=false
 use_cloud=false
 experiment_model=""
 dry_run=false
+prompt_file=""
 while (($#)); do
   case "$1" in
     --ceiling)
@@ -834,6 +839,14 @@ while (($#)); do
     --experiment=*)
       experiment_model="${1#--experiment=}"
       ;;
+    --prompt)
+      shift
+      (($#)) || die "--prompt requires a file path"
+      prompt_file="$1"
+      ;;
+    --prompt=*)
+      prompt_file="${1#--prompt=}"
+      ;;
     --dry-run)
       dry_run=true
       ;;
@@ -847,6 +860,19 @@ while (($#)); do
   esac
   shift
 done
+
+# --prompt switches a run from the interactive TUI to a non-interactive
+# `opencode run` of the file's contents. It is the foundation for `oc compare`
+# (one task across N models) and for any practice run that does not need a
+# terminal. The prompt is read once, here, so a missing or empty file is a
+# configuration error before any state is created.
+prompt_text=""
+if [[ -n "$prompt_file" ]]; then
+  [[ -f "$prompt_file" && ! -L "$prompt_file" && -r "$prompt_file" ]] ||
+    die "--prompt must be a readable regular file"
+  prompt_text="$(<"$prompt_file")"
+  [[ -n "$prompt_text" ]] || die "--prompt file is empty"
+fi
 
 selected_routes=0
 [[ "$use_ceiling" != true ]] || selected_routes=$((selected_routes + 1))
@@ -1050,6 +1076,7 @@ jq -n \
   --arg runBranch "$run_branch" \
   --arg createdAt "$created_at" \
   --argjson sandbox "$is_sandbox" \
+  --arg prompt "$prompt_text" \
   '{
     schemaVersion: 1,
     sandbox: $sandbox,
@@ -1068,7 +1095,7 @@ jq -n \
     runBranch: $runBranch,
     createdAt: $createdAt,
     status: "provisioning"
-  }' >"$record_temporary"
+  } | if $prompt == "" then . else .prompt = $prompt end' >"$record_temporary"
 chmod 600 "$record_temporary"
 mv -f -- "$record_temporary" "$record_path"
 
@@ -1191,53 +1218,66 @@ printf 'cost:       %s\n' "$cost_class"
 printf 'source:     %s\n' "$repository_path"
 printf 'execution:  %s\n' "$execution_path"
 printf 'record:     %s\n' "$record_path"
+[[ -z "$prompt_file" ]] || printf 'output:     %s\n' "$run_dir/output.log"
 
 run_started_epoch="$(date -u +%s)"
 set +e
-env \
-  "${provider_env_sanitizers[@]}" \
-  -u OPENCODE_PERMISSION \
-  -u OPENCODE_PLUGIN_META_FILE \
-  -u SSH_AUTH_SOCK \
-  -u GH_TOKEN \
-  -u GITHUB_TOKEN \
-  -u GH_ENTERPRISE_TOKEN \
-  -u GITHUB_ENTERPRISE_TOKEN \
-  -u GITLAB_TOKEN \
-  -u GITLAB_ACCESS_TOKEN \
-  HOME="$runtime_home" \
-  XDG_CONFIG_HOME="$runtime_home/.config" \
-  XDG_CACHE_HOME="$runtime_home/.cache" \
-  XDG_DATA_HOME="$runtime_home/.local/share" \
-  XDG_STATE_HOME="$runtime_home/.local/state" \
-  OPENCODE_CONFIG="$config" \
-  OPENCODE_CONFIG_DIR="$runtime_config_dir" \
-  OPENCODE_CONFIG_CONTENT="$guard_content" \
-  OPENCODE_PURE=1 \
-  OPENCODE_DISABLE_PROJECT_CONFIG=1 \
-  OPENCODE_DISABLE_EXTERNAL_SKILLS=1 \
-  OPENCODE_DISABLE_CLAUDE_CODE=1 \
-  OPENCODE_DISABLE_DEFAULT_PLUGINS=1 \
-  OPENCODE_DISABLE_AUTOUPDATE=1 \
-  OPENCODE_DISABLE_MODELS_FETCH=1 \
-  GIT_TERMINAL_PROMPT=0 \
-  GCM_INTERACTIVE=never \
-  GIT_ASKPASS=/bin/false \
-  SSH_ASKPASS=/bin/false \
-  GIT_SSH=/bin/false \
-  GIT_SSH_COMMAND=/bin/false \
-  GIT_CONFIG_NOSYSTEM=1 \
-  GIT_CONFIG_GLOBAL=/dev/null \
-  GIT_CONFIG_COUNT=4 \
-  GIT_CONFIG_KEY_0=credential.helper \
-  GIT_CONFIG_VALUE_0= \
-  GIT_CONFIG_KEY_1=credential.interactive \
-  GIT_CONFIG_VALUE_1=never \
-  GIT_CONFIG_KEY_2=core.askPass \
-  GIT_CONFIG_VALUE_2=/bin/false \
-  GIT_CONFIG_KEY_3=remote.origin.pushurl \
-  GIT_CONFIG_VALUE_3=disabled://opencode-fleet-local \
-  "$opencode_bin" --pure "$execution_path" --agent "$agent" --model "$model"
+run_env=(
+  "${provider_env_sanitizers[@]}"
+  -u OPENCODE_PERMISSION
+  -u OPENCODE_PLUGIN_META_FILE
+  -u SSH_AUTH_SOCK
+  -u GH_TOKEN
+  -u GITHUB_TOKEN
+  -u GH_ENTERPRISE_TOKEN
+  -u GITHUB_ENTERPRISE_TOKEN
+  -u GITLAB_TOKEN
+  -u GITLAB_ACCESS_TOKEN
+  HOME="$runtime_home"
+  XDG_CONFIG_HOME="$runtime_home/.config"
+  XDG_CACHE_HOME="$runtime_home/.cache"
+  XDG_DATA_HOME="$runtime_home/.local/share"
+  XDG_STATE_HOME="$runtime_home/.local/state"
+  OPENCODE_CONFIG="$config"
+  OPENCODE_CONFIG_DIR="$runtime_config_dir"
+  OPENCODE_CONFIG_CONTENT="$guard_content"
+  OPENCODE_PURE=1
+  OPENCODE_DISABLE_PROJECT_CONFIG=1
+  OPENCODE_DISABLE_EXTERNAL_SKILLS=1
+  OPENCODE_DISABLE_CLAUDE_CODE=1
+  OPENCODE_DISABLE_DEFAULT_PLUGINS=1
+  OPENCODE_DISABLE_AUTOUPDATE=1
+  OPENCODE_DISABLE_MODELS_FETCH=1
+  GIT_TERMINAL_PROMPT=0
+  GCM_INTERACTIVE=never
+  GIT_ASKPASS=/bin/false
+  SSH_ASKPASS=/bin/false
+  GIT_SSH=/bin/false
+  GIT_SSH_COMMAND=/bin/false
+  GIT_CONFIG_NOSYSTEM=1
+  GIT_CONFIG_GLOBAL=/dev/null
+  GIT_CONFIG_COUNT=4
+  GIT_CONFIG_KEY_0=credential.helper
+  GIT_CONFIG_VALUE_0=
+  GIT_CONFIG_KEY_1=credential.interactive
+  GIT_CONFIG_VALUE_1=never
+  GIT_CONFIG_KEY_2=core.askPass
+  GIT_CONFIG_VALUE_2=/bin/false
+  GIT_CONFIG_KEY_3=remote.origin.pushurl
+  GIT_CONFIG_VALUE_3=disabled://opencode-fleet-local
+)
+if [[ -n "$prompt_file" ]]; then
+  # Non-interactive: `opencode run` takes the working directory as --dir and
+  # the task as a positional message, instead of the interactive TUI's
+  # `--pure <path>` positional. Output is captured per-run so `oc compare`
+  # (and any non-interactive practice run) leaves reviewable evidence.
+  env "${run_env[@]}" "$opencode_bin" run --pure --dir "$execution_path" \
+    --agent "$agent" --model "$model" "$prompt_text" \
+    >"$run_dir/output.log" 2>&1
+else
+  env "${run_env[@]}" "$opencode_bin" --pure "$execution_path" \
+    --agent "$agent" --model "$model"
+fi
 exit_code=$?
 set -e
 

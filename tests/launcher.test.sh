@@ -75,8 +75,20 @@ jq -n \
     gitCount: $gitCount, pushUrl: $pushUrl, gitSsh: $gitSsh,
     noSystem: $noSystem}' >>"$FAKE_ENV_LOG"
 if [[ "$FAKE_MUTATE" == "1" ]]; then
-  printf 'changed\n' >>"$2/tracked.txt"
-  printf 'untracked\n' >"$2/untracked.txt"
+  # Interactive invocation is `--pure <path> ...` (path is $2); non-interactive
+  # is `run --pure --dir <path> ... <message>`. Resolve the working directory
+  # for either shape so a build diffstat is produced in both modes.
+  mutate_dir="$2"
+  if [[ "${1:-}" == "run" ]]; then
+    mutate_dir=""
+    prev=""
+    for arg in "$@"; do
+      [[ "$prev" == "--dir" ]] && mutate_dir="$arg"
+      prev="$arg"
+    done
+  fi
+  printf 'changed\n' >>"$mutate_dir/tracked.txt"
+  printf 'untracked\n' >"$mutate_dir/untracked.txt"
 fi
 if [[ -n "${FAKE_SLEEP:-}" ]]; then
   printf 'started\n' >"$FAKE_STARTED"
@@ -930,6 +942,45 @@ assert_refusal_early "dirty sandbox build" "requires a clean sandbox" \
   env "${sandbox_env[@]}" OPENCODE_FLEET_RUN_ID=sandbox-dirty \
   "$fleet_root/scripts/oc" sandbox scratch build
 git -C "$sandbox_path" checkout -- tracked.txt
+
+# --prompt switches a run to non-interactive `opencode run`: the model receives
+# the file's contents as a positional message, the working directory moves to
+# --dir, and output is captured into the run record. This is the invocation
+# shape `oc compare` will loop over.
+prompt_file="$temp_root/task.txt"
+printf 'implement the foo feature\n' >"$prompt_file"
+: >"$fake_log"
+env "${sandbox_env[@]}" FAKE_MUTATE=1 OPENCODE_FLEET_RUN_ID=prompt-build \
+  "$fleet_root/scripts/oc" sandbox scratch build --prompt "$prompt_file" >/dev/null
+prompt_record="$state_root/runs/prompt-build/record.json"
+# The launcher used the non-interactive `run` subcommand with --dir, not the
+# interactive `--pure <path>` positional, and passed the prompt as the message.
+grep -q '^run --pure --dir ' "$fake_log" ||
+  { printf 'prompt run was not non-interactive: %s\n' "$(cat "$fake_log")" >&2
+    exit 1; }
+grep -q ' --agent fleet-build --model ollama/qwen3-coder:30b ' "$fake_log" ||
+  { printf 'prompt run used the wrong agent/model: %s\n' "$(cat "$fake_log")" >&2
+    exit 1; }
+grep -q 'implement the foo feature$' "$fake_log" ||
+  { printf 'prompt text was not passed as the message: %s\n' "$(cat "$fake_log")" >&2
+    exit 1; }
+jq -e '
+  .status == "completed" and .mode == "build" and
+  .prompt == "implement the foo feature" and
+  .model == "ollama/qwen3-coder:30b" and
+  .diffstat.files == 1
+' "$prompt_record" >/dev/null ||
+  { printf 'prompt run record was wrong\n'; jq . "$prompt_record" >&2; exit 1; }
+[[ -f "$state_root/runs/prompt-build/output.log" ]] ||
+  { printf 'non-interactive output was not captured\n' >&2; exit 1; }
+# A prompt file that is missing or empty is a configuration error, not a run.
+assert_refusal_early "missing prompt file" "must be a readable regular file" \
+  env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox scratch build \
+    --prompt "$temp_root/absent.txt"
+: >"$prompt_file"
+assert_refusal_early "empty prompt file" "prompt file is empty" \
+  env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox scratch build \
+    --prompt "$prompt_file"
 
 printf 'launcher tests passed\n'
 

@@ -65,8 +65,9 @@ tool's credential-path exclusions; path-only enumeration remains available.
     oc diff <run-id>
     oc note <run-id> <text>
     oc stats [--model | --repo]
-    oc <repository> [plan|build|review]
-       [--ceiling | --cloud | --experiment ollama/<model>] [--dry-run]
+  oc <repository> [plan|build|review]
+     [--ceiling | --cloud | --experiment ollama/<model>]
+     [--prompt <file>] [--dry-run]
 
 Examples:
 
@@ -75,6 +76,7 @@ Examples:
     oc Icarus review --ceiling
     oc Icarus plan --experiment ollama/qwen3.8:27b
     OPENCODE_FLEET_CLOUD_MODEL=provider/model oc Icarus review --cloud
+    oc sandbox practice build --prompt task.txt --experiment ollama/qwen3.8:27b
 
 All ordinary modes use the pinned cost-efficient
 ollama/qwen3-coder:30b. --ceiling is the only route to
@@ -92,6 +94,18 @@ route; the two pinned models are rejected from it so an experiment can never
 quietly shadow the daily lane. Trim the list to taste — an entry that is not
 in the staged provider catalog, or is not pulled in Ollama, fails closed, and
 `scripts/doctor --local-models` reports the difference.
+
+`--prompt <file>` switches a run from the interactive TUI to a non-interactive
+`opencode run` of the file's contents. The model receives the prompt as a
+positional message and works in the same private worktree (build) or source
+path (plan/review) as an interactive run, under the same guard, lock, and
+sanitized environment. Output is captured into the run record so a
+non-interactive practice run leaves reviewable evidence alongside its diffstat.
+It is the invocation shape `oc compare` will build on; on its own it is the
+way to run a model against a task without holding a terminal. The pinned
+OpenCode binary's non-interactive behaviour under the fleet's isolated runtime
+is not yet verified against the pinned version, so treat a `--prompt` run
+against the real binary as experimental until that check is done.
 
 The staged catalog deliberately holds only models that can drive an agent.
 Embedding models, safety classifiers, and single-domain models are left out
