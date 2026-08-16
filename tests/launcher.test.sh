@@ -1022,6 +1022,41 @@ assert_refusal_early "compare with non-allowlisted model" \
   env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox scratch compare \
   --prompt "$compare_prompt" --models ollama/qwen3-coder:30b
 
+# `oc resume <run-id>` re-enters a build run's session with `opencode --continue`
+# under the identical sanitized environment. Each run's isolated runtime home
+# holds its session, so --continue resumes the run's own.
+resume_prompt="$temp_root/resume-task.txt"
+printf 'add a comment\n' >"$resume_prompt"
+env "${sandbox_env[@]}" OPENCODE_FLEET_RUN_ID=resume-source \
+  "$fleet_root/scripts/oc" sandbox scratch build --prompt "$resume_prompt" \
+  --experiment ollama/qwen3.8:27b >/dev/null
+: >"$fake_log"
+env "${sandbox_env[@]}" "$fleet_root/scripts/oc" resume resume-source >/dev/null
+resume_record="$state_root/runs/resume-source/record.json"
+jq -e '.resumedAt != null and .status == "completed"' "$resume_record" >/dev/null ||
+  { printf 'resume did not mark the run resumed\n'; jq . "$resume_record" >&2; exit 1; }
+grep -q -- '--continue$' "$fake_log" ||
+  { printf 'resume did not invoke opencode with --continue: %s\n' \
+      "$(cat "$fake_log")" >&2; exit 1; }
+# Only build runs (with a worktree) can be resumed; a plan run has none.
+env "${sandbox_env[@]}" OPENCODE_FLEET_RUN_ID=resume-plan \
+  "$fleet_root/scripts/oc" sandbox scratch plan --prompt "$resume_prompt" >/dev/null
+assert_refusal_early "resume of a non-build run" \
+  "only build runs" \
+  env "${sandbox_env[@]}" "$fleet_root/scripts/oc" resume resume-plan
+# A run whose worktree branch moved (HEAD moved) is refused, like rollback.
+resume_source_worktree="$(jq -r '.worktreePath' "$resume_record")"
+git -C "$resume_source_worktree" branch -m opencode/build/renamed
+assert_refusal_early "resume of a moved-branch run" \
+  "branch no longer matches" \
+  env "${sandbox_env[@]}" "$fleet_root/scripts/oc" resume resume-source
+git -C "$resume_source_worktree" branch -m opencode/build/resume-source
+# A missing run and extra arguments are refused.
+assert_refusal_early "resume of a missing run" "no such run" \
+  env "${sandbox_env[@]}" "$fleet_root/scripts/oc" resume no-such-run
+assert_refusal_early "resume with extra arguments" "no extra arguments" \
+  env "${sandbox_env[@]}" "$fleet_root/scripts/oc" resume resume-source extra
+
 printf 'launcher tests passed\n'
 
 

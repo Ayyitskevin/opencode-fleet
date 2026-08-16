@@ -27,6 +27,7 @@ Usage:
   oc runs [repository]
   oc show <run-id>
   oc diff <run-id>
+  oc resume <run-id>
   oc note <run-id> <text>
   oc stats [--model | --repo]
   oc <repository> [plan|build|review|compare]
@@ -683,6 +684,107 @@ collect_run_records() {
   done
 }
 
+# Every provider-credential environment variable to scrub from a model child:
+# the explicit names document the providers known today, and the pattern sweep
+# closes the same door for every credential-shaped variable in this environment,
+# including ones from providers that did not exist when this was written. Output
+# is one variable name per line so both the single-run path and `oc resume` build
+# their own -u arrays without duplicating the discovery.
+credential_names_to_scrub() {
+  local credential_name credential_pattern
+  local -a explicit=(
+    AI21_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
+    AWS_ACCESS_KEY_ID AWS_CONFIG_FILE AWS_CONTAINER_CREDENTIALS_FULL_URI
+    AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_DEFAULT_PROFILE AWS_PROFILE
+    AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SHARED_CREDENTIALS_FILE
+    AWS_WEB_IDENTITY_TOKEN_FILE AZURE_API_KEY AZURE_CLIENT_ID
+    AZURE_CLIENT_SECRET AZURE_OPENAI_API_KEY AZURE_OPENAI_ENDPOINT
+    AZURE_TENANT_ID BEDROCK_API_KEY CEREBRAS_API_KEY COHERE_API_KEY
+    DASHSCOPE_API_KEY DATABRICKS_TOKEN DEEPINFRA_API_KEY DEEPSEEK_API_KEY
+    FIREWORKS_API_KEY GEMINI_API_KEY GOOGLE_API_KEY
+    GOOGLE_APPLICATION_CREDENTIALS GOOGLE_GENERATIVE_AI_API_KEY GROQ_API_KEY
+    HF_TOKEN HUGGINGFACE_API_KEY MISTRAL_API_KEY MOONSHOT_API_KEY
+    NVIDIA_API_KEY OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_PROJECT
+    OPENCODE_API_KEY OPENROUTER_API_KEY PERPLEXITY_API_KEY REPLICATE_API_TOKEN
+    TOGETHER_API_KEY VERTEXAI_PROJECT XAI_API_KEY
+  )
+  local -a patterns=(
+    '*_ACCESS_KEY' '*_ACCESS_KEY_ID' '*_APIKEY' '*_API_KEY' '*_AUTH_TOKEN'
+    '*_CREDENTIALS' '*_CREDENTIALS_FILE' '*_PASSWORD' '*_PRIVATE_KEY'
+    '*_SECRET' '*_SECRET_ACCESS_KEY' '*_SECRET_KEY' '*_SESSION_TOKEN' '*_TOKEN'
+  )
+  local -A scrub=()
+  for credential_name in "${explicit[@]}"; do
+    scrub["$credential_name"]=1
+  done
+  while IFS='=' read -r -d '' credential_name _; do
+    [[ "$credential_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    for credential_pattern in "${patterns[@]}"; do
+      # shellcheck disable=SC2053
+      if [[ "$credential_name" == $credential_pattern ]]; then
+        scrub["$credential_name"]=1
+        break
+      fi
+    done
+  done < <(env -0)
+  printf '%s\n' "${!scrub[@]}"
+}
+
+# Build the sanitized environment array a model child runs under, parameterized
+# by the runtime home (isolated per run), its config dir, and the guard content.
+# Both the single-run path and `oc resume` call this so the model sees the same
+# boundary whether it is a fresh run or a resumed session.
+build_run_env() {
+  local rt_home="$1"
+  local rt_config_dir="$2"
+  local rt_guard="$3"
+  run_env=(
+    "${provider_env_sanitizers[@]}"
+    -u OPENCODE_PERMISSION
+    -u OPENCODE_PLUGIN_META_FILE
+    -u SSH_AUTH_SOCK
+    -u GH_TOKEN
+    -u GITHUB_TOKEN
+    -u GH_ENTERPRISE_TOKEN
+    -u GITHUB_ENTERPRISE_TOKEN
+    -u GITLAB_TOKEN
+    -u GITLAB_ACCESS_TOKEN
+    HOME="$rt_home"
+    XDG_CONFIG_HOME="$rt_home/.config"
+    XDG_CACHE_HOME="$rt_home/.cache"
+    XDG_DATA_HOME="$rt_home/.local/share"
+    XDG_STATE_HOME="$rt_home/.local/state"
+    OPENCODE_CONFIG="$config"
+    OPENCODE_CONFIG_DIR="$rt_config_dir"
+    OPENCODE_CONFIG_CONTENT="$rt_guard"
+    OPENCODE_PURE=1
+    OPENCODE_DISABLE_PROJECT_CONFIG=1
+    OPENCODE_DISABLE_EXTERNAL_SKILLS=1
+    OPENCODE_DISABLE_CLAUDE_CODE=1
+    OPENCODE_DISABLE_DEFAULT_PLUGINS=1
+    OPENCODE_DISABLE_AUTOUPDATE=1
+    OPENCODE_DISABLE_MODELS_FETCH=1
+    GIT_TERMINAL_PROMPT=0
+    GCM_INTERACTIVE=never
+    GIT_ASKPASS=/bin/false
+    SSH_ASKPASS=/bin/false
+    GIT_SSH=/bin/false
+    GIT_SSH_COMMAND=/bin/false
+    GIT_CONFIG_NOSYSTEM=1
+    GIT_CONFIG_GLOBAL=/dev/null
+    GIT_CONFIG_SYSTEM=/dev/null
+    GIT_CONFIG_COUNT=4
+    GIT_CONFIG_KEY_0=credential.helper
+    GIT_CONFIG_VALUE_0=
+    GIT_CONFIG_KEY_1=credential.interactive
+    GIT_CONFIG_VALUE_1=never
+    GIT_CONFIG_KEY_2=core.askPass
+    GIT_CONFIG_VALUE_2=/bin/false
+    GIT_CONFIG_KEY_3=remote.origin.pushurl
+    GIT_CONFIG_VALUE_3=disabled://opencode-fleet-local
+  )
+}
+
 case "$command_name" in
   runs)
     shift
@@ -759,6 +861,78 @@ case "$command_name" in
        (map(.diffstat.deletions // 0) | add)] | @tsv
     ' "${run_records[@]}"
     exit 0
+    ;;
+  resume)
+    shift
+    resume_run_id="${1:-}"
+    resolve_run_record "$resume_run_id"
+    shift
+    (($# == 0)) || die "resume takes no extra arguments beyond the run ID"
+    resume_worktree="$(jq -r '.worktreePath // ""' "$record_path")"
+    resume_model="$(jq -r '.model // ""' "$record_path")"
+    resume_agent="$(jq -r '.agent // ""' "$record_path")"
+    resume_branch="$(jq -r '.runBranch // ""' "$record_path")"
+    resume_base="$(jq -r '.baseCommit // ""' "$record_path")"
+    [[ -n "$resume_worktree" && "$resume_worktree" != "null" &&
+       -n "$resume_model" && "$resume_model" != "null" &&
+       -n "$resume_agent" && "$resume_agent" != "null" &&
+       -n "$resume_branch" && "$resume_branch" != "null" ]] ||
+      die "only build runs (with a worktree, branch, and model) can be resumed"
+    # Fail-closed: the worktree, its branch, the runtime home, and the pinned
+    # CLI must all still match what the run recorded. A resumed build whose HEAD
+    # moved is refused here for the same reason rollback refuses it.
+    [[ -d "$resume_worktree" && ! -L "$resume_worktree" ]] ||
+      die "the run worktree is no longer present"
+    [[ "$(git -C "$resume_worktree" symbolic-ref --quiet --short HEAD 2>/dev/null || true)" \
+       == "$resume_branch" ]] ||
+      die "run worktree branch no longer matches the record (HEAD moved)"
+    resume_runtime_home="$run_dir/runtime-home"
+    [[ -d "$resume_runtime_home" && ! -L "$resume_runtime_home" ]] ||
+      die "the run runtime home is no longer present"
+    validate_pinned_cli
+    # A resumed session is still a session: acquire the global lock.
+    lock_path="$state_root/session.lock"
+    [[ ! -L "$lock_path" ]] || die "global session lock must not be a symlink"
+    exec 9>"$lock_path"
+    chmod 600 "$lock_path"
+    flock -n 9 || die "another OpenCode fleet session owns the local lane"
+    # Re-enter the run's session with the identical sanitized environment.
+    # --continue resumes the last session in the run's isolated runtime home,
+    # which is the run's own (each run mints a fresh runtime home).
+    update_run_record --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '.resumedAt = $at'
+    worktree_path="$resume_worktree"
+    base_commit="$resume_base"
+    run_record_finalized=false
+    run_record_signal=""
+    run_started_epoch="$(date -u +%s)"
+    trap 'trap_run_signal INT 2' INT
+    trap 'trap_run_signal TERM 15' TERM
+    trap 'trap_run_signal HUP 1' HUP
+    trap reconcile_run_record EXIT
+    mapfile -t credential_scrub_names < <(credential_names_to_scrub)
+    provider_env_sanitizers=()
+    for credential_name in "${credential_scrub_names[@]}"; do
+      provider_env_sanitizers+=(-u "$credential_name")
+    done
+    guard_content="$(jq -c '.enabled_providers = ["ollama"]' "$guard")"
+    runtime_config_dir="$resume_runtime_home/.config/opencode"
+    build_run_env "$resume_runtime_home" "$runtime_config_dir" "$guard_content"
+    printf 'resume:     %s\n' "$resume_run_id"
+    printf 'worktree:   %s\n' "$resume_worktree"
+    printf 'model:      %s\n' "$resume_model"
+    printf 'record:     %s\n' "$record_path"
+    set +e
+    env "${run_env[@]}" "$opencode_bin" --pure "$resume_worktree" \
+      --agent "$resume_agent" --model "$resume_model" --continue
+    exit_code=$?
+    set -e
+    if [[ "$exit_code" -eq 0 ]]; then
+      finalize_run_record "completed" "$exit_code"
+    else
+      finalize_run_record "failed" "$exit_code"
+    fi
+    exit "$exit_code"
     ;;
 esac
 
@@ -1237,33 +1411,10 @@ install -d -m 700 "$runtime_home" "$runtime_home/.config" \
   "$runtime_home/.cache" "$runtime_home/.local/share" \
   "$runtime_home/.local/state" "$runtime_config_dir"
 # A denylist of provider credentials cannot be complete: it is only ever as
-# current as the day it was written. The explicit names below document the
-# providers known today; the pattern sweep closes the same door for every
-# credential-shaped variable that exists in this environment, including ones
-# from providers that did not exist when this was written.
-provider_credential_names=(
-  AI21_API_KEY ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
-  AWS_ACCESS_KEY_ID AWS_CONFIG_FILE AWS_CONTAINER_CREDENTIALS_FULL_URI
-  AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_DEFAULT_PROFILE AWS_PROFILE
-  AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SHARED_CREDENTIALS_FILE
-  AWS_WEB_IDENTITY_TOKEN_FILE AZURE_API_KEY AZURE_CLIENT_ID
-  AZURE_CLIENT_SECRET AZURE_OPENAI_API_KEY AZURE_OPENAI_ENDPOINT
-  AZURE_TENANT_ID BEDROCK_API_KEY CEREBRAS_API_KEY COHERE_API_KEY
-  DASHSCOPE_API_KEY DATABRICKS_TOKEN DEEPINFRA_API_KEY DEEPSEEK_API_KEY
-  FIREWORKS_API_KEY GEMINI_API_KEY GOOGLE_API_KEY
-  GOOGLE_APPLICATION_CREDENTIALS GOOGLE_GENERATIVE_AI_API_KEY GROQ_API_KEY
-  HF_TOKEN HUGGINGFACE_API_KEY MISTRAL_API_KEY MOONSHOT_API_KEY
-  NVIDIA_API_KEY OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_PROJECT
-  OPENCODE_API_KEY OPENROUTER_API_KEY PERPLEXITY_API_KEY REPLICATE_API_TOKEN
-  TOGETHER_API_KEY VERTEXAI_PROJECT XAI_API_KEY
-)
-
-provider_credential_patterns=(
-  '*_ACCESS_KEY' '*_ACCESS_KEY_ID' '*_APIKEY' '*_API_KEY' '*_AUTH_TOKEN'
-  '*_CREDENTIALS' '*_CREDENTIALS_FILE' '*_PASSWORD' '*_PRIVATE_KEY'
-  '*_SECRET' '*_SECRET_ACCESS_KEY' '*_SECRET_KEY' '*_SESSION_TOKEN' '*_TOKEN'
-)
-
+# current as the day it was written. credential_names_to_scrub (above) holds the
+# explicit names plus the pattern sweep that closes the same door for every
+# credential-shaped variable in this environment, including ones from providers
+# that did not exist when this was written.
 # The explicit cloud lane enables exactly one provider, so exactly that
 # provider's credentials survive. An allowlisted model whose provider has no
 # declared mapping fails closed rather than falling back to passing everything.
@@ -1284,20 +1435,11 @@ cloud_provider_credentials() {
   esac
 }
 
+mapfile -t credential_scrub_names < <(credential_names_to_scrub)
 declare -A sanitized_credentials=()
-for credential_name in "${provider_credential_names[@]}"; do
+for credential_name in "${credential_scrub_names[@]}"; do
   sanitized_credentials["$credential_name"]=1
 done
-while IFS='=' read -r -d '' credential_name _; do
-  [[ "$credential_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-  for credential_pattern in "${provider_credential_patterns[@]}"; do
-    # shellcheck disable=SC2053
-    if [[ "$credential_name" == $credential_pattern ]]; then
-      sanitized_credentials["$credential_name"]=1
-      break
-    fi
-  done
-done < <(env -0)
 
 if [[ "$use_cloud" == true ]]; then
   cloud_provider="${model%%/*}"
@@ -1332,50 +1474,7 @@ printf 'record:     %s\n' "$record_path"
 
 run_started_epoch="$(date -u +%s)"
 set +e
-run_env=(
-  "${provider_env_sanitizers[@]}"
-  -u OPENCODE_PERMISSION
-  -u OPENCODE_PLUGIN_META_FILE
-  -u SSH_AUTH_SOCK
-  -u GH_TOKEN
-  -u GITHUB_TOKEN
-  -u GH_ENTERPRISE_TOKEN
-  -u GITHUB_ENTERPRISE_TOKEN
-  -u GITLAB_TOKEN
-  -u GITLAB_ACCESS_TOKEN
-  HOME="$runtime_home"
-  XDG_CONFIG_HOME="$runtime_home/.config"
-  XDG_CACHE_HOME="$runtime_home/.cache"
-  XDG_DATA_HOME="$runtime_home/.local/share"
-  XDG_STATE_HOME="$runtime_home/.local/state"
-  OPENCODE_CONFIG="$config"
-  OPENCODE_CONFIG_DIR="$runtime_config_dir"
-  OPENCODE_CONFIG_CONTENT="$guard_content"
-  OPENCODE_PURE=1
-  OPENCODE_DISABLE_PROJECT_CONFIG=1
-  OPENCODE_DISABLE_EXTERNAL_SKILLS=1
-  OPENCODE_DISABLE_CLAUDE_CODE=1
-  OPENCODE_DISABLE_DEFAULT_PLUGINS=1
-  OPENCODE_DISABLE_AUTOUPDATE=1
-  OPENCODE_DISABLE_MODELS_FETCH=1
-  GIT_TERMINAL_PROMPT=0
-  GCM_INTERACTIVE=never
-  GIT_ASKPASS=/bin/false
-  SSH_ASKPASS=/bin/false
-  GIT_SSH=/bin/false
-  GIT_SSH_COMMAND=/bin/false
-  GIT_CONFIG_NOSYSTEM=1
-  GIT_CONFIG_GLOBAL=/dev/null
-  GIT_CONFIG_COUNT=4
-  GIT_CONFIG_KEY_0=credential.helper
-  GIT_CONFIG_VALUE_0=
-  GIT_CONFIG_KEY_1=credential.interactive
-  GIT_CONFIG_VALUE_1=never
-  GIT_CONFIG_KEY_2=core.askPass
-  GIT_CONFIG_VALUE_2=/bin/false
-  GIT_CONFIG_KEY_3=remote.origin.pushurl
-  GIT_CONFIG_VALUE_3=disabled://opencode-fleet-local
-)
+build_run_env "$runtime_home" "$runtime_config_dir" "$guard_content"
 if [[ -n "$prompt_file" ]]; then
   # Non-interactive: `opencode run` takes the working directory as --dir and
   # the task as a positional message, instead of the interactive TUI's

@@ -63,6 +63,7 @@ tool's credential-path exclusions; path-only enumeration remains available.
     oc runs [repository]
     oc show <run-id>
     oc diff <run-id>
+    oc resume <run-id>
     oc note <run-id> <text>
     oc stats [--model | --repo]
   oc <repository> [plan|build|review]
@@ -123,6 +124,19 @@ holds no lock and creates no worktree. The runs are reviewed afterwards with
 prints (model, status, duration, diffstat, run) is read back from the same
 records. The same 1.18.18-smoke-tested / pinned-1.18.4-unconfirmed caveat as
 `--prompt` applies.
+
+`oc resume <run-id>` re-enters a build run's session with `opencode --continue`
+under the identical sanitized environment, working directory, and isolated
+runtime home. Each run mints a fresh runtime home, and OpenCode persists its
+session there, so `--continue` resumes the run's own session without the fleet
+having to track a session ID. Resume is fail-closed: it refuses if the worktree,
+its branch, the runtime home, or the pinned CLI no longer match what the run
+recorded. A resumed build that commits its work is covered by the existing
+rollback rule -- rollback already refuses when HEAD has moved off the recorded
+base, so a resumed-and-committed run is not silently rollbackable. The
+session-continue shape was smoke-tested under the fleet's isolated runtime on
+the installed 1.18.18 (a two-turn session resumed and remembered context); the
+pinned 1.18.4 is older, so confirm on the pinned binary before relying on it.
 
 The staged catalog deliberately holds only models that can drive an agent.
 Embedding models, safety classifiers, and single-domain models are left out
