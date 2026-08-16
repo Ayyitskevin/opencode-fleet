@@ -107,6 +107,21 @@ OpenCode binary's non-interactive behaviour under the fleet's isolated runtime
 is not yet verified against the pinned version, so treat a `--prompt` run
 against the real binary as experimental until that check is done.
 
+`oc compare` runs one `--prompt` task across N local models so practice
+compounds into a record of which model is good at what. It is a local-only
+lane: it rejects `--ceiling`, `--cloud`, and `--experiment`, and every model
+must be listed in `localExperiments` and present in the staged provider
+catalog. With no `--models` it runs the whole allowlist; `--models a,b,c`
+runs a subset. Each model is a full `oc ... build --prompt --experiment
+<model>` run — its own lock, private worktree, sanitized environment, run
+record, and diffstat — so compare reuses the existing machinery without
+widening any boundary. The global lock serializes the runs; compare itself
+holds no lock and creates no worktree. The runs are reviewed afterwards with
+`oc diff <run-id>` and `oc show <run-id>`, and the comparison table compare
+prints (model, status, duration, diffstat, run) is read back from the same
+records. The same experimental caveat as `--prompt` applies until the
+non-interactive shape is verified against the pinned binary.
+
 The staged catalog deliberately holds only models that can drive an agent.
 Embedding models, safety classifiers, and single-domain models are left out
 because they cannot run a coding lane, not because they are unwelcome.

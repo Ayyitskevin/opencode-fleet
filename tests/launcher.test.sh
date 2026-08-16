@@ -982,6 +982,46 @@ assert_refusal_early "empty prompt file" "prompt file is empty" \
   env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox scratch build \
     --prompt "$prompt_file"
 
+# `oc compare` runs one --prompt task across N localExperiments models, one
+# build run per model, then a comparison table. It is a thin orchestrator: each
+# model is a full `oc ... build --prompt --experiment <model>` subprocess, so
+# every run gets its own lock, worktree, record, and diffstat.
+compare_prompt="$temp_root/compare-task.txt"
+printf 'add a greeting module\n' >"$compare_prompt"
+compare_output="$(env "${sandbox_env[@]}" FAKE_MUTATE=1 \
+  "$fleet_root/scripts/oc" sandbox scratch compare \
+  --prompt "$compare_prompt" \
+  --models ollama/qwen3.8:27b,ollama/gemma4:26b 2>&1)" ||
+  { printf 'compare failed:\n%s\n' "$compare_output" >&2; exit 1; }
+# The comparison table has one completed row per requested model.
+compare_table="$(awk '/^=== comparison ===/{f=1; next} f' <<<"$compare_output")"
+for cm in ollama/gemma4:26b ollama/qwen3.8:27b; do
+  awk -F'\t' -v m="$cm" '$1==m && $2=="completed" {found=1} END{exit !found}' \
+    <<<"$compare_table" ||
+    { printf 'compare table missing completed row for %s:\n%s\n' "$cm" \
+        "$compare_table" >&2; exit 1; }
+done
+# compare --dry-run lists the model set without dispatching any run.
+compare_dry="$(env "${sandbox_env[@]}" \
+  "$fleet_root/scripts/oc" sandbox scratch compare \
+  --prompt "$compare_prompt" --models ollama/qwen3.8:27b,ollama/gemma4:26b \
+  --dry-run)"
+jq -e '.mode == "compare" and
+  (.models | sort == ["ollama/gemma4:26b","ollama/qwen3.8:27b"])' \
+  <<<"$compare_dry" >/dev/null ||
+  { printf 'compare dry-run was wrong:\n%s\n' "$compare_dry" >&2; exit 1; }
+# compare requires --prompt and rejects the other escalations; a model outside
+# localExperiments is refused even though others are allowlisted.
+assert_refusal_early "compare without prompt" "compare requires --prompt" \
+  env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox scratch compare
+assert_refusal_early "compare with --experiment" "incompatible" \
+  env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox scratch compare \
+  --prompt "$compare_prompt" --experiment ollama/qwen3.8:27b
+assert_refusal_early "compare with non-allowlisted model" \
+  "not in the local experiment allowlist" \
+  env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox scratch compare \
+  --prompt "$compare_prompt" --models ollama/qwen3-coder:30b
+
 printf 'launcher tests passed\n'
 
 

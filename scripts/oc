@@ -23,15 +23,15 @@ Usage:
   oc doctor [--strict] [--local-models]
   oc sandbox new <name>
   oc sandbox list
-  oc sandbox <name> [plan|build|review] [--experiment ollama/<model>]
+  oc sandbox <name> [plan|build|review|compare] [--experiment ollama/<model>]
   oc runs [repository]
   oc show <run-id>
   oc diff <run-id>
   oc note <run-id> <text>
   oc stats [--model | --repo]
-  oc <repository> [plan|build|review]
+  oc <repository> [plan|build|review|compare]
      [--ceiling | --cloud | --experiment ollama/<model>]
-     [--prompt <file>] [--dry-run]
+     [--prompt <file>] [--models <a,b,c>] [--dry-run]
 
 Examples:
   oc Icarus plan
@@ -40,6 +40,7 @@ Examples:
   oc Icarus plan --experiment ollama/qwen3.6:35b
   OPENCODE_FLEET_CLOUD_MODEL=provider/model oc Icarus build --cloud
   oc sandbox practice build --prompt task.txt --experiment ollama/qwen3.8:27b
+  oc sandbox practice compare --prompt task.txt --models ollama/qwen3.8:27b,ollama/gemma4:26b
 
 Local modes use the pinned cost-efficient coder. --ceiling is the only route to
 the pinned local ceiling. --experiment runs another local model, and accepts
@@ -48,6 +49,9 @@ requires both an enabled cloud policy and an exact model allowlist entry in
 config/model-routes.json. --prompt <file> switches a run from the interactive
 TUI to a non-interactive `opencode run` of the file's contents, capturing
 output into the run record; it is the shape `oc compare` will build on.
+`oc compare` runs one --prompt task across N localExperiments models (or a
+--models subset), one build run per model, then prints a comparison table;
+it is local-only and rejects --ceiling, --cloud, and --experiment.
 USAGE
 }
 
@@ -813,7 +817,7 @@ fi
 repository_query="$command_name"
 shift
 mode="plan"
-if [[ "${1:-}" =~ ^(plan|build|review)$ ]]; then
+if [[ "${1:-}" =~ ^(plan|build|review|compare)$ ]]; then
   mode="$1"
   shift
 fi
@@ -822,6 +826,7 @@ use_ceiling=false
 use_cloud=false
 experiment_model=""
 dry_run=false
+compare_models=""
 prompt_file=""
 while (($#)); do
   case "$1" in
@@ -846,6 +851,14 @@ while (($#)); do
       ;;
     --prompt=*)
       prompt_file="${1#--prompt=}"
+      ;;
+    --models)
+      shift
+      (($#)) || die "--models requires a comma-separated list"
+      compare_models="$1"
+      ;;
+    --models=*)
+      compare_models="${1#--models=}"
       ;;
     --dry-run)
       dry_run=true
@@ -929,6 +942,103 @@ else
   [[ "$(realpath -m -- "$repository_path")" == "$repository_path" ]] ||
     die "catalogued clone path is not canonical"
   validate_independent_clone "$repository_path" "$repository_full_name"
+fi
+
+# `oc compare` runs one task across N allowlisted local models so the owner can
+# learn which model is good at what. It is a thin orchestrator: each model gets
+# a full `oc ... build --prompt --experiment <model>` subprocess, so every run
+# reuses the existing lock, worktree, sanitized environment, record, and
+# diffstat machinery without duplication. The global lock serializes the
+# subprocesses naturally (each acquires it in turn). Compare itself holds no
+# lock and creates no worktree; it only resolves the model set, dispatches, and
+# reads the records back.
+if [[ "$mode" == "compare" ]]; then
+  [[ -n "$prompt_file" ]] ||
+    die "compare requires --prompt <file>"
+  [[ "$use_ceiling" != true && "$use_cloud" != true &&
+     -z "$experiment_model" ]] ||
+    die "compare is a local-only lane: --ceiling, --cloud, and --experiment are incompatible"
+
+  # Resolve the model set: the whole localExperiments allowlist, or a
+  # comma-separated --models subset. Every entry must be allowlisted and staged,
+  # exactly as --experiment demands of a single model.
+  mapfile -t compare_model_list < <(
+    if [[ -n "$compare_models" ]]; then
+      tr ',' '\n' <<<"$compare_models"
+    else
+      jq -r '.localExperiments[]?' "$routes"
+    fi
+  )
+  [[ "${#compare_model_list[@]}" -ge 1 ]] ||
+    die "compare has no models: localExperiments is empty and --models was not given"
+  for cm in "${compare_model_list[@]}"; do
+    [[ "$cm" =~ ^ollama/ ]] ||
+      die "compare model is not an ollama/<model> entry: $cm"
+    jq -e --arg model "$cm" '(.localExperiments // []) | index($model) != null' \
+      "$routes" >/dev/null ||
+      die "compare model is not in the local experiment allowlist: $cm"
+    sed '/^[[:space:]]*\/\//d' "$config" |
+      jq -e --arg model "${cm#ollama/}" \
+        '.provider.ollama.models[$model] != null' >/dev/null ||
+      die "compare model is absent from the staged provider catalog: $cm"
+  done
+
+  if [[ "$is_sandbox" == true ]]; then
+    compare_base_args=(sandbox "$sandbox_name" build)
+  else
+    compare_base_args=("$repository_name" build)
+  fi
+
+  if [[ "$dry_run" == true ]]; then
+    jq -n --arg prompt "$prompt_text" \
+      --argjson models "$(printf '%s\n' "${compare_model_list[@]}" | jq -R . | jq -s .)" \
+      '{mode: "compare", prompt: $prompt, models: $models}'
+    exit 0
+  fi
+
+  # Fail fast: a dirty sandbox or clone makes every subprocess fail the clean
+  # gate, so check once here instead of N times.
+  compare_status_output="$(git -C "$repository_path" status --porcelain=v1 --untracked-files=all)" ||
+    die "cannot determine clone cleanliness"
+  [[ -z "$compare_status_output" ]] ||
+    die "compare requires a clean ${repository_risk}; commit or discard your scratch work"
+
+  printf 'compare:    %d models\n' "${#compare_model_list[@]}"
+  printf 'prompt:     %s\n' "$prompt_file"
+  printf 'target:     %s\n' "$repository_name"
+
+  compare_records=()
+  for cm in "${compare_model_list[@]}"; do
+    printf '\n=== %s ===\n' "$cm"
+    # Each subprocess is a full build run with its own lock, worktree, record,
+    # and diffstat. -u OPENCODE_FLEET_RUN_ID lets every subprocess mint a fresh
+    # run ID even if the parent shell inherited a test-fixed one.
+    compare_output="$(env -u OPENCODE_FLEET_RUN_ID \
+      "$fleet_root/scripts/oc" "${compare_base_args[@]}" \
+      --prompt "$prompt_file" --experiment "$cm" 2>&1)" || true
+    printf '%s\n' "$compare_output"
+    compare_run_id="$(awk '/^run: +/{sub(/^run: +/,""); print; exit}' \
+      <<<"$compare_output")"
+    if [[ -n "$compare_run_id" &&
+          -f "$state_root/runs/$compare_run_id/record.json" ]]; then
+      compare_records+=("$state_root/runs/$compare_run_id/record.json")
+    fi
+  done
+
+  printf '\n=== comparison ===\n'
+  if [[ "${#compare_records[@]}" -gt 0 ]]; then
+    printf 'MODEL\tSTATUS\tSECONDS\tDIFF\tRUN\n'
+    jq -s -r 'sort_by(.model)[] |
+      [.model, .status, (.durationSeconds // "-" | tostring),
+       (if .diffstat then "+\(.diffstat.insertions)/-\(.diffstat.deletions)"
+        else "-" end),
+       .runId] | @tsv
+    ' "${compare_records[@]}"
+  else
+    printf 'no run records were produced\n' >&2
+    exit 1
+  fi
+  exit 0
 fi
 
 agent="$(jq -r --arg mode "$mode" '.routes[$mode].agent' "$routes")"
