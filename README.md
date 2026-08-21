@@ -74,27 +74,24 @@ Examples:
 
     oc Icarus
     oc Icarus build
-    oc Icarus review --ceiling
-    oc Icarus plan --experiment ollama/qwen3.8:27b
+    oc Icarus plan --experiment ollama/ornith-1.5:35b
     OPENCODE_FLEET_CLOUD_MODEL=provider/model oc Icarus review --cloud
-    oc sandbox practice build --prompt task.txt --experiment ollama/qwen3.8:27b
+    oc sandbox practice build --prompt task.txt --experiment ollama/ornith-1.5:35b
 
-All ordinary modes use the pinned cost-efficient
-ollama/qwen3-coder:30b. --ceiling is the only route to
-ollama/qwen3-coder-next:q8_0. These local selections are deterministic and
-cannot be changed with environment model overrides.
+All ordinary modes use the pinned `ollama/qwen3.8:27b` code model. There is no
+approved local ceiling route; `--ceiling` fails loudly instead of substituting
+another model. Mickey and Flow carry explicit host profiles for their
+host-appropriate Muse simple/vision tag. These local selections are
+deterministic and cannot be changed with environment model overrides.
 
 `--experiment` is the one sanctioned way to run a different local model, for
-practice and comparison. It accepts only exact `ollama/<model>` entries listed
-in `localExperiments` in config/model-routes.json, requires that model to exist
-in the staged provider catalog, may not shadow a pinned route, and is mutually
+practice and comparison. The shipped direct-only allowlist contains exactly
+`ollama/ornith-1.5:35b`; it cannot shadow the Qwen daily route and is mutually
 exclusive with `--ceiling` and `--cloud`. Like every other escalation it is a
 command-line request, never an environment override, and never a fallback.
-The allowlist carries the staged local models that are not already pinned to a
-route; the two pinned models are rejected from it so an experiment can never
-quietly shadow the daily lane. Trim the list to taste — an entry that is not
-in the staged provider catalog, or is not pulled in Ollama, fails closed, and
-`scripts/doctor --local-models` reports the difference.
+`scripts/doctor --strict` checks the active hostname profile against the exact
+tags returned by that host's loopback Ollama API and fails if any routed tag is
+missing.
 
 `--prompt <file>` switches a run from the interactive TUI to a non-interactive
 `opencode run` of the file's contents. The model receives the prompt as a

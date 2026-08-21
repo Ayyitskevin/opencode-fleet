@@ -4,7 +4,7 @@
   // Local Ollama remains the installed default. scripts/oc chooses an exact
   // model per mode from config/model-routes.json and never falls back.
   "model": "ollama/qwen3.8:27b",
-  "small_model": "ollama/muse-glimmer",
+  "small_model": "ollama/qwen3.8:27b",
   "enabled_providers": ["ollama"],
   "default_agent": "fleet-plan",
   "autoupdate": false,
@@ -18,24 +18,29 @@
   "provider": {
     "ollama": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Ollama (mickey loopback)",
+      "name": "Ollama (local loopback)",
       "options": {
         "baseURL": "http://127.0.0.1:11434/v1"
       },
       "models": {
         "qwen3.8:27b": {
-          "name": "Qwen3.8 27B (agentic code, vision) — the default AND the ceiling",
+          "name": "Qwen3.8 27B (primary code)",
+          "tools": true
+        },
+        "ornith-1.5:35b": {
+          "name": "Ornith 1.5 35B (direct-only fast code)",
+          "tools": true
+        },
+        "muse-glimmer:latest": {
+          "name": "Muse Glimmer (Mickey simple and vision)",
           "tools": true,
           "modalities": {"input": ["text", "image"], "output": ["text"]}
         },
-        "muse-glimmer": {
-          "id": "muse-glimmer:latest",
-          "name": "Muse Glimmer 30B (agentic, vision) — simple lane + multimodal alt",
+        "muse-glimmer:30b": {
+          "name": "Muse Glimmer 30B (Flow simple and vision)",
           "tools": true,
           "modalities": {"input": ["text", "image"], "output": ["text"]}
-        },
-        "ornith-1.5:35b": {"name": "Ornith 1.5 35B — the fast coding lane; --experiment / non-interactive runs only, never a pinned route", "tools": true},
-        "medgemma:27b": {"name": "MedGemma 27B (medical)", "tools": true}
+        }
       }
     }
   },
