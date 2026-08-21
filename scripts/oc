@@ -37,19 +37,18 @@ Usage:
 Examples:
   oc Icarus plan
   oc Icarus build
-  oc Icarus review --ceiling
-  oc Icarus plan --experiment ollama/qwen3.6:35b
+  oc Icarus build --experiment ollama/ornith-1.5:35b
   OPENCODE_FLEET_CLOUD_MODEL=provider/model oc Icarus build --cloud
-  oc sandbox practice build --prompt task.txt --experiment ollama/qwen3.8:27b
-  oc sandbox practice compare --prompt task.txt --models ollama/qwen3.8:27b,ollama/gemma4:26b
+  oc sandbox practice build --prompt task.txt --experiment ollama/ornith-1.5:35b
 
-Local modes use the pinned cost-efficient coder. --ceiling is the only route to
-the pinned local ceiling. --experiment runs another local model, and accepts
-only models listed in localExperiments in config/model-routes.json. Cloud use
-requires both an enabled cloud policy and an exact model allowlist entry in
-config/model-routes.json. --prompt <file> switches a run from the interactive
-TUI to a non-interactive `opencode run` of the file's contents, capturing
-output into the run record; it is the shape `oc compare` will build on.
+Local modes use the pinned Qwen3.8 coder. There is currently no approved local
+ceiling; --ceiling fails loudly instead of substituting another model.
+--experiment runs another local model and accepts only the direct-only models
+listed in localExperiments in config/model-routes.json. Cloud use requires both
+an enabled cloud policy and an exact model allowlist entry. --prompt <file>
+switches a run from the interactive TUI to a non-interactive `opencode run` of
+the file's contents, capturing output into the run record; it is the shape
+`oc compare` will build on.
 `oc compare` runs one --prompt task across N localExperiments models (or a
 --models subset), one build run per model, then prints a comparison table;
 it is local-only and rejects --ceiling, --cloud, and --experiment.
@@ -99,16 +98,27 @@ validate_manifest() {
 
 validate_routes() {
   jq -e '
-    .schemaVersion == 1 and
+    .schemaVersion == 2 and
     .routes == {
-      plan: {agent: "fleet-plan", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
-      build: {agent: "fleet-build", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
-      review: {agent: "fleet-review", model: "ollama/qwen3-coder:30b", costClass: "local-mid"}
+      plan: {agent: "fleet-plan", model: "ollama/qwen3.8:27b", costClass: "local-code"},
+      build: {agent: "fleet-build", model: "ollama/qwen3.8:27b", costClass: "local-code"},
+      review: {agent: "fleet-review", model: "ollama/qwen3.8:27b", costClass: "local-code"}
     } and
-    .ceiling == {
-      model: "ollama/qwen3-coder-next:q8_0",
-      costClass: "local-ceiling"
+    .profiles == {
+      mickey: {
+        hostnames: ["mickey", "strix-halo-a9-mega"],
+        simple: "ollama/muse-glimmer:latest", vision: "ollama/muse-glimmer:latest",
+        code: "ollama/qwen3.8:27b", fastCode: "ollama/ornith-1.5:35b"
+      },
+      flow: {
+        hostnames: ["flow"],
+        simple: "ollama/muse-glimmer:30b", vision: "ollama/muse-glimmer:30b",
+        code: "ollama/qwen3.8:27b", fastCode: "ollama/ornith-1.5:35b"
+      }
     } and
+    .ceiling == null and
+    .directOnly == ["ollama/ornith-1.5:35b"] and
+    .localExperiments == .directOnly and
     (.cloud.enabled | type == "boolean") and
     (.cloud.allowlist | type == "array") and
     all(.cloud.allowlist[];
@@ -116,16 +126,7 @@ validate_routes() {
       test("^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+$") and
       (startswith("ollama/") | not)
     ) and
-    (.cloud.allowlist | length == (unique | length)) and
-    ((.localExperiments // []) | type == "array") and
-    all((.localExperiments // [])[];
-      type == "string" and
-      test("^ollama/[A-Za-z0-9._:-]+$")
-    ) and
-    ((.localExperiments // []) | length == (unique | length)) and
-    (((.localExperiments // []) - [.routes.plan.model, .routes.build.model,
-      .routes.review.model, .ceiling.model]) ==
-      (.localExperiments // []))
+    (.cloud.allowlist | length == (unique | length))
   ' "$routes" >/dev/null || die "model routes failed strict validation"
 }
 
@@ -231,19 +232,17 @@ validate_staged_config() {
       ["$schema", "agent", "autoupdate", "default_agent", "enabled_providers",
        "instructions", "mcp", "model", "permission", "plugin", "provider",
        "share", "skills", "small_model", "snapshot"] and
-    .model == "ollama/qwen3-coder:30b" and
-    .small_model == "ollama/gpt-oss:20b" and
+    .model == "ollama/qwen3.8:27b" and
+    .small_model == "ollama/qwen3.8:27b" and
     .enabled_providers == ["ollama"] and
     .default_agent == "fleet-plan" and
     (.provider | keys) == ["ollama"] and
     (.provider.ollama | keys | sort) == ["models", "name", "npm", "options"] and
     .provider.ollama.npm == "@ai-sdk/openai-compatible" and
-    .provider.ollama.name == "Ollama (mickey loopback)" and
+    .provider.ollama.name == "Ollama (local loopback)" and
     .provider.ollama.options == {baseURL: "http://127.0.0.1:11434/v1"} and
-    (.provider.ollama.models | type) == "object" and
-    (.provider.ollama.models | has("gpt-oss:20b")) and
-    (.provider.ollama.models | has("qwen3-coder:30b")) and
-    (.provider.ollama.models | has("qwen3-coder-next:q8_0")) and
+    (.provider.ollama.models | keys) ==
+      ["muse-glimmer:30b", "muse-glimmer:latest", "ornith-1.5:35b", "qwen3.8:27b"] and
     .autoupdate == false and .share == "disabled" and
     .plugin == [] and .mcp == {} and .instructions == [] and
     .skills == {paths: [], urls: []} and
@@ -1219,10 +1218,12 @@ agent="$(jq -r --arg mode "$mode" '.routes[$mode].agent' "$routes")"
 model="$(jq -r --arg mode "$mode" '.routes[$mode].model' "$routes")"
 cost_class="$(jq -r --arg mode "$mode" '.routes[$mode].costClass' "$routes")"
 if [[ "$use_ceiling" == true ]]; then
-  model="$(jq -r '.ceiling.model' "$routes")"
-  cost_class="$(jq -r '.ceiling.costClass' "$routes")"
+  model="$(jq -r '.ceiling.model // empty' "$routes")"
+  [[ -n "$model" ]] ||
+    die "no local ceiling route is configured; choose a pinned route or explicit experiment"
+  cost_class="$(jq -r '.ceiling.costClass // empty' "$routes")"
 elif [[ -n "$experiment_model" ]]; then
-  # Practising with another local model is an explicit, allowlisted escalation
+  # Practising with a direct-only local model is an explicit allowlisted lane
   # in the same shape as --ceiling and --cloud: never an environment override,
   # never a fallback, and never off the pinned loopback provider.
   jq -e --arg model "$experiment_model" \

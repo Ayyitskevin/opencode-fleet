@@ -60,26 +60,39 @@ jq -e '
 ' "$manifest" >/dev/null
 
 jq -e '
-  .schemaVersion == 1 and
+  .schemaVersion == 2 and
   .routes.plan == {
     agent: "fleet-plan",
-    model: "ollama/qwen3-coder:30b",
-    costClass: "local-mid"
+    model: "ollama/qwen3.8:27b",
+    costClass: "local-code"
   } and
   .routes.build == {
     agent: "fleet-build",
-    model: "ollama/qwen3-coder:30b",
-    costClass: "local-mid"
+    model: "ollama/qwen3.8:27b",
+    costClass: "local-code"
   } and
   .routes.review == {
     agent: "fleet-review",
-    model: "ollama/qwen3-coder:30b",
-    costClass: "local-mid"
+    model: "ollama/qwen3.8:27b",
+    costClass: "local-code"
   } and
-  .ceiling == {
-    model: "ollama/qwen3-coder-next:q8_0",
-    costClass: "local-ceiling"
+  .profiles.mickey == {
+    hostnames: ["mickey", "strix-halo-a9-mega"],
+    simple: "ollama/muse-glimmer:latest",
+    vision: "ollama/muse-glimmer:latest",
+    code: "ollama/qwen3.8:27b",
+    fastCode: "ollama/ornith-1.5:35b"
   } and
+  .profiles.flow == {
+    hostnames: ["flow"],
+    simple: "ollama/muse-glimmer:30b",
+    vision: "ollama/muse-glimmer:30b",
+    code: "ollama/qwen3.8:27b",
+    fastCode: "ollama/ornith-1.5:35b"
+  } and
+  .ceiling == null and
+  .directOnly == ["ollama/ornith-1.5:35b"] and
+  .localExperiments == ["ollama/ornith-1.5:35b"] and
   .cloud == {enabled: false, allowlist: []}
 ' "$routes" >/dev/null
 
@@ -104,8 +117,8 @@ jq -e '
 
 config_json="$(sed '/^[[:space:]]*\/\//d' "$config")"
 jq -e '
-  .model == "ollama/qwen3-coder:30b" and
-  .small_model == "ollama/gpt-oss:20b" and
+  .model == "ollama/qwen3.8:27b" and
+  .small_model == "ollama/qwen3.8:27b" and
   .enabled_providers == ["ollama"] and
   .share == "disabled" and
   .autoupdate == false and
@@ -126,9 +139,10 @@ while IFS= read -r model; do
   model_id="${model#ollama/}"
   jq -e --arg model "$model_id" \
     '.provider.ollama.models[$model] != null' <<<"$config_json" >/dev/null
-done < <(jq -r '.routes[].model' "$routes")
+done < <(jq -r '[.routes[].model, (.profiles[] | .simple, .vision, .code, .fastCode),
+  .directOnly[], .localExperiments[]] | unique | .[]' "$routes")
 
-retired_pattern='devstral|deepseek-r1|llama3\.3|llama4|phi4|olmo-3|magistral|nemotron-3-super|translategemma'
+retired_pattern='gpt-oss:20b|qwen3-coder|nemotron-3\.5-lightning|nemotron3|glm-4\.7-flash|gemma4|qwen3-vl|qwen3-next|gpt-oss:120b|qwen3\.5:122b|devstral|deepseek-r1|llama3\.3|llama4|phi4|olmo-3|magistral|nemotron-3-super|translategemma'
 if grep -Eq "$retired_pattern" "$config"; then
   printf 'retired model remains in config\n' >&2
   exit 1

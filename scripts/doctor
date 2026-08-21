@@ -45,6 +45,10 @@ while (($#)); do
   shift
 done
 
+# Strict diagnosis includes executable local capacity: a policy-valid route to
+# an absent tag is not a healthy workstation.
+[[ "$strict" == true ]] && check_local_models=true
+
 failures=0
 warnings=0
 
@@ -125,7 +129,7 @@ validate_clone() {
   done
 }
 
-for command_name in jq git flock realpath stat sha256sum sed cut readlink grep; do
+for command_name in jq git flock realpath stat sha256sum sed cut readlink grep hostname; do
   if command -v "$command_name" >/dev/null 2>&1; then
     pass "dependency $command_name"
   else
@@ -187,16 +191,27 @@ fi
 
 routes_valid=false
 if jq -e '
-  .schemaVersion == 1 and
+  .schemaVersion == 2 and
   .routes == {
-    plan: {agent: "fleet-plan", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
-    build: {agent: "fleet-build", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
-    review: {agent: "fleet-review", model: "ollama/qwen3-coder:30b", costClass: "local-mid"}
+    plan: {agent: "fleet-plan", model: "ollama/qwen3.8:27b", costClass: "local-code"},
+    build: {agent: "fleet-build", model: "ollama/qwen3.8:27b", costClass: "local-code"},
+    review: {agent: "fleet-review", model: "ollama/qwen3.8:27b", costClass: "local-code"}
   } and
-  .ceiling == {
-    model: "ollama/qwen3-coder-next:q8_0",
-    costClass: "local-ceiling"
+  .profiles == {
+    mickey: {
+      hostnames: ["mickey", "strix-halo-a9-mega"],
+      simple: "ollama/muse-glimmer:latest", vision: "ollama/muse-glimmer:latest",
+      code: "ollama/qwen3.8:27b", fastCode: "ollama/ornith-1.5:35b"
+    },
+    flow: {
+      hostnames: ["flow"],
+      simple: "ollama/muse-glimmer:30b", vision: "ollama/muse-glimmer:30b",
+      code: "ollama/qwen3.8:27b", fastCode: "ollama/ornith-1.5:35b"
+    }
   } and
+  .ceiling == null and
+  .directOnly == ["ollama/ornith-1.5:35b"] and
+  .localExperiments == .directOnly and
   (.cloud.enabled | type == "boolean") and
   (.cloud.allowlist | type == "array") and
   all(.cloud.allowlist[];
@@ -206,7 +221,7 @@ if jq -e '
   ) and
   (.cloud.allowlist | length == (unique | length))
 ' "$routes" >/dev/null 2>&1; then
-  pass "deterministic local routes and explicit cloud policy"
+  pass "deterministic host-aware local routes and explicit cloud policy"
   routes_valid=true
   if [[ "$(jq -r '.cloud.enabled' "$routes")" == true ]]; then
     warn "paid cloud routing is enabled"
@@ -223,18 +238,16 @@ if jq -e . <<<"$config_json" >/dev/null 2>&1; then
   config_valid=true
   pass "staged JSONC parses after comment removal"
   if jq -e '
-    .model == "ollama/qwen3-coder:30b" and
-    .small_model == "ollama/gpt-oss:20b" and
+    .model == "ollama/qwen3.8:27b" and
+    .small_model == "ollama/qwen3.8:27b" and
     .enabled_providers == ["ollama"] and
     (.provider | keys) == ["ollama"] and
     (.provider.ollama | keys | sort) == ["models", "name", "npm", "options"] and
     .provider.ollama.npm == "@ai-sdk/openai-compatible" and
-    .provider.ollama.name == "Ollama (mickey loopback)" and
+    .provider.ollama.name == "Ollama (local loopback)" and
     .provider.ollama.options == {baseURL: "http://127.0.0.1:11434/v1"} and
-    (.provider.ollama.models | type) == "object" and
-    (.provider.ollama.models | has("gpt-oss:20b")) and
-    (.provider.ollama.models | has("qwen3-coder:30b")) and
-    (.provider.ollama.models | has("qwen3-coder-next:q8_0")) and
+    (.provider.ollama.models | keys) ==
+      ["muse-glimmer:30b", "muse-glimmer:latest", "ornith-1.5:35b", "qwen3.8:27b"] and
     .share == "disabled" and
     .autoupdate == false and
     .default_agent == "fleet-plan" and
@@ -303,14 +316,17 @@ if [[ "$config_valid" == true && "$routes_valid" == true ]]; then
     model_id="${model#ollama/}"
     if ! jq -e --arg model "$model_id" \
       '.provider.ollama.models[$model] != null' <<<"$config_json" >/dev/null; then
-      fail "route references a model absent from staged config"
+      fail "route or host profile references a model absent from staged config"
       missing_route_model=true
     fi
-  done < <(jq -r '.routes[].model' "$routes")
-  [[ "$missing_route_model" == true ]] || pass "all local routes exist in staged config"
+  done < <(jq -r '
+    [.routes[].model, (.profiles[] | .simple, .vision, .code, .fastCode),
+     .directOnly[], .localExperiments[]] | unique | .[]' "$routes")
+  [[ "$missing_route_model" == true ]] ||
+    pass "all local routes and host profiles exist in staged config"
 fi
 
-retired_pattern='devstral|deepseek-r1|llama3\.3|llama4|phi4|olmo-3|magistral|nemotron-3-super|translategemma'
+retired_pattern='gpt-oss:20b|qwen3-coder|nemotron-3\.5-lightning|nemotron3|glm-4\.7-flash|gemma4|qwen3-vl|qwen3-next|gpt-oss:120b|qwen3\.5:122b|devstral|deepseek-r1|llama3\.3|llama4|phi4|olmo-3|magistral|nemotron-3-super|translategemma'
 if grep -Eq "$retired_pattern" "$config"; then
   fail "retired fleet model remains in staged config"
 else
@@ -461,27 +477,37 @@ fi
 
 # The likeliest failure on a practice evening is not a policy breach: it is a
 # fully validated launcher starting a model that is not there. This check is
-# opt-in, read-only, and reaches only the pinned loopback endpoint, so it never
-# becomes a dependency of the launch path.
+# read-only and reaches only the pinned loopback endpoint. Strict mode enables
+# it automatically; --local-models remains available for a focused non-strict
+# check. Flow stays loopback-only: run doctor on Flow rather than rebinding or
+# probing its daemon remotely.
 if [[ "$check_local_models" == true ]]; then
   local_models_url="${OPENCODE_FLEET_MODELS_URL:-http://127.0.0.1:11434/v1/models}"
+  node_hostname="$(hostname -s)"
+  node_hostname="${node_hostname,,}"
+  node_profile="$(jq -r --arg hostname "$node_hostname" '
+    .profiles | to_entries[] |
+    select(.value.hostnames | index($hostname)) | .key
+  ' "$routes" 2>/dev/null || true)"
   [[ "$local_models_url" == http://127.0.0.1:* ||
      "$local_models_url" == http://localhost:* ]] ||
     { printf 'doctor: model checks are loopback-only\n' >&2; exit 2; }
-  if ! command -v curl >/dev/null 2>&1; then
+  if [[ -z "$node_profile" ]]; then
+    fail "hostname $node_hostname has no model route profile"
+  elif ! command -v curl >/dev/null 2>&1; then
     fail "curl is required for --local-models"
   elif ! installed_models="$(curl -fsS --max-time 5 -- "$local_models_url" 2>/dev/null)"; then
     fail "local model daemon is unreachable at $local_models_url"
   elif ! jq -e '.data | type == "array"' <<<"$installed_models" >/dev/null 2>&1; then
     fail "local model daemon returned an unexpected model listing"
   else
-    pass "local model daemon is reachable"
+    pass "local model daemon is reachable for profile $node_profile"
     if [[ "$routes_valid" == true ]]; then
       missing_local_model=false
       while IFS= read -r required_model; do
         [[ -n "$required_model" ]] || continue
         if jq -e --arg model "${required_model#ollama/}" \
-          'any(.data[]; .id == $model or (.id | split(":")[0]) == $model)' \
+          'any(.data[]; .id == $model)' \
           <<<"$installed_models" >/dev/null; then
           pass "local model present: $required_model"
         else
@@ -489,10 +515,13 @@ if [[ "$check_local_models" == true ]]; then
           missing_local_model=true
         fi
       done < <(jq -r '
-        [.routes[].model, .ceiling.model, (.localExperiments // [])[]] |
-        unique | .[]' "$routes")
+        [.routes[].model,
+         .profiles[$profile].simple, .profiles[$profile].vision,
+         .profiles[$profile].code, .profiles[$profile].fastCode,
+         .directOnly[], .localExperiments[]] | unique | .[]
+      ' --arg profile "$node_profile" "$routes")
       [[ "$missing_local_model" == true ]] ||
-        pass "every routed and allowlisted local model is pulled"
+        pass "every exact routed tag for profile $node_profile is pulled"
     fi
   fi
 fi

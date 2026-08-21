@@ -1,39 +1,44 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "routes": {
     "plan": {
       "agent": "fleet-plan",
-      "model": "ollama/qwen3-coder:30b",
-      "costClass": "local-mid"
+      "model": "ollama/qwen3.8:27b",
+      "costClass": "local-code"
     },
     "build": {
       "agent": "fleet-build",
-      "model": "ollama/qwen3-coder:30b",
-      "costClass": "local-mid"
+      "model": "ollama/qwen3.8:27b",
+      "costClass": "local-code"
     },
     "review": {
       "agent": "fleet-review",
-      "model": "ollama/qwen3-coder:30b",
-      "costClass": "local-mid"
+      "model": "ollama/qwen3.8:27b",
+      "costClass": "local-code"
     }
   },
-  "ceiling": {
-    "model": "ollama/qwen3-coder-next:q8_0",
-    "costClass": "local-ceiling"
+  "profiles": {
+    "mickey": {
+      "hostnames": ["mickey", "strix-halo-a9-mega"],
+      "simple": "ollama/muse-glimmer:latest",
+      "vision": "ollama/muse-glimmer:latest",
+      "code": "ollama/qwen3.8:27b",
+      "fastCode": "ollama/ornith-1.5:35b"
+    },
+    "flow": {
+      "hostnames": ["flow"],
+      "simple": "ollama/muse-glimmer:30b",
+      "vision": "ollama/muse-glimmer:30b",
+      "code": "ollama/qwen3.8:27b",
+      "fastCode": "ollama/ornith-1.5:35b"
+    }
   },
+  "ceiling": null,
+  "directOnly": [
+    "ollama/ornith-1.5:35b"
+  ],
   "localExperiments": [
-    "ollama/gpt-oss:20b",
-    "ollama/qwen3.8:27b",
-    "ollama/nemotron-3.5-lightning:30b",
-    "ollama/nemotron3:33b",
-    "ollama/command-r:35b",
-    "ollama/gemma4:26b",
-    "ollama/glm-4.7-flash",
-    "ollama/muse-glimmer",
-    "ollama/qwen3-vl:32b",
-    "ollama/qwen3-next:80b",
-    "ollama/gpt-oss:120b",
-    "ollama/qwen3.5:122b"
+    "ollama/ornith-1.5:35b"
   ],
   "cloud": {
     "enabled": false,

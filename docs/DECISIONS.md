@@ -58,13 +58,14 @@ outside its policy even in standard-risk repositories.
 ## D8 — Local means one exact loopback provider
 
 The normal cost fallback contains only the Ollama provider, the pinned
-OpenAI-compatible adapter, the mickey loopback URL, and an exact
-`enabled_providers: ["ollama"]` gate. Plan, build, review, and ceiling routes
-are exact values. Ordinary local execution removes common paid-provider
-credentials from the child environment. The explicit allowlisted cloud lane
-enables only its requested provider for that run. Alternate local models,
-remote-compatible base URLs, extra providers, and implicit fallback are
-configuration errors rather than routing choices.
+OpenAI-compatible adapter, the host-local loopback URL, and an exact
+`enabled_providers: ["ollama"]` gate. Plan, build, and review pin
+`qwen3.8:27b`; there is no approved ceiling route. Host profiles pin the exact
+Muse simple/vision tag and Ornith fast-code tag available on Mickey and Flow.
+Ordinary local execution removes common paid-provider credentials from the
+child environment. The explicit allowlisted cloud lane enables only its
+requested provider for that run. Remote-compatible base URLs, extra providers,
+and implicit fallback are configuration errors rather than routing choices.
 
 ## D9 — Install intent is durable before target mutation
 
@@ -96,23 +97,22 @@ tools inherit the fail-closed default.
 
 ## D12 — Practising with another local model is an allowlisted escalation
 
-D8 originally treated any model other than the pinned route and ceiling as a
-configuration error. That kept the daily lane deterministic but left the staged
-provider catalog unreachable, so deliberate practice with a different local
-model had no sanctioned path at all and the only way to try one was to edit the
-route table and defeat strict validation.
+D8 originally treated any model other than the pinned routes as a configuration
+error. That kept the daily lane deterministic but left the staged provider
+catalog unreachable, so deliberate practice with a different local model had no
+sanctioned path at all and the only way to try one was to edit the route table
+and defeat strict validation.
 
-`--experiment ollama/<model>` is that path, in the same shape as `--ceiling`
-and `--cloud`: an explicit command-line request, checked against an exact
-`localExperiments` allowlist in config/model-routes.json, required to exist in
-the staged provider catalog, forbidden from shadowing a pinned route, and
-mutually exclusive with the other escalations. The shipped allowlist is empty.
+`--experiment ollama/ornith-1.5:35b` is that path: an explicit command-line
+request checked against the exact direct-only allowlist, required to exist in
+the staged provider catalog, forbidden from shadowing the Qwen daily route, and
+mutually exclusive with the other escalations.
 
-D8's actual invariants are unchanged: only the Ollama provider, only the mickey
+D8's actual invariants are unchanged: only the Ollama provider, only the local
 loopback URL, `enabled_providers` exactly `["ollama"]`, no environment model
-override, and no fallback. What is amended is only the claim that alternate
-local models are errors; on free local compute, the cost the pin was protecting
-against does not exist.
+override, and no fallback. What is amended is only the claim that all alternate
+local models are errors: the verified Ornith tag has one explicit, auditable
+fast-code path.
 
 ## D13 — A record that outlives its process must not lie
 

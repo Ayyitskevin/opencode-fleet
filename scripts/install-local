@@ -211,18 +211,16 @@ jq -e '
     ["$schema", "agent", "autoupdate", "default_agent", "enabled_providers",
      "instructions", "mcp", "model", "permission", "plugin", "provider",
      "share", "skills", "small_model", "snapshot"] and
-  .model == "ollama/qwen3-coder:30b" and
-  .small_model == "ollama/gpt-oss:20b" and
+  .model == "ollama/qwen3.8:27b" and
+  .small_model == "ollama/qwen3.8:27b" and
   .enabled_providers == ["ollama"] and
   (.provider | keys) == ["ollama"] and
   (.provider.ollama | keys | sort) == ["models", "name", "npm", "options"] and
   .provider.ollama.npm == "@ai-sdk/openai-compatible" and
-  .provider.ollama.name == "Ollama (mickey loopback)" and
+  .provider.ollama.name == "Ollama (local loopback)" and
   .provider.ollama.options == {baseURL: "http://127.0.0.1:11434/v1"} and
-  (.provider.ollama.models | type) == "object" and
-  (.provider.ollama.models | has("gpt-oss:20b")) and
-  (.provider.ollama.models | has("qwen3-coder:30b")) and
-  (.provider.ollama.models | has("qwen3-coder-next:q8_0")) and
+  (.provider.ollama.models | keys) ==
+    ["muse-glimmer:30b", "muse-glimmer:latest", "ornith-1.5:35b", "qwen3.8:27b"] and
   .share == "disabled" and
   .autoupdate == false and
   .default_agent == "fleet-plan" and
@@ -361,16 +359,27 @@ jq -e '
 fleet_assert_permission_contract <"$source_guard" ||
   die "runtime guard failed the canonical credential and shell contract"
 jq -e '
-  .schemaVersion == 1 and
+  .schemaVersion == 2 and
   .routes == {
-    plan: {agent: "fleet-plan", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
-    build: {agent: "fleet-build", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
-    review: {agent: "fleet-review", model: "ollama/qwen3-coder:30b", costClass: "local-mid"}
+    plan: {agent: "fleet-plan", model: "ollama/qwen3.8:27b", costClass: "local-code"},
+    build: {agent: "fleet-build", model: "ollama/qwen3.8:27b", costClass: "local-code"},
+    review: {agent: "fleet-review", model: "ollama/qwen3.8:27b", costClass: "local-code"}
   } and
-  .ceiling == {
-    model: "ollama/qwen3-coder-next:q8_0",
-    costClass: "local-ceiling"
+  .profiles == {
+    mickey: {
+      hostnames: ["mickey", "strix-halo-a9-mega"],
+      simple: "ollama/muse-glimmer:latest", vision: "ollama/muse-glimmer:latest",
+      code: "ollama/qwen3.8:27b", fastCode: "ollama/ornith-1.5:35b"
+    },
+    flow: {
+      hostnames: ["flow"],
+      simple: "ollama/muse-glimmer:30b", vision: "ollama/muse-glimmer:30b",
+      code: "ollama/qwen3.8:27b", fastCode: "ollama/ornith-1.5:35b"
+    }
   } and
+  .ceiling == null and
+  .directOnly == ["ollama/ornith-1.5:35b"] and
+  .localExperiments == .directOnly and
   (.cloud.enabled | type == "boolean") and
   (.cloud.allowlist | type == "array") and
   all(.cloud.allowlist[];

@@ -76,35 +76,25 @@ untouched.
 
 ## 8. Practising with other local models
 
-`localExperiments` in `config/model-routes.json` already lists the staged models
-that are not pinned to a route. Confirm they are pulled
-(`scripts/doctor --local-models`), then:
+The sole direct-only fast-code route is Ornith 1.5. Confirm the active host's
+exact routed tags are pulled (`scripts/doctor --strict`), then:
 
-    oc Icarus plan --experiment ollama/qwen3.8:27b
+    oc Icarus plan --experiment ollama/ornith-1.5:35b
 
 Run the same task across models, then compare with `oc diff` and `oc stats`.
-Trim the list to taste: the two models pinned to the daily routes are rejected
-from it, so an experiment can never quietly become the default.
+Ornith is explicit-only, so it can never quietly become the default.
 
-Every catalogued model advertises tool calling, which an agent lane requires.
-Where to start, by what each is actually built for:
+The verified host profiles are:
 
-| Model | Reach for it when |
-| --- | --- |
-| `muse-glimmer` | agentic work — purpose-built for tool loops, recovers from failed calls, reads screenshots |
-| `qwen3.8:27b` | agentic coding with a very long context; also reads images |
-| `glm-4.7-flash` | agentic coding at speed (MoE, ~3B active) |
-| `nemotron-3.5-lightning:30b` | long-running agent execution: many fast tool calls |
-| `gemma4:26b` | a second opinion from a different family |
-| `nemotron3:33b` | documents, screenshots, and transcripts rather than code |
-| `command-r:35b` | long-context chat and retrieval; the oldest of the set |
-| `gpt-oss:120b`, `qwen3.5:122b`, `qwen3-next:80b` | when you want the largest local answer and can wait |
-| `gpt-oss:20b` | quick, cheap iterations |
+| Lane | Mickey | Flow |
+| --- | --- | --- |
+| daily code | `qwen3.8:27b` | `qwen3.8:27b` |
+| direct-only fast code | `ornith-1.5:35b` | `ornith-1.5:35b` |
+| simple / vision | `muse-glimmer:latest` | `muse-glimmer:30b` |
 
-Models that are pulled but deliberately not catalogued cannot drive an agent
-lane at all: embeddings (`qwen3-embedding`, `bge-m3`, `nomic-embed-text`),
-safety classifiers (`gpt-oss-safeguard`, `shieldgemma`), and single-domain
-models (`translategemma`, `medgemma`).
+Other pulled models are outside this harness's agent-routing policy. Embeddings,
+safety classifiers, medical models, and retrieval models remain available to
+their owning services but are not silent substitutes for an OpenCode lane.
 
 ## 9. Throwaway practice
 
@@ -114,7 +104,7 @@ Practising should not require a catalogued GitHub repository:
     oc sandbox list
     oc sandbox scratch                    # plan
     oc sandbox scratch build              # private worktree, as usual
-    oc sandbox scratch plan --experiment ollama/qwen3.8:27b
+    oc sandbox scratch plan --experiment ollama/ornith-1.5:35b
     oc diff <run-id>
 
 A sandbox has no remote, so nothing in it can be published. Build still needs

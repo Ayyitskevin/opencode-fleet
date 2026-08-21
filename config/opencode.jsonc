@@ -3,8 +3,8 @@
 
   // Local Ollama remains the installed default. scripts/oc chooses an exact
   // model per mode from config/model-routes.json and never falls back.
-  "model": "ollama/qwen3-coder:30b",
-  "small_model": "ollama/gpt-oss:20b",
+  "model": "ollama/qwen3.8:27b",
+  "small_model": "ollama/qwen3.8:27b",
   "enabled_providers": ["ollama"],
   "default_agent": "fleet-plan",
   "autoupdate": false,
@@ -18,42 +18,29 @@
   "provider": {
     "ollama": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Ollama (mickey loopback)",
+      "name": "Ollama (local loopback)",
       "options": {
         "baseURL": "http://127.0.0.1:11434/v1"
       },
       "models": {
-        "gpt-oss:20b": {"name": "GPT-OSS 20B (small, fast)", "tools": true},
-        "qwen3-coder:30b": {"name": "Qwen3 Coder 30B (daily code)", "tools": true},
-        "qwen3-coder-next:q8_0": {"name": "Qwen3 Coder Next Q8 (code ceiling)", "tools": true},
-        "muse-glimmer": {
-          "id": "muse-glimmer:latest",
-          "name": "Muse Glimmer 30B (agentic, vision)",
-          "tools": true,
-          "modalities": {"input": ["text", "image"], "output": ["text"]}
-        },
         "qwen3.8:27b": {
-          "name": "Qwen3.8 27B (agentic code, vision)",
+          "name": "Qwen3.8 27B (primary code)",
+          "tools": true
+        },
+        "ornith-1.5:35b": {
+          "name": "Ornith 1.5 35B (direct-only fast code)",
+          "tools": true
+        },
+        "muse-glimmer:latest": {
+          "name": "Muse Glimmer (Mickey simple and vision)",
           "tools": true,
           "modalities": {"input": ["text", "image"], "output": ["text"]}
         },
-        "nemotron-3.5-lightning:30b": {"name": "Nemotron 3.5 Lightning 30B (fast agent execution)", "tools": true},
-        "glm-4.7-flash": {"id": "glm-4.7-flash:latest", "name": "GLM 4.7 Flash 30B (agentic code)", "tools": true},
-        "gemma4:26b": {"name": "Gemma4 26B (tool use)", "tools": true},
-        "nemotron3:33b": {
-          "name": "Nemotron 3 Nano Omni 33B (documents, vision)",
+        "muse-glimmer:30b": {
+          "name": "Muse Glimmer 30B (Flow simple and vision)",
           "tools": true,
           "modalities": {"input": ["text", "image"], "output": ["text"]}
-        },
-        "command-r:35b": {"name": "Command R 35B (long-context chat and RAG)", "tools": true},
-        "qwen3-vl:32b": {
-          "name": "Qwen3 VL 32B (vision)",
-          "tools": true,
-          "modalities": {"input": ["text", "image"], "output": ["text"]}
-        },
-        "qwen3-next:80b": {"name": "Qwen3 Next 80B (heavy)", "tools": true},
-        "gpt-oss:120b": {"name": "GPT-OSS 120B (heavy)", "tools": true},
-        "qwen3.5:122b": {"name": "Qwen3.5 122B (largest)", "tools": true}
+        }
       }
     }
   },
