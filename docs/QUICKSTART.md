@@ -91,15 +91,18 @@ Where to start, by what each is actually built for:
 
 | Model | Reach for it when |
 | --- | --- |
-| `muse-glimmer` | agentic work — purpose-built for tool loops, recovers from failed calls, reads screenshots |
-| `qwen3.8:27b` | agentic coding with a very long context; also reads images |
-| `glm-4.7-flash` | agentic coding at speed (MoE, ~3B active) |
-| `nemotron-3.5-lightning:30b` | long-running agent execution: many fast tool calls |
-| `gemma4:26b` | a second opinion from a different family |
-| `nemotron3:33b` | documents, screenshots, and transcripts rather than code |
-| `command-r:35b` | long-context chat and retrieval; the oldest of the set |
-| `gpt-oss:120b`, `qwen3.5:122b`, `qwen3-next:80b` | when you want the largest local answer and can wait |
-| `gpt-oss:20b` | quick, cheap iterations |
+| `qwen3.8:27b` | **the pinned default** for plan/build/review — agentic coding, very long context, also reads images |
+| `muse-glimmer` | the small/simple lane and the multimodal alternative — purpose-built for tool loops, recovers from failed calls, reads screenshots |
+| `command-r:35b` | `--ceiling` — long-context chat and retrieval; the largest local model that is safe inside an agent loop |
+| `ornith-1.5:35b` | `--experiment` / non-interactive `--prompt` runs ONLY — the fastest 35B coder, but it stalls in agent loops. Never wire it as a route or a seat |
+| `medgemma:27b` | medical-domain questions |
+
+The >35B ceiling class was **retired 2026-08-15** — `gpt-oss:120b`, `qwen3.5:122b`,
+`qwen3-next:80b`, `nemotron-3.5-lightning:30b`, `nemotron3:33b`, `qwen3-vl:32b`,
+`gemma4:26b`, `glm-4.7-flash`, `gpt-oss:20b`, and the `qwen3-coder` models are
+GONE from the fleet and must not be reintroduced without a roster pass. The
+largest routable local model is now 35B. Catalog rows are verified against the
+live Ollama roster by `shared/roster-check.sh`; run it after any `ollama rm`.
 
 Models that are pulled but deliberately not catalogued cannot drive an agent
 lane at all: embeddings (`qwen3-embedding`, `bge-m3`, `nomic-embed-text`),

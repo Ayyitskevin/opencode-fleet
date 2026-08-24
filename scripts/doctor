@@ -189,12 +189,12 @@ routes_valid=false
 if jq -e '
   .schemaVersion == 1 and
   .routes == {
-    plan: {agent: "fleet-plan", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
-    build: {agent: "fleet-build", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
-    review: {agent: "fleet-review", model: "ollama/qwen3-coder:30b", costClass: "local-mid"}
+    plan: {agent: "fleet-plan", model: "ollama/qwen3.8:27b", costClass: "local-mid"},
+    build: {agent: "fleet-build", model: "ollama/qwen3.8:27b", costClass: "local-mid"},
+    review: {agent: "fleet-review", model: "ollama/qwen3.8:27b", costClass: "local-mid"}
   } and
   .ceiling == {
-    model: "ollama/qwen3-coder-next:q8_0",
+    model: "ollama/command-r:35b",
     costClass: "local-ceiling"
   } and
   (.cloud.enabled | type == "boolean") and
@@ -223,8 +223,8 @@ if jq -e . <<<"$config_json" >/dev/null 2>&1; then
   config_valid=true
   pass "staged JSONC parses after comment removal"
   if jq -e '
-    .model == "ollama/qwen3-coder:30b" and
-    .small_model == "ollama/gpt-oss:20b" and
+    .model == "ollama/qwen3.8:27b" and
+    .small_model == "ollama/muse-glimmer" and
     .enabled_providers == ["ollama"] and
     (.provider | keys) == ["ollama"] and
     (.provider.ollama | keys | sort) == ["models", "name", "npm", "options"] and
@@ -232,9 +232,9 @@ if jq -e . <<<"$config_json" >/dev/null 2>&1; then
     .provider.ollama.name == "Ollama (mickey loopback)" and
     .provider.ollama.options == {baseURL: "http://127.0.0.1:11434/v1"} and
     (.provider.ollama.models | type) == "object" and
-    (.provider.ollama.models | has("gpt-oss:20b")) and
-    (.provider.ollama.models | has("qwen3-coder:30b")) and
-    (.provider.ollama.models | has("qwen3-coder-next:q8_0")) and
+    (.provider.ollama.models | has("qwen3.8:27b")) and
+    (.provider.ollama.models | has("muse-glimmer")) and
+    (.provider.ollama.models | has("command-r:35b")) and
     .share == "disabled" and
     .autoupdate == false and
     .default_agent == "fleet-plan" and
@@ -310,7 +310,7 @@ if [[ "$config_valid" == true && "$routes_valid" == true ]]; then
   [[ "$missing_route_model" == true ]] || pass "all local routes exist in staged config"
 fi
 
-retired_pattern='devstral|deepseek-r1|llama3\.3|llama4|phi4|olmo-3|magistral|nemotron-3-super|translategemma'
+retired_pattern='devstral|deepseek-r1|llama3\.3|llama4|phi4|olmo-3|magistral|nemotron-3-super|translategemma|qwen3-coder|qwen3-next|qwen3\.5:122b|qwen3\.6|gpt-oss:20b|gpt-oss:120b|gemma4|nemotron-3\.5-lightning|nemotron3:33b|qwen3-vl:32b|glm-4\.7-flash'
 if grep -Eq "$retired_pattern" "$config"; then
   fail "retired fleet model remains in staged config"
 else

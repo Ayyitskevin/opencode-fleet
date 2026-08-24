@@ -211,8 +211,8 @@ jq -e '
     ["$schema", "agent", "autoupdate", "default_agent", "enabled_providers",
      "instructions", "mcp", "model", "permission", "plugin", "provider",
      "share", "skills", "small_model", "snapshot"] and
-  .model == "ollama/qwen3-coder:30b" and
-  .small_model == "ollama/gpt-oss:20b" and
+  .model == "ollama/qwen3.8:27b" and
+  .small_model == "ollama/muse-glimmer" and
   .enabled_providers == ["ollama"] and
   (.provider | keys) == ["ollama"] and
   (.provider.ollama | keys | sort) == ["models", "name", "npm", "options"] and
@@ -220,9 +220,9 @@ jq -e '
   .provider.ollama.name == "Ollama (mickey loopback)" and
   .provider.ollama.options == {baseURL: "http://127.0.0.1:11434/v1"} and
   (.provider.ollama.models | type) == "object" and
-  (.provider.ollama.models | has("gpt-oss:20b")) and
-  (.provider.ollama.models | has("qwen3-coder:30b")) and
-  (.provider.ollama.models | has("qwen3-coder-next:q8_0")) and
+  (.provider.ollama.models | has("qwen3.8:27b")) and
+  (.provider.ollama.models | has("muse-glimmer")) and
+  (.provider.ollama.models | has("command-r:35b")) and
   .share == "disabled" and
   .autoupdate == false and
   .default_agent == "fleet-plan" and
@@ -363,12 +363,12 @@ fleet_assert_permission_contract <"$source_guard" ||
 jq -e '
   .schemaVersion == 1 and
   .routes == {
-    plan: {agent: "fleet-plan", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
-    build: {agent: "fleet-build", model: "ollama/qwen3-coder:30b", costClass: "local-mid"},
-    review: {agent: "fleet-review", model: "ollama/qwen3-coder:30b", costClass: "local-mid"}
+    plan: {agent: "fleet-plan", model: "ollama/qwen3.8:27b", costClass: "local-mid"},
+    build: {agent: "fleet-build", model: "ollama/qwen3.8:27b", costClass: "local-mid"},
+    review: {agent: "fleet-review", model: "ollama/qwen3.8:27b", costClass: "local-mid"}
   } and
   .ceiling == {
-    model: "ollama/qwen3-coder-next:q8_0",
+    model: "ollama/command-r:35b",
     costClass: "local-ceiling"
   } and
   (.cloud.enabled | type == "boolean") and

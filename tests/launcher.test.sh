@@ -164,7 +164,7 @@ plan_output="$(env "${common_env[@]}" "$fleet_root/scripts/oc" example --dry-run
 jq -e '
   .mode == "plan" and
   .agent == "fleet-plan" and
-  .model == "ollama/qwen3-coder:30b" and
+  .model == "ollama/qwen3.8:27b" and
   .costClass == "local-mid" and
   .executionPath == .sourcePath
 ' <<<"$plan_output" >/dev/null
@@ -177,7 +177,7 @@ build_output="$(env "${common_env[@]}" "$fleet_root/scripts/oc" Example build --
 jq -e '
   .mode == "build" and
   .agent == "fleet-build" and
-  .model == "ollama/qwen3-coder:30b" and
+  .model == "ollama/qwen3.8:27b" and
   .costClass == "local-mid" and
   .executionPath == "private-run-worktree" and
   .dirty == false
@@ -187,7 +187,7 @@ review_output="$(env "${common_env[@]}" "$fleet_root/scripts/oc" Example review 
 jq -e '
   .mode == "review" and
   .agent == "fleet-review" and
-  .model == "ollama/qwen3-coder:30b" and
+  .model == "ollama/qwen3.8:27b" and
   .costClass == "local-mid"
 ' <<<"$review_output" >/dev/null
 
@@ -196,7 +196,7 @@ ceiling_output="$(
 )"
 jq -e '
   .mode == "review" and
-  .model == "ollama/qwen3-coder-next:q8_0" and
+  .model == "ollama/command-r:35b" and
   .costClass == "local-ceiling"
 ' <<<"$ceiling_output" >/dev/null
 
@@ -252,16 +252,16 @@ assert_refusal_early "experiment outside the shipped allowlist" \
   env "${common_env[@]}" "$fleet_root/scripts/oc" Example \
   --experiment ollama/not-allowlisted:1b --dry-run
 
-jq '.localExperiments = ["ollama/qwen3.8:27b"]' \
+jq '.localExperiments = ["ollama/muse-glimmer"]' \
   "$fleet_root/config/model-routes.json" >"$experiment_routes"
 experiment_output="$(
   env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
-    "$fleet_root/scripts/oc" Example plan --experiment ollama/qwen3.8:27b --dry-run
+    "$fleet_root/scripts/oc" Example plan --experiment ollama/muse-glimmer --dry-run
 )"
 jq -e '
   .mode == "plan" and
   .agent == "fleet-plan" and
-  .model == "ollama/qwen3.8:27b" and
+  .model == "ollama/muse-glimmer" and
   .costClass == "local-experiment"
 ' <<<"$experiment_output" >/dev/null ||
   { printf 'allowlisted experiment model was not selected\n' >&2; exit 1; }
@@ -277,28 +277,28 @@ assert_refusal_early "experiment model absent from the catalog" \
 # The daily routes stay deterministic: an experiment cannot be requested by
 # environment variable, cannot shadow a pinned route, and cannot combine with
 # another escalation.
-jq '.localExperiments = ["ollama/qwen3-coder:30b"]' \
+jq '.localExperiments = ["ollama/qwen3.8:27b"]' \
   "$fleet_root/config/model-routes.json" >"$experiment_routes"
 assert_refusal_early "experiment allowlist shadowing a pinned route" \
   "model routes failed strict validation" \
   env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
   "$fleet_root/scripts/oc" Example --dry-run
 
-jq '.localExperiments = ["ollama/qwen3.8:27b"]' \
+jq '.localExperiments = ["ollama/muse-glimmer"]' \
   "$fleet_root/config/model-routes.json" >"$experiment_routes"
 for exclusive_flag in --ceiling --cloud; do
   assert_refusal_early "experiment combined with $exclusive_flag" \
     "mutually exclusive" \
     env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
-    "$fleet_root/scripts/oc" Example --experiment ollama/qwen3.8:27b \
+    "$fleet_root/scripts/oc" Example --experiment ollama/muse-glimmer \
     "$exclusive_flag" --dry-run
 done
 default_route_output="$(
   env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$experiment_routes" \
-    OPENCODE_FLEET_EXPERIMENT=ollama/qwen3.8:27b \
+    OPENCODE_FLEET_EXPERIMENT=ollama/muse-glimmer \
     "$fleet_root/scripts/oc" Example --dry-run
 )"
-jq -e '.model == "ollama/qwen3-coder:30b" and .costClass == "local-mid"' \
+jq -e '.model == "ollama/qwen3.8:27b" and .costClass == "local-mid"' \
   <<<"$default_route_output" >/dev/null ||
   { printf 'an environment variable changed the daily model route\n' >&2
     exit 1; }
@@ -455,7 +455,7 @@ for config_mutation in extra-enabled-provider grep-allow lsp-allow unknown-conte
 done
 
 bad_routes="$temp_root/bad-routes.json"
-jq '.routes.plan.model = "ollama/qwen3.8:27b"' \
+jq '.routes.plan.model = "ollama/muse-glimmer"' \
   "$fleet_root/config/model-routes.json" >"$bad_routes"
 if env "${common_env[@]}" OPENCODE_FLEET_ROUTES="$bad_routes" \
   "$fleet_root/scripts/oc" Example --dry-run >/dev/null 2>&1; then
@@ -571,7 +571,7 @@ execution_path="$(jq -r '.executionPath' "$record")"
   { printf 'build mutated its dedicated source clone\n' >&2; exit 1; }
 [[ "$(wc -l <"$fake_log")" -eq 1 ]] ||
   { printf 'launcher invoked the model more than once\n' >&2; exit 1; }
-grep -q -- '--pure .* --agent fleet-build --model ollama/qwen3-coder:30b' "$fake_log"
+grep -q -- '--pure .* --agent fleet-build --model ollama/qwen3.8:27b' "$fake_log"
 jq -e \
   --arg home "$state_root/runs/build-success/runtime-home" \
   --arg config "$fleet_root/config/opencode.jsonc" '
@@ -823,7 +823,7 @@ env "${common_env[@]}" "$fleet_root/scripts/oc" diff history-build |
   { printf 'a read-only subcommand mutated a run record\n' >&2; exit 1; }
 
 env "${common_env[@]}" "$fleet_root/scripts/oc" note history-build \
-  'qwen3-coder planned well but missed the test layout' >/dev/null
+  'qwen3.8 planned well but missed the test layout' >/dev/null
 jq -e '
   (.notes | length) == 1 and
   (.notes[0].note | test("missed the test layout")) and
@@ -831,7 +831,7 @@ jq -e '
 ' "$history_record" >/dev/null ||
   { printf 'oc note did not append an operator note\n' >&2; exit 1; }
 stats_table="$(env "${common_env[@]}" "$fleet_root/scripts/oc" stats)"
-grep -q 'ollama/qwen3-coder:30b' <<<"$stats_table" ||
+grep -q 'ollama/qwen3.8:27b' <<<"$stats_table" ||
   { printf 'oc stats did not aggregate by model\n' >&2; exit 1; }
 grep -q 'Example' \
   <<<"$(env "${common_env[@]}" "$fleet_root/scripts/oc" stats --repo)" ||
@@ -881,7 +881,7 @@ sandbox_plan="$(env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox scratch
 jq -e '
   .repository == "scratch" and .fullName == "sandbox/scratch" and
   .sandbox == true and .risk == "sandbox" and
-  .model == "ollama/qwen3-coder:30b"
+  .model == "ollama/qwen3.8:27b"
 ' <<<"$sandbox_plan" >/dev/null ||
   { printf 'sandbox plan did not resolve to lane-owned state\n' >&2; exit 1; }
 
@@ -958,7 +958,7 @@ prompt_record="$state_root/runs/prompt-build/record.json"
 grep -q '^run --pure --dir ' "$fake_log" ||
   { printf 'prompt run was not non-interactive: %s\n' "$(cat "$fake_log")" >&2
     exit 1; }
-grep -q ' --agent fleet-build --model ollama/qwen3-coder:30b ' "$fake_log" ||
+grep -q ' --agent fleet-build --model ollama/qwen3.8:27b ' "$fake_log" ||
   { printf 'prompt run used the wrong agent/model: %s\n' "$(cat "$fake_log")" >&2
     exit 1; }
 grep -q 'implement the foo feature$' "$fake_log" ||
@@ -967,7 +967,7 @@ grep -q 'implement the foo feature$' "$fake_log" ||
 jq -e '
   .status == "completed" and .mode == "build" and
   .prompt == "implement the foo feature" and
-  .model == "ollama/qwen3-coder:30b" and
+  .model == "ollama/qwen3.8:27b" and
   .diffstat.files == 1
 ' "$prompt_record" >/dev/null ||
   { printf 'prompt run record was wrong\n'; jq . "$prompt_record" >&2; exit 1; }
@@ -991,11 +991,11 @@ printf 'add a greeting module\n' >"$compare_prompt"
 compare_output="$(env "${sandbox_env[@]}" FAKE_MUTATE=1 \
   "$fleet_root/scripts/oc" sandbox scratch compare \
   --prompt "$compare_prompt" \
-  --models ollama/qwen3.8:27b,ollama/gemma4:26b 2>&1)" ||
+  --models ollama/muse-glimmer,ollama/ornith-1.5:35b 2>&1)" ||
   { printf 'compare failed:\n%s\n' "$compare_output" >&2; exit 1; }
 # The comparison table has one completed row per requested model.
 compare_table="$(awk '/^=== comparison ===/{f=1; next} f' <<<"$compare_output")"
-for cm in ollama/gemma4:26b ollama/qwen3.8:27b; do
+for cm in ollama/muse-glimmer ollama/ornith-1.5:35b; do
   awk -F'\t' -v m="$cm" '$1==m && $2=="completed" {found=1} END{exit !found}' \
     <<<"$compare_table" ||
     { printf 'compare table missing completed row for %s:\n%s\n' "$cm" \
@@ -1004,10 +1004,10 @@ done
 # compare --dry-run lists the model set without dispatching any run.
 compare_dry="$(env "${sandbox_env[@]}" \
   "$fleet_root/scripts/oc" sandbox scratch compare \
-  --prompt "$compare_prompt" --models ollama/qwen3.8:27b,ollama/gemma4:26b \
+  --prompt "$compare_prompt" --models ollama/muse-glimmer,ollama/ornith-1.5:35b \
   --dry-run)"
 jq -e '.mode == "compare" and
-  (.models | sort == ["ollama/gemma4:26b","ollama/qwen3.8:27b"])' \
+  (.models | sort == ["ollama/muse-glimmer","ollama/ornith-1.5:35b"])' \
   <<<"$compare_dry" >/dev/null ||
   { printf 'compare dry-run was wrong:\n%s\n' "$compare_dry" >&2; exit 1; }
 # compare requires --prompt and rejects the other escalations; a model outside
@@ -1020,7 +1020,7 @@ assert_refusal_early "compare with --experiment" "incompatible" \
 assert_refusal_early "compare with non-allowlisted model" \
   "not in the local experiment allowlist" \
   env "${sandbox_env[@]}" "$fleet_root/scripts/oc" sandbox scratch compare \
-  --prompt "$compare_prompt" --models ollama/qwen3-coder:30b
+  --prompt "$compare_prompt" --models ollama/qwen3.8:27b
 
 # `oc resume <run-id>` re-enters a build run's session with `opencode --continue`
 # under the identical sanitized environment. Each run's isolated runtime home
@@ -1029,7 +1029,7 @@ resume_prompt="$temp_root/resume-task.txt"
 printf 'add a comment\n' >"$resume_prompt"
 env "${sandbox_env[@]}" OPENCODE_FLEET_RUN_ID=resume-source \
   "$fleet_root/scripts/oc" sandbox scratch build --prompt "$resume_prompt" \
-  --experiment ollama/qwen3.8:27b >/dev/null
+  --experiment ollama/muse-glimmer >/dev/null
 : >"$fake_log"
 env "${sandbox_env[@]}" "$fleet_root/scripts/oc" resume resume-source >/dev/null
 resume_record="$state_root/runs/resume-source/record.json"

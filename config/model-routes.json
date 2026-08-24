@@ -3,37 +3,28 @@
   "routes": {
     "plan": {
       "agent": "fleet-plan",
-      "model": "ollama/qwen3-coder:30b",
+      "model": "ollama/qwen3.8:27b",
       "costClass": "local-mid"
     },
     "build": {
       "agent": "fleet-build",
-      "model": "ollama/qwen3-coder:30b",
+      "model": "ollama/qwen3.8:27b",
       "costClass": "local-mid"
     },
     "review": {
       "agent": "fleet-review",
-      "model": "ollama/qwen3-coder:30b",
+      "model": "ollama/qwen3.8:27b",
       "costClass": "local-mid"
     }
   },
   "ceiling": {
-    "model": "ollama/qwen3-coder-next:q8_0",
+    "model": "ollama/command-r:35b",
     "costClass": "local-ceiling"
   },
   "localExperiments": [
-    "ollama/gpt-oss:20b",
-    "ollama/qwen3.8:27b",
-    "ollama/nemotron-3.5-lightning:30b",
-    "ollama/nemotron3:33b",
-    "ollama/command-r:35b",
-    "ollama/gemma4:26b",
-    "ollama/glm-4.7-flash",
     "ollama/muse-glimmer",
-    "ollama/qwen3-vl:32b",
-    "ollama/qwen3-next:80b",
-    "ollama/gpt-oss:120b",
-    "ollama/qwen3.5:122b"
+    "ollama/ornith-1.5:35b",
+    "ollama/medgemma:27b"
   ],
   "cloud": {
     "enabled": false,

@@ -63,21 +63,21 @@ jq -e '
   .schemaVersion == 1 and
   .routes.plan == {
     agent: "fleet-plan",
-    model: "ollama/qwen3-coder:30b",
+    model: "ollama/qwen3.8:27b",
     costClass: "local-mid"
   } and
   .routes.build == {
     agent: "fleet-build",
-    model: "ollama/qwen3-coder:30b",
+    model: "ollama/qwen3.8:27b",
     costClass: "local-mid"
   } and
   .routes.review == {
     agent: "fleet-review",
-    model: "ollama/qwen3-coder:30b",
+    model: "ollama/qwen3.8:27b",
     costClass: "local-mid"
   } and
   .ceiling == {
-    model: "ollama/qwen3-coder-next:q8_0",
+    model: "ollama/command-r:35b",
     costClass: "local-ceiling"
   } and
   .cloud == {enabled: false, allowlist: []}
@@ -104,8 +104,8 @@ jq -e '
 
 config_json="$(sed '/^[[:space:]]*\/\//d' "$config")"
 jq -e '
-  .model == "ollama/qwen3-coder:30b" and
-  .small_model == "ollama/gpt-oss:20b" and
+  .model == "ollama/qwen3.8:27b" and
+  .small_model == "ollama/muse-glimmer" and
   .enabled_providers == ["ollama"] and
   .share == "disabled" and
   .autoupdate == false and
@@ -128,7 +128,7 @@ while IFS= read -r model; do
     '.provider.ollama.models[$model] != null' <<<"$config_json" >/dev/null
 done < <(jq -r '.routes[].model' "$routes")
 
-retired_pattern='devstral|deepseek-r1|llama3\.3|llama4|phi4|olmo-3|magistral|nemotron-3-super|translategemma'
+retired_pattern='devstral|deepseek-r1|llama3\.3|llama4|phi4|olmo-3|magistral|nemotron-3-super|translategemma|qwen3-coder|qwen3-next|qwen3\.5:122b|qwen3\.6|gpt-oss:20b|gpt-oss:120b|gemma4|nemotron-3\.5-lightning|nemotron3:33b|qwen3-vl:32b|glm-4\.7-flash'
 if grep -Eq "$retired_pattern" "$config"; then
   printf 'retired model remains in config\n' >&2
   exit 1
