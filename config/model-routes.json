@@ -18,12 +18,12 @@
     }
   },
   "ceiling": {
-    "model": "ollama/command-r:35b",
+    "model": "ollama/qwen3.8:27b",
     "costClass": "local-ceiling"
   },
   "localExperiments": [
-    "ollama/muse-glimmer",
     "ollama/ornith-1.5:35b",
+    "ollama/muse-glimmer",
     "ollama/medgemma:27b"
   ],
   "cloud": {

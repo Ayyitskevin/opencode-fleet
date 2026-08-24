@@ -222,7 +222,7 @@ jq -e '
   (.provider.ollama.models | type) == "object" and
   (.provider.ollama.models | has("qwen3.8:27b")) and
   (.provider.ollama.models | has("muse-glimmer")) and
-  (.provider.ollama.models | has("command-r:35b")) and
+  (.provider.ollama.models | has("qwen3.8:27b")) and
   .share == "disabled" and
   .autoupdate == false and
   .default_agent == "fleet-plan" and
@@ -368,7 +368,7 @@ jq -e '
     review: {agent: "fleet-review", model: "ollama/qwen3.8:27b", costClass: "local-mid"}
   } and
   .ceiling == {
-    model: "ollama/command-r:35b",
+    model: "ollama/qwen3.8:27b",
     costClass: "local-ceiling"
   } and
   (.cloud.enabled | type == "boolean") and

@@ -77,7 +77,7 @@ jq -e '
     costClass: "local-mid"
   } and
   .ceiling == {
-    model: "ollama/command-r:35b",
+    model: "ollama/qwen3.8:27b",
     costClass: "local-ceiling"
   } and
   .cloud == {enabled: false, allowlist: []}

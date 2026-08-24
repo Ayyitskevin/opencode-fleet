@@ -196,7 +196,7 @@ ceiling_output="$(
 )"
 jq -e '
   .mode == "review" and
-  .model == "ollama/command-r:35b" and
+  .model == "ollama/qwen3.8:27b" and
   .costClass == "local-ceiling"
 ' <<<"$ceiling_output" >/dev/null
 
@@ -991,11 +991,11 @@ printf 'add a greeting module\n' >"$compare_prompt"
 compare_output="$(env "${sandbox_env[@]}" FAKE_MUTATE=1 \
   "$fleet_root/scripts/oc" sandbox scratch compare \
   --prompt "$compare_prompt" \
-  --models ollama/muse-glimmer,ollama/ornith-1.5:35b 2>&1)" ||
+  --models ollama/muse-glimmer,ollama/medgemma:27b 2>&1)" ||
   { printf 'compare failed:\n%s\n' "$compare_output" >&2; exit 1; }
 # The comparison table has one completed row per requested model.
 compare_table="$(awk '/^=== comparison ===/{f=1; next} f' <<<"$compare_output")"
-for cm in ollama/muse-glimmer ollama/ornith-1.5:35b; do
+for cm in ollama/muse-glimmer ollama/medgemma:27b; do
   awk -F'\t' -v m="$cm" '$1==m && $2=="completed" {found=1} END{exit !found}' \
     <<<"$compare_table" ||
     { printf 'compare table missing completed row for %s:\n%s\n' "$cm" \
@@ -1004,10 +1004,10 @@ done
 # compare --dry-run lists the model set without dispatching any run.
 compare_dry="$(env "${sandbox_env[@]}" \
   "$fleet_root/scripts/oc" sandbox scratch compare \
-  --prompt "$compare_prompt" --models ollama/muse-glimmer,ollama/ornith-1.5:35b \
+  --prompt "$compare_prompt" --models ollama/muse-glimmer,ollama/medgemma:27b \
   --dry-run)"
 jq -e '.mode == "compare" and
-  (.models | sort == ["ollama/muse-glimmer","ollama/ornith-1.5:35b"])' \
+  (.models | sort == ["ollama/medgemma:27b","ollama/muse-glimmer"])' \
   <<<"$compare_dry" >/dev/null ||
   { printf 'compare dry-run was wrong:\n%s\n' "$compare_dry" >&2; exit 1; }
 # compare requires --prompt and rejects the other escalations; a model outside

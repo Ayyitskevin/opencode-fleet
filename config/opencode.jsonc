@@ -24,7 +24,7 @@
       },
       "models": {
         "qwen3.8:27b": {
-          "name": "Qwen3.8 27B (agentic code, vision) — the pinned coder",
+          "name": "Qwen3.8 27B (agentic code, vision) — the default AND the ceiling",
           "tools": true,
           "modalities": {"input": ["text", "image"], "output": ["text"]}
         },
@@ -34,8 +34,7 @@
           "tools": true,
           "modalities": {"input": ["text", "image"], "output": ["text"]}
         },
-        "command-r:35b": {"name": "Command R 35B (long-context chat and RAG) — largest loop-safe local", "tools": true},
-        "ornith-1.5:35b": {"name": "Ornith 1.5 35B (fast coder) — DIRECT/--experiment runs only, stalls in agent loops", "tools": true},
+        "ornith-1.5:35b": {"name": "Ornith 1.5 35B — the fast coding lane; --experiment / non-interactive runs only, never a pinned route", "tools": true},
         "medgemma:27b": {"name": "MedGemma 27B (medical)", "tools": true}
       }
     }
