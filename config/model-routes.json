@@ -1,30 +1,44 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "routes": {
     "plan": {
       "agent": "fleet-plan",
       "model": "ollama/qwen3.8:27b",
-      "costClass": "local-mid"
+      "costClass": "local-code"
     },
     "build": {
       "agent": "fleet-build",
       "model": "ollama/qwen3.8:27b",
-      "costClass": "local-mid"
+      "costClass": "local-code"
     },
     "review": {
       "agent": "fleet-review",
       "model": "ollama/qwen3.8:27b",
-      "costClass": "local-mid"
+      "costClass": "local-code"
     }
   },
-  "ceiling": {
-    "model": "ollama/qwen3.8:27b",
-    "costClass": "local-ceiling"
+  "profiles": {
+    "mickey": {
+      "hostnames": ["mickey", "strix-halo-a9-mega"],
+      "simple": "ollama/muse-glimmer:latest",
+      "vision": "ollama/muse-glimmer:latest",
+      "code": "ollama/qwen3.8:27b",
+      "fastCode": "ollama/ornith-1.5:35b"
+    },
+    "flow": {
+      "hostnames": ["flow"],
+      "simple": "ollama/muse-glimmer:30b",
+      "vision": "ollama/muse-glimmer:30b",
+      "code": "ollama/qwen3.8:27b",
+      "fastCode": "ollama/ornith-1.5:35b"
+    }
   },
+  "ceiling": null,
+  "directOnly": [
+    "ollama/ornith-1.5:35b"
+  ],
   "localExperiments": [
-    "ollama/ornith-1.5:35b",
-    "ollama/muse-glimmer",
-    "ollama/medgemma:27b"
+    "ollama/ornith-1.5:35b"
   ],
   "cloud": {
     "enabled": false,
